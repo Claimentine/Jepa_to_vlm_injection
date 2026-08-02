@@ -1,0 +1,40 @@
+# data / model outputs -- never commit, see docs/data_and_checkpoints.md
+*.mp4
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.hdf5
+*.zip
+*.jsonl
+*.csv
+runs/
+*_runs/
+*_runs_smoke/
+checkpoints/
+cache/
+clips/
+videos/
+qa_full_report.txt
+demo_sample/
+
+# credentials -- must never be committed
+cookies*.txt
+*.token
+token
+stored_tokens
+.env
+
+# logs
+*.log
+slurm-*.out
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# os
+.DS_Store

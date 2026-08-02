@@ -1,0 +1,23 @@
+# Used for: V-JEPA2 feature extraction, video clip splitting (ffmpeg),
+# ThinkJEPA's own cache_train utilities (load_dense_jepa_encoder,
+# CortexGuidedVideoPredictor). Roughly: everything under vans_qa/demo/ and
+# vans_qa/full_scale/ that is NOT the Qwen3-VL training/eval scripts.
+name: thinkjepa
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - ffmpeg
+  - pip
+  - pip:
+      - torch==2.12.1
+      - torchvision
+      - opencv-python==4.13.0.92
+      - numpy==2.4.6
+      - huggingface_hub==1.20.1
+      - yt-dlp[default]==2026.7.4
+      - yt-dlp-ejs   # node-based JS-challenge solver yt-dlp needs for YouTube bot-check bypass
+      - decord

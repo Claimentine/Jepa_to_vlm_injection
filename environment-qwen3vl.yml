@@ -1,0 +1,20 @@
+# Used for: the injection architecture itself (common/jepa_injection_model.py),
+# all training/eval scripts that load Qwen3-VL-2B-Thinking (train/eval in
+# egodex_probe/ and vans_qa/*), Node.js is NOT needed here (that's the
+# thinkjepa env, for yt-dlp).
+name: qwen3vl
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - torch==2.10.0
+      - transformers==5.1.0
+      - qwen-vl-utils==0.0.14
+      - accelerate
+      - numpy
+      - huggingface_hub==1.20.1
