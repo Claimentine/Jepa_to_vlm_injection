@@ -85,7 +85,7 @@ spec:
             limits:
               # Limits must be no more than 20% above requests (Nautilus fair-share policy).
               cpu: "2.4"
-              memory: "3.6Gi"
+              memory: "3600Mi"
           volumeMounts:
             - name: data-storage
               mountPath: /data

@@ -59,7 +59,7 @@ spec:
             limits:
               # Limits must be no more than 20% above requests (Nautilus fair-share policy).
               cpu: "4.8"
-              memory: "9.6Gi"
+              memory: "9600Mi"
           volumeMounts:
             - name: git-repo-code
               mountPath: /code
@@ -68,6 +68,14 @@ spec:
       initContainers:
         - name: init-clone-repo
           image: alpine/git
+          # A small, bounded CPU-only clone step; it must also declare resources.
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
           args:
             - clone
             - --single-branch
