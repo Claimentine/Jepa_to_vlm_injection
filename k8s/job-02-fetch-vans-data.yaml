@@ -1,0 +1,107 @@
+# Step 2: pull the VANS-Data-100K CSVs + demo bundle onto the data PVC.
+#
+# NOTE on the source: the repo's docs/data_and_checkpoints.md calls this
+# "the KlingTeam/VANS HF *dataset*", but as of 2026-08 it is actually
+# published as a *model* repo (huggingface.co/KlingTeam/VANS, repo_type=
+# "model", public, no token needed) containing:
+#   VANS-DATA_demo.zip                       (~625MB, the 500-pair demo bundle)
+#   VANS-DATA-100K/VANS-DATA_COIN.csv        (~45MB)
+#   VANS-DATA-100K/VANS-DATA_YouCook.csv     (~20MB)
+# (verified directly against the HF API -- filenames/paths confirmed, not
+# guessed). The repo's *model* weight files (VANS_mllm.safetensors etc.) in
+# the same repo are NOT pulled here -- this job is data-only.
+#
+# CPU-only, no GPU (this is a plain download+unzip, not compute).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-fetch-vans-data
+spec:
+  template:
+    spec:
+      containers:
+        - name: fetch-vans-data
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              pip install --quiet -U huggingface_hub
+              mkdir -p /data/hf_data/demo_sample
+              python3 - <<'PY'
+              import os, shutil, zipfile
+              from huggingface_hub import hf_hub_download
+
+              REPO_ID = "KlingTeam/VANS"
+              DEST = "/data/hf_data"
+
+              csv_files = {
+                  "VANS-DATA-100K/VANS-DATA_COIN.csv": os.path.join(DEST, "VANS-DATA_COIN.csv"),
+                  "VANS-DATA-100K/VANS-DATA_YouCook.csv": os.path.join(DEST, "VANS-DATA_YouCook.csv"),
+              }
+              for remote, local in csv_files.items():
+                  if os.path.exists(local):
+                      print(f"[skip] {local} already present")
+                      continue
+                  print(f"[fetch] {remote} -> {local}")
+                  cached = hf_hub_download(repo_id=REPO_ID, repo_type="model", filename=remote)
+                  shutil.copy(cached, local)
+
+              demo_dir = os.path.join(DEST, "demo_sample")
+              marker = os.path.join(demo_dir, ".extracted")
+              if os.path.exists(marker):
+                  print(f"[skip] {demo_dir} already extracted")
+              else:
+                  print("[fetch] VANS-DATA_demo.zip (~625MB, this is the slow step)")
+                  zip_path = hf_hub_download(repo_id=REPO_ID, repo_type="model", filename="VANS-DATA_demo.zip")
+                  os.makedirs(demo_dir, exist_ok=True)
+                  with zipfile.ZipFile(zip_path) as zf:
+                      names = zf.namelist()
+                      print(f"[fetch] zip has {len(names)} entries, first 10: {names[:10]}")
+                      zf.extractall(demo_dir)
+                  open(marker, "w").close()
+
+              print("[fetch] done. demo_sample/ layout:")
+              for root, dirs, files in os.walk(demo_dir):
+                  depth = root[len(demo_dir):].count(os.sep)
+                  if depth <= 1:
+                      print(" " * depth, os.path.relpath(root, demo_dir), f"({len(files)} files)")
+              PY
+
+              echo "=================================================="
+              echo "[VERIFY] the repo's demo scripts expect exactly:"
+              echo "  \$VANS_ROOT/hf_data/demo_sample/VANS_DATA_EXAMPLE.csv"
+              echo "  \$VANS_ROOT/hf_data/demo_sample/VANS_DATA_EXAMPLES/"
+              echo "Check the layout printed above matches -- if the zip put"
+              echo "everything one level deeper (e.g. a VANS-DATA_demo/ subdir),"
+              echo "adjust with a symlink or fix the paths in vans_qa/demo/*.py."
+              echo "=================================================="
+          resources:
+            requests:
+              cpu: "2"
+              memory: "3Gi"
+            limits:
+              # Limits must be no more than 20% above requests (Nautilus fair-share policy).
+              cpu: "2.4"
+              memory: "3.6Gi"
+          volumeMounts:
+            - name: data-storage
+              mountPath: /data
+      volumes:
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      restartPolicy: Never
+  backoffLimit: 2
+
+# Apply with:
+#   kubectl apply -f job-02-fetch-vans-data.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-fetch-vans-data -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-fetch-vans-data -n williamli-scvl
+#
+# When you later run training/eval scripts from vans_qa/demo/, set:
+#   export VANS_ROOT=/data   (matches this job's mount path)

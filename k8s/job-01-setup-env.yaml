@@ -1,0 +1,94 @@
+# Step 1: environment setup.
+# Builds both conda envs (see environment-thinkjepa.yml / environment-qwen3vl.yml
+# in the repo README) onto the persistent conda volume, and clones+patches
+# ThinkJEPA (scripts/patch_thinkjepa.sh), so this only needs to run once.
+# CPU-only on purpose -- never use a GPU pod for installs/builds (Section 1.2,
+# rule #2 of the onboarding guide: GPU utilization would sit at 0% and rack up
+# a fair-share violation).
+#
+# Idempotent: re-running this Job (e.g. after adding a new dependency) skips
+# any env/checkout that already exists on the conda volume.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-setup-env
+spec:
+  template:
+    spec:
+      containers:
+        - name: setup-env
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              command -v conda
+              command -v git
+              REPO=/code/Jepa_to_vlm_injection
+              ENVS=/home/jovyan/conda-envs
+              mkdir -p "$ENVS"
+
+              if [ -d "$ENVS/thinkjepa" ]; then
+                echo "[skip] thinkjepa env already exists at $ENVS/thinkjepa"
+              else
+                conda env create -f "$REPO/environment-thinkjepa.yml" --prefix "$ENVS/thinkjepa"
+              fi
+
+              if [ -d "$ENVS/qwen3vl" ]; then
+                echo "[skip] qwen3vl env already exists at $ENVS/qwen3vl"
+              else
+                conda env create -f "$REPO/environment-qwen3vl.yml" --prefix "$ENVS/qwen3vl"
+              fi
+
+              THINKJEPA_ROOT=/home/jovyan/ThinkJEPA
+              if [ -d "$THINKJEPA_ROOT/.git" ]; then
+                echo "[skip] ThinkJEPA already cloned at $THINKJEPA_ROOT"
+              else
+                git clone --single-branch https://github.com/Hai-chao-Zhang/ThinkJEPA "$THINKJEPA_ROOT"
+              fi
+              THINKJEPA_ROOT="$THINKJEPA_ROOT" bash "$REPO/scripts/patch_thinkjepa.sh"
+
+              echo "[done] conda envs + ThinkJEPA are ready under $ENVS and $THINKJEPA_ROOT"
+              echo "[done] both persisted on the conda PVC -- future jobs can activate them directly, no reinstall."
+          resources:
+            requests:
+              cpu: "4"
+              memory: "8Gi"
+            limits:
+              # Limits must be no more than 20% above requests (Nautilus fair-share policy).
+              cpu: "4.8"
+              memory: "9.6Gi"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {} # Temporary volume for code, cloned fresh each run
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+      restartPolicy: Never
+  backoffLimit: 2 # conda solve failures won't fix themselves on retry
+
+# Apply with:
+#   kubectl apply -f job-01-setup-env.yaml -n williamli-scvl
+# Watch it:
+#   kubectl get pods -n williamli-scvl -w
+#   kubectl logs -f job/ruixin-setup-env -n williamli-scvl
+# Clean up when done (Golden Rule #4 -- Jobs don't clean up their pods):
+#   kubectl delete job ruixin-setup-env -n williamli-scvl

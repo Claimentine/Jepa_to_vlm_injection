@@ -1,0 +1,22 @@
+# Persistent volume for datasets, feature caches, and run outputs.
+# File storage (rook-cephfs): best for large files and shared access across
+# multiple pods/jobs at once (ReadWriteMany).
+# Per lab onboarding guide Section 1.5 / Template 2.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jepa-vlm-injection-data-vol
+spec:
+  storageClassName: rook-cephfs
+  accessModes:
+    - ReadWriteMany # Allows multiple pods to mount this
+  resources:
+    requests:
+      storage: 200Gi # VANS demo+CSVs is ~700MB; grow this before adding
+                      # COIN/YouCook2 raw video or full V-JEPA2 feature caches
+
+# Apply with:
+#   kubectl apply -f pvc-data-cephfs.yaml -n williamli-scvl
+#
+# Reminder (Golden Rule #2): 6-month purge rule applies here too. This is
+# NOT where finished results/papers-worth-of-data should live long-term.

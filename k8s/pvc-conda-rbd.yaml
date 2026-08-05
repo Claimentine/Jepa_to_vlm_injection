@@ -1,0 +1,22 @@
+# Persistent volume for code + conda environments + pip/conda package caches.
+# Block storage (rook-ceph-block): fast for many small files (conda installs,
+# pip installs) but ReadWriteOnce -- only one pod can mount this at a time.
+# Per lab onboarding guide Section 1.5 / Template 1.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ruixin-conda-vol
+spec:
+  storageClassName: rook-ceph-block
+  accessModes:
+    - ReadWriteOnce # Can only be attached to one pod at a time
+  resources:
+    requests:
+      storage: 50Gi # two conda envs (torch+cuda each) + ThinkJEPA checkout; grow if needed
+
+# Apply with:
+#   kubectl apply -f pvc-conda-rbd.yaml -n williamli-scvl
+#
+# Reminder (Golden Rule #2): this is active-computation storage, not archival.
+# A PVC untouched for 6 months can be purged without notice -- move final
+# results to lab-approved long-term storage when a project wraps up.
