@@ -82,10 +82,12 @@ spec:
             requests:
               cpu: "2"
               memory: "3Gi"
+              ephemeral-storage: "1Gi"
             limits:
               # Limits must be no more than 20% above requests (Nautilus fair-share policy).
               cpu: "2.4"
               memory: "3600Mi"
+              ephemeral-storage: "1200Mi"
           volumeMounts:
             - name: data-storage
               mountPath: /data
@@ -93,6 +95,10 @@ spec:
         - name: data-storage
           persistentVolumeClaim:
             claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        # The PRP image runs as UID 1000; this grants that group write access to new PVCs.
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       restartPolicy: Never
   backoffLimit: 2
 

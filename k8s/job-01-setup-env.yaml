@@ -56,10 +56,12 @@ spec:
             requests:
               cpu: "4"
               memory: "8Gi"
+              ephemeral-storage: "1Gi"
             limits:
               # Limits must be no more than 20% above requests (Nautilus fair-share policy).
               cpu: "4.8"
               memory: "9600Mi"
+              ephemeral-storage: "1200Mi"
           volumeMounts:
             - name: git-repo-code
               mountPath: /code
@@ -73,9 +75,11 @@ spec:
             requests:
               cpu: "1"
               memory: "2Gi"
+              ephemeral-storage: "1Gi"
             limits:
               cpu: "1"
               memory: "2Gi"
+              ephemeral-storage: "1200Mi"
           args:
             - clone
             - --single-branch
@@ -90,6 +94,10 @@ spec:
         - name: conda-storage
           persistentVolumeClaim:
             claimName: ruixin-conda-vol
+      securityContext:
+        # The PRP image runs as UID 1000; this grants that group write access to new PVCs.
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       restartPolicy: Never
   backoffLimit: 2 # conda solve failures won't fix themselves on retry
 
