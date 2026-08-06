@@ -19,6 +19,30 @@ metadata:
 spec:
   template:
     spec:
+      initContainers:
+        # CephFS provisions the volume root as root-owned. Make the empty volume
+        # writable by the non-root UID used by the PRP runtime image.
+        - name: init-data-permissions
+          image: busybox:1.36
+          command:
+            - "sh"
+          args:
+            - "-c"
+            - "chown 1000:1000 /data && chmod 0775 /data"
+          securityContext:
+            runAsUser: 0
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          volumeMounts:
+            - name: data-storage
+              mountPath: /data
       containers:
         - name: fetch-vans-data
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
