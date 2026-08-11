@@ -10,7 +10,14 @@ channels:
   - defaults
 dependencies:
   - python=3.11
-  - ffmpeg
+  # Pinned to the conda-forge build specifically: with plain "ffmpeg", conda
+  # resolves the outdated pytorch-channel build (ffmpeg 4.3) ahead of
+  # conda-forge because of this file's channel order, and that build is
+  # linked against libopenh264.so.5 while conda-forge's openh264 package
+  # ships .so.6 -- ffmpeg fails at runtime with a missing .so, not at
+  # install time, so the breakage doesn't surface until something actually
+  # invokes ffmpeg.
+  - conda-forge::ffmpeg
   - pip
   - pip:
       - torch==2.12.1

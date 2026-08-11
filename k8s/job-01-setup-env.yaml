@@ -30,16 +30,27 @@ spec:
               ENVS=/home/jovyan/conda-envs
               mkdir -p "$ENVS"
 
-              if [ -d "$ENVS/thinkjepa" ]; then
-                echo "[skip] thinkjepa env already exists at $ENVS/thinkjepa"
+              # Marker file, not just directory existence: `conda env create`
+              # creates the prefix dir immediately and only fails later, mid
+              # pip-install, on things like network flakiness -- a bare
+              # `[ -d ... ]` check would then treat that half-built env as
+              # "done" forever and silently skip reinstalling it on every
+              # future re-apply (this bit us once: both envs ended up with
+              # only base packaging tools, no torch/opencv/etc.).
+              if [ -f "$ENVS/thinkjepa/.setup_complete" ]; then
+                echo "[skip] thinkjepa env already complete at $ENVS/thinkjepa"
               else
+                rm -rf "$ENVS/thinkjepa"
                 conda env create -f "$REPO/environment-thinkjepa.yml" --prefix "$ENVS/thinkjepa"
+                touch "$ENVS/thinkjepa/.setup_complete"
               fi
 
-              if [ -d "$ENVS/qwen3vl" ]; then
-                echo "[skip] qwen3vl env already exists at $ENVS/qwen3vl"
+              if [ -f "$ENVS/qwen3vl/.setup_complete" ]; then
+                echo "[skip] qwen3vl env already complete at $ENVS/qwen3vl"
               else
+                rm -rf "$ENVS/qwen3vl"
                 conda env create -f "$REPO/environment-qwen3vl.yml" --prefix "$ENVS/qwen3vl"
+                touch "$ENVS/qwen3vl/.setup_complete"
               fi
 
               THINKJEPA_ROOT=/home/jovyan/ThinkJEPA

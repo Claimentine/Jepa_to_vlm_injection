@@ -13,6 +13,7 @@ dependencies:
   - pip
   - pip:
       - torch==2.10.0
+      - torchvision==0.25.0  # qwen_vl_utils imports this; wasn't declared and pulled in an unpinned torch upgrade
       - transformers==5.1.0
       - qwen-vl-utils==0.0.14
       - accelerate
