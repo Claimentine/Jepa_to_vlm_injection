@@ -78,9 +78,12 @@ kubectl delete job ruixin-setup-env ruixin-fetch-vans-data ruixin-extract-vjepa-
   12,032/28,226 matched pairs, 18,147 unique clips needed, 4,649 (25.6%)
   already have cached V-JEPA2 features -- matches the historical numbers in
   the main README, so the restore looks complete for what it claims to be.
-  At least one `.npz` in the backup was found corrupt (`BadZipFile`) during
-  a spot check -- run `vans_qa/full_scale/scan_corrupt_npz.py` before
-  trusting the cache wholesale.
+  Ran `vans_qa/full_scale/scan_corrupt_npz.py`: 131/4,649 (2.8%) of those
+  cached `.npz` were corrupt (`BadZipFile`/`EOFError`, likely truncated
+  during the ad hoc restore) -- listed in `raw_data/corrupt_npz_list.txt`
+  and deleted, so job-03's `os.path.exists()` skip check won't mistake them
+  for done. job-03 will therefore (re)extract 13,629 clips (131 corrupted +
+  13,498 never cached), not 13,498.
 
 ## What each file does
 
