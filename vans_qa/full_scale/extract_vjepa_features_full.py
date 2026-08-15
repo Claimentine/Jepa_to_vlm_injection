@@ -29,6 +29,7 @@ from cache_train.thinker_train import (
     load_dense_jepa_encoder,
     encode_dense_jepa_video,
 )
+from cache_train.video_observation_adapter import VideoObservationAdapter
 
 BASE = os.environ.get("VANS_ROOT", "/projects/bhay/william/ruixin/vans_world_model")
 WORK_BASE = os.environ.get("VANS_WORK_ROOT", "/work/nvme/bdqf/yli8/vans_raw_data")  # relocated off the near-full /projects/bhay allocation
@@ -72,9 +73,15 @@ def read_clip_frames(mp4_path, n_frames=NUM_FRAMES):
     return frames
 
 
-def clip_to_model_input(frames, transform):
-    clip_tensor = transform(frames)
-    return clip_tensor.permute(1, 0, 2, 3).unsqueeze(0)
+def clip_to_model_input(frames, adapter):
+    # load_dense_jepa_encoder's second return value is a transform *spec*
+    # (resize/crop/normalize params), not a callable -- VideoObservationAdapter
+    # is the nn.Module that actually applies it (see thinker_train.py's own
+    # `fast_tx = VideoObservationAdapter(pt_video_transform); img = fast_tx(img)`
+    # usage). Feed it (T,H,W,C) uint8; it returns (T,C,H,W) normalized.
+    frames_t = torch.from_numpy(np.stack(frames))
+    clip_tensor = adapter(frames_t)
+    return clip_tensor.unsqueeze(0)
 
 
 def main():
@@ -95,6 +102,7 @@ def main():
 
     print(f"[INFO] loading V-JEPA2 encoder from {VITL_PT} ...")
     model_pt, transform = load_dense_jepa_encoder(pt_model_path=VITL_PT)
+    adapter = VideoObservationAdapter(transform, antialias=True)
 
     n_ok, n_err, n_skip = 0, 0, 0
     for clip_path in clips:
@@ -105,7 +113,7 @@ def main():
             continue
         try:
             frames = read_clip_frames(clip_path)
-            video = clip_to_model_input(frames, transform).cuda()
+            video = clip_to_model_input(frames, adapter).cuda()
             feats = encode_dense_jepa_video(video, model_pt)
             np.savez(out_path, feats=feats[0].half().cpu().numpy())
             n_ok += 1

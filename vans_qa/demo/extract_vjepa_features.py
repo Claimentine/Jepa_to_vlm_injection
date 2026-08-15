@@ -36,6 +36,7 @@ from cache_train.thinker_train import (
     encode_dense_jepa_video,
     build_dense_jepa_video_transform,
 )
+from cache_train.video_observation_adapter import VideoObservationAdapter
 
 VITL_PT = os.environ.get("VJEPA2_CKPT", "/work/nvme/bdqf/william/charles/pretrain/vjepa2/vitl.pt")
 NUM_FRAMES = 64
@@ -72,9 +73,15 @@ def read_clip_frames(mp4_path, n_frames=NUM_FRAMES):
     return frames  # list of (H,W,3) uint8 RGB numpy arrays, len == n_frames
 
 
-def clip_to_model_input(frames, transform):
-    clip_tensor = transform(frames)  # (C, T, H, W), normalized
-    video = clip_tensor.permute(1, 0, 2, 3).unsqueeze(0)  # (1, T, C, H, W)
+def clip_to_model_input(frames, adapter):
+    # load_dense_jepa_encoder's second return value is a transform *spec*
+    # (resize/crop/normalize params), not a callable -- VideoObservationAdapter
+    # is the nn.Module that actually applies it (see thinker_train.py's own
+    # `fast_tx = VideoObservationAdapter(pt_video_transform); img = fast_tx(img)`
+    # usage). Feed it (T,H,W,C) uint8; it returns (T,C,H,W) normalized.
+    frames_t = torch.from_numpy(np.stack(frames))
+    clip_tensor = adapter(frames_t)  # (T, C, H, W), normalized
+    video = clip_tensor.unsqueeze(0)  # (1, T, C, H, W)
     return video
 
 
@@ -94,6 +101,7 @@ def main():
 
     print(f"[INFO] loading V-JEPA2 encoder from {VITL_PT} ...")
     model_pt, transform = load_dense_jepa_encoder(pt_model_path=VITL_PT)
+    adapter = VideoObservationAdapter(transform, antialias=True)
 
     n_ok, n_err = 0, 0
     for pid in pair_ids:
@@ -108,8 +116,8 @@ def main():
             in_frames = read_clip_frames(in_mp4)
             out_frames = read_clip_frames(out_mp4)
 
-            in_video = clip_to_model_input(in_frames, transform).cuda()
-            out_video = clip_to_model_input(out_frames, transform).cuda()
+            in_video = clip_to_model_input(in_frames, adapter).cuda()
+            out_video = clip_to_model_input(out_frames, adapter).cuda()
 
             in_feats = encode_dense_jepa_video(in_video, model_pt)  # (1,T,P,D)
             out_feats = encode_dense_jepa_video(out_video, model_pt)
