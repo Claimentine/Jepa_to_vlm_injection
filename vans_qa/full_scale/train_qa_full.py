@@ -53,9 +53,18 @@ def load_vjepa_in_feats(clip_path):
 
 
 def has_features(item):
-    vjepa_ok = os.path.exists(os.path.join(VJEPA_CACHE, f"{safe_name(item['in_clip'])}.npz"))
-    vlm_ok = find_vlm_npz(item["in_clip"]) is not None
-    return vjepa_ok and vlm_ok
+    # This script's injection direction (JepaInjector) only ever loads
+    # vjepa_feats -- VLM_CACHE/find_vlm_npz above is dead code for it, kept
+    # only because a sibling script (train_latent_world_model.py, the
+    # opposite VLM-guides-JEPA direction) needs both caches populated for
+    # the *same* item set to stay comparable. On Nautilus, vlm_guidance_cache_full
+    # never got populated: extract_vlm_guidance_full.py shells out to
+    # ThinkJEPA's cache_train/qwen3_cache_extractor.py, which doesn't exist
+    # in the current public ThinkJEPA release (patch_thinkjepa.sh already
+    # guards for this with `if [ -f "$EXTRACTOR" ]`). Gating on vlm_ok here
+    # would zero out train/val entirely, so it's dropped -- restore it once
+    # that extractor is available again.
+    return os.path.exists(os.path.join(VJEPA_CACHE, f"{safe_name(item['in_clip'])}.npz"))
 
 
 def build_option_block(item, rng):
