@@ -1,13 +1,12 @@
 """
-Full-scale held-out test evaluation, generate()-based (same protocol as the
-demo pilot's eval_vans_qa_injection.py) so numbers are directly comparable
-to the n=75 demo pilot's none/random/jepa/jepa_transfer results.
+Full-scale held-out evaluation using paired A/B continuation log-probabilities.
+This deliberately avoids autoregressive generation and answer parsing, so
+training, validation, and held-out evaluation use the same decision rule.
 """
 import argparse
 import json
 import os
 import random
-import re
 import sys
 
 import torch
@@ -15,31 +14,29 @@ import torch
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-from common.jepa_injection_model import JepaInjector, LanguageModelInjectionHook, prepend_placeholder_tokens  # noqa: E402
+from common.jepa_injection_model import (  # noqa: E402
+    DecoderLayerInjectionHook,
+    JepaInjector,
+    LanguageModelInjectionHook,
+    LayerWiseJEPAInjector,
+    resolve_decoder_layers,
+    select_layer_indices,
+)
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 from train_qa_full import (
     MODEL_ID, build_option_block, build_prompt_text, build_inputs, load_vjepa_in_feats, has_features, BASE,
+    candidate_logprob, prepare_model_inputs,
 )
-
-ANSWER_RE = re.compile(r"final answer\s*[:\-]?\s*([AB])\b", re.IGNORECASE)
-FALLBACK_RE = re.compile(r"\b([AB])\b")
-
-
-def parse_letter(text):
-    m = ANSWER_RE.search(text)
-    if m:
-        return m.group(1).upper()
-    matches = [m.group(1).upper() for m in FALLBACK_RE.finditer(text)]
-    return matches[-1] if matches else None
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default=os.path.join(BASE, "raw_data/qa_split_full.json"))
-    ap.add_argument("--injection", choices=["jepa", "random", "none"], required=True)
+    ap.add_argument("--injection", choices=["jepa", "random", "constant", "none"], required=True)
+    ap.add_argument("--injection_site", choices=["prefix", "film", "cross_attn"], default="prefix")
+    ap.add_argument("--layer_strategy", choices=["middle4", "last4", "uniform4", "all"], default="middle4")
     ap.add_argument("--checkpoint", default=None)
-    ap.add_argument("--max_new_tokens", type=int, default=160)
     ap.add_argument("--max_test_items", type=int, default=300, help="cap test set for cost control")
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--out", default=None)
@@ -62,14 +59,33 @@ def main():
     device = next(model.parameters()).device
     hidden_size = model.config.text_config.hidden_size
 
-    injector, hook = None, None
-    if args.injection in ("jepa", "random"):
+    injector, hook, layer_indices = None, None, []
+    if args.injection != "none":
+        if not args.checkpoint:
+            raise ValueError("--checkpoint is required unless --injection none")
         ckpt = torch.load(args.checkpoint, map_location=device)
-        injector = JepaInjector(jepa_dim=1024, hidden_size=hidden_size, mode=args.injection, pooling="temporal")
+        saved_args = ckpt.get("args", {})
+        checkpoint_site = saved_args.get("injection_site", "prefix")
+        if checkpoint_site != args.injection_site:
+            raise ValueError(f"checkpoint site={checkpoint_site}, requested {args.injection_site}")
+        if args.injection_site == "prefix":
+            injector = JepaInjector(
+                jepa_dim=1024, hidden_size=hidden_size, mode=args.injection,
+                seed=saved_args.get("seed", 0), pooling="temporal",
+            )
+            hook = LanguageModelInjectionHook(model, n_tokens)
+        else:
+            strategy = saved_args.get("layer_strategy", args.layer_strategy)
+            layer_indices = select_layer_indices(len(resolve_decoder_layers(model)), strategy)
+            injector = LayerWiseJEPAInjector(
+                hidden_size=hidden_size, layer_indices=layer_indices, condition_mode=args.injection,
+                seed=saved_args.get("seed", 0), mode=args.injection_site,
+            )
+            hook = DecoderLayerInjectionHook(model, injector)
         injector.load_state_dict(ckpt["injector_state"])
         injector.to(device).eval()
-        hook = LanguageModelInjectionHook(model, n_tokens)
         placeholder_id = processor.tokenizer.pad_token_id
+        print(f"[INFO] injection={args.injection} site={args.injection_site} layers={layer_indices}")
 
     rng = random.Random(args.seed)
 
@@ -79,29 +95,26 @@ def main():
             prompt_text = build_prompt_text(item["question"], option_lines)
             try:
                 inputs = build_inputs(processor, item["in_clip"], prompt_text)
-                model_inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
+                site = args.injection_site if injector is not None else "none"
+                model_inputs = prepare_model_inputs(inputs, site, n_tokens, placeholder_id if injector else None)
+                model_inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in model_inputs.items()}
 
-                if args.injection in ("jepa", "random"):
+                if injector is not None:
                     feats = torch.from_numpy(load_vjepa_in_feats(item["in_clip"])).unsqueeze(0).to(device)
-                    soft_prompt = injector(feats)
-                    input_ids, attn_mask = prepend_placeholder_tokens(
-                        model_inputs["input_ids"], model_inputs["attention_mask"], n_tokens, placeholder_id
-                    )
-                    model_inputs["input_ids"] = input_ids
-                    model_inputs["attention_mask"] = attn_mask
-                    hook.set(soft_prompt)
-
-                generated_ids = model.generate(**model_inputs, max_new_tokens=args.max_new_tokens)
+                    condition = injector(feats) if args.injection_site == "prefix" else injector.condition(feats)
+                    hook.set(condition)
+                scores = torch.stack([
+                    candidate_logprob(model, model_inputs, processor.tokenizer, "A"),
+                    candidate_logprob(model, model_inputs, processor.tokenizer, "B"),
+                ])
                 if hook is not None:
                     hook.clear()
-
-                trimmed = generated_ids[:, model_inputs["input_ids"].shape[1]:]
-                out_text = processor.batch_decode(trimmed, skip_special_tokens=True)[0]
-                pred_letter = parse_letter(out_text)
+                pred_letter = "A" if scores[0] > scores[1] else "B"
 
                 record = {
                     "pid": item["pid"], "correct_letter": correct_letter, "pred_letter": pred_letter,
-                    "correct": pred_letter == correct_letter, "raw_output": out_text,
+                    "correct": pred_letter == correct_letter,
+                    "logprob_A": float(scores[0].item()), "logprob_B": float(scores[1].item()),
                 }
             except Exception as e:
                 record = {"pid": item["pid"], "error": f"{type(e).__name__}: {e}"}

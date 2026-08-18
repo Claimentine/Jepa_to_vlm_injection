@@ -148,7 +148,7 @@ class JepaInjector(nn.Module):
 
     def __init__(self, jepa_dim=1024, hidden_size=2048, n_tokens=8, mode="jepa", seed=0, pooling="temporal"):
         super().__init__()
-        assert mode in {"jepa", "random"}
+        assert mode in {"jepa", "random", "constant"}
         assert pooling in {"temporal", "global"}
         self.mode = mode
         self.pooling = pooling
@@ -160,15 +160,79 @@ class JepaInjector(nn.Module):
             self.adapter = SoftPromptAdapter(in_dim=jepa_dim, hidden_size=hidden_size, n_tokens=n_tokens)
         self._rng = torch.Generator().manual_seed(seed)
         self._jepa_dim = jepa_dim
+        # A content-free learned control.  It has the same output shape as the
+        # temporal JEPA condition, but cannot encode anything about a clip.
+        # It deliberately bypasses the JEPA pooler: its purpose is to test
+        # whether *video-dependent* conditioning, rather than merely adding
+        # trainable prompt parameters, is useful.
+        if mode == "constant":
+            self.constant_tokens = nn.Parameter(
+                torch.zeros(1, 64 if pooling == "temporal" else n_tokens, hidden_size)
+            )
 
     def forward(self, vjepa_feats):
         # vjepa_feats: (B, T, N, D) float tensor
+        if self.mode == "constant":
+            if self.pooling == "temporal" and vjepa_feats.shape[1] != self.constant_tokens.shape[1]:
+                raise ValueError("constant temporal injector was initialized for a different number of frames")
+            return self.constant_tokens.expand(vjepa_feats.shape[0], -1, -1)
         if self.mode == "random":
             vjepa_feats = torch.randn(
                 vjepa_feats.shape, generator=self._rng, dtype=vjepa_feats.dtype
             ).to(vjepa_feats.device)
         pooled = self.pooler(vjepa_feats)
         return self.adapter(pooled)  # temporal: (B, T, hidden_size); global: (B, n_tokens, hidden_size)
+
+
+class LayerWiseJEPAInjector(nn.Module):
+    """Turn JEPA tokens into zero-initialized, gated decoder-layer updates.
+
+    ``mode='film'`` applies sample-specific FiLM-style scale/shift to the
+    hidden states entering selected decoder blocks.  ``mode='cross_attn'``
+    lets every language token attend to the 64 temporally ordered JEPA tokens.
+    The gates start at zero, so attaching this module is initially an exact
+    no-op for the frozen VLM rather than a destructive distribution shift.
+    """
+
+    def __init__(self, hidden_size, layer_indices, condition_mode="jepa", seed=0,
+                 mode="film", nhead=8):
+        super().__init__()
+        assert mode in {"film", "cross_attn"}
+        self.mode = mode
+        self.layer_indices = tuple(layer_indices)
+        self.conditioner = JepaInjector(
+            hidden_size=hidden_size, mode=condition_mode, seed=seed, pooling="temporal"
+        )
+        keys = [str(i) for i in self.layer_indices]
+        if mode == "film":
+            self.modulators = nn.ModuleDict({k: nn.Linear(hidden_size, 2 * hidden_size) for k in keys})
+            for modulator in self.modulators.values():
+                nn.init.zeros_(modulator.weight)
+                nn.init.zeros_(modulator.bias)
+        else:
+            self.cross_attention = nn.ModuleDict({
+                k: nn.MultiheadAttention(hidden_size, nhead, batch_first=True) for k in keys
+            })
+            self.query_norm = nn.ModuleDict({k: nn.LayerNorm(hidden_size) for k in keys})
+        self.gates = nn.ParameterDict({k: nn.Parameter(torch.zeros(())) for k in keys})
+
+    def condition(self, vjepa_feats):
+        """Return (B, T, H) once; reuse it for both A/B likelihood calls."""
+        return self.conditioner(vjepa_feats)
+
+    def apply(self, layer_idx, hidden_states, condition):
+        key = str(layer_idx)
+        if self.mode == "film":
+            global_condition = condition.mean(dim=1)
+            gamma, beta = self.modulators[key](global_condition).chunk(2, dim=-1)
+            # Bounded scale avoids an early optimizer step exploding a frozen
+            # decoder's activations.
+            update = 0.1 * torch.tanh(gamma).unsqueeze(1) * hidden_states + beta.unsqueeze(1)
+        else:
+            update, _ = self.cross_attention[key](
+                self.query_norm[key](hidden_states), condition, condition, need_weights=False
+            )
+        return hidden_states + self.gates[key] * update
 
 
 class LanguageModelInjectionHook:
@@ -214,6 +278,80 @@ class LanguageModelInjectionHook:
         inputs_embeds[:, : self.n_tokens, :] = sp
         kwargs["inputs_embeds"] = inputs_embeds
         return args, kwargs
+
+
+def resolve_decoder_layers(model):
+    """Return Qwen decoder blocks across the small layout variations in HF."""
+    lm = model.model.language_model
+    layers = getattr(lm, "layers", None)
+    if layers is None and hasattr(lm, "model"):
+        layers = getattr(lm.model, "layers", None)
+    if layers is None:
+        raise AttributeError("could not find decoder layers below model.model.language_model")
+    return layers
+
+
+def select_layer_indices(n_layers, strategy):
+    """Pick a small, reproducible set of decoder layers for deep injection."""
+    if strategy == "all":
+        return list(range(n_layers))
+    if strategy == "middle4":
+        start = max(0, n_layers // 2 - 2)
+        return list(range(start, min(start + 4, n_layers)))
+    if strategy == "last4":
+        return list(range(max(0, n_layers - 4), n_layers))
+    if strategy == "uniform4":
+        if n_layers <= 4:
+            return list(range(n_layers))
+        return sorted({round(i * (n_layers - 1) / 3) for i in range(4)})
+    raise ValueError(f"unknown layer strategy: {strategy}")
+
+
+class DecoderLayerInjectionHook:
+    """Apply a :class:`LayerWiseJEPAInjector` before selected decoder blocks.
+
+    The condition is set once per video and remains constant while scoring the
+    two answer continuations.  This avoids stochastic dropout differences
+    between the A and B likelihoods.
+    """
+
+    def __init__(self, model, injector):
+        self.injector = injector
+        self._current = None
+        self._handles = []
+        layers = resolve_decoder_layers(model)
+        for idx in injector.layer_indices:
+            if idx < 0 or idx >= len(layers):
+                raise IndexError(f"decoder layer {idx} outside [0, {len(layers)})")
+            self._handles.append(layers[idx].register_forward_pre_hook(
+                self._make_hook(idx), with_kwargs=True
+            ))
+
+    def _make_hook(self, layer_idx):
+        def pre_hook(module, args, kwargs):
+            if self._current is None:
+                return args, kwargs
+            if args:
+                hidden_states = args[0]
+                return (self.injector.apply(layer_idx, hidden_states, self._current),) + args[1:], kwargs
+            hidden_states = kwargs.get("hidden_states")
+            if hidden_states is None:
+                return args, kwargs
+            kwargs = dict(kwargs)
+            kwargs["hidden_states"] = self.injector.apply(layer_idx, hidden_states, self._current)
+            return args, kwargs
+        return pre_hook
+
+    def set(self, condition):
+        self._current = condition
+
+    def clear(self):
+        self._current = None
+
+    def remove(self):
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
 
 
 def prepend_placeholder_tokens(input_ids, attention_mask, n_tokens, placeholder_id):

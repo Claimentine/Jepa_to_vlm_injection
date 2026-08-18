@@ -24,7 +24,15 @@ from qwen_vl_utils import process_vision_info
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-from common.jepa_injection_model import JepaInjector, LanguageModelInjectionHook, prepend_placeholder_tokens  # noqa: E402
+from common.jepa_injection_model import (  # noqa: E402
+    DecoderLayerInjectionHook,
+    JepaInjector,
+    LanguageModelInjectionHook,
+    LayerWiseJEPAInjector,
+    prepend_placeholder_tokens,
+    resolve_decoder_layers,
+    select_layer_indices,
+)
 
 BASE = os.environ.get("VANS_ROOT", "/projects/bhay/william/ruixin/vans_world_model")
 WORK_BASE = os.environ.get("VANS_WORK_ROOT", "/work/nvme/bdqf/yli8/vans_raw_data")  # relocated off the near-full /projects/bhay allocation
@@ -87,8 +95,7 @@ def build_prompt_text(question, option_lines):
         "You are shown footage filmed from a first-person viewpoint.\n"
         f"{question}\n\n"
         + "\n".join(option_lines)
-        + "\n\nAnswer with exactly one line in the form:\n"
-        "Final answer: <LETTER>"
+        + "\n\nAnswer with only the option letter:"
     )
 
 
@@ -127,17 +134,46 @@ def build_inputs(processor, in_clip_path, prompt_text, max_frames=32):
     return inputs
 
 
-def append_answer_tokens(tokenizer, input_ids, attention_mask, true_letter):
-    suffix_text = f" Final answer: {true_letter}"
-    suffix_ids = tokenizer(suffix_text, add_special_tokens=False, return_tensors="pt")["input_ids"]
+def append_answer_tokens(tokenizer, input_ids, attention_mask, letter):
+    """Append a candidate continuation and return its token positions.
+
+    The leading space is intentional: Qwen's tokenizer represents answer
+    letters differently at a word boundary.  Scoring the complete candidate
+    sequence also remains correct if a future tokenizer splits a letter.
+    """
+    suffix_ids = tokenizer(f" {letter}", add_special_tokens=False, return_tensors="pt")["input_ids"]
     full_ids = torch.cat([input_ids, suffix_ids], dim=1)
     full_mask = torch.cat([attention_mask, torch.ones_like(suffix_ids)], dim=1)
-    labels = torch.full_like(full_ids, -100)
-    labels[:, -1] = full_ids[:, -1]
-    return full_ids, full_mask, labels
+    return full_ids, full_mask, suffix_ids
 
 
-def evaluate_teacher_forced(model, processor, hook, injector, items, n_tokens, placeholder_id, device, rng):
+def candidate_logprob(model, model_inputs, tokenizer, letter):
+    """Log P(letter | video, question, options), summed over answer tokens."""
+    prefix_len = model_inputs["input_ids"].shape[1]
+    input_ids, attn_mask, suffix_ids = append_answer_tokens(
+        tokenizer, model_inputs["input_ids"], model_inputs["attention_mask"], letter
+    )
+    call_inputs = dict(model_inputs)
+    call_inputs["input_ids"] = input_ids
+    call_inputs["attention_mask"] = attn_mask
+    out = model(**call_inputs)
+    positions = torch.arange(prefix_len - 1, prefix_len - 1 + suffix_ids.shape[1], device=out.logits.device)
+    token_logprobs = out.logits[0, positions].float().log_softmax(dim=-1)
+    targets = suffix_ids[0].to(out.logits.device)
+    return token_logprobs.gather(1, targets.unsqueeze(1)).sum()
+
+
+def prepare_model_inputs(inputs, injection_site, n_tokens, placeholder_id):
+    model_inputs = {k: v for k, v in inputs.items() if k not in ("input_ids", "attention_mask")}
+    input_ids, attn_mask = inputs["input_ids"], inputs["attention_mask"]
+    if injection_site == "prefix":
+        input_ids, attn_mask = prepend_placeholder_tokens(input_ids, attn_mask, n_tokens, placeholder_id)
+    model_inputs["input_ids"] = input_ids
+    model_inputs["attention_mask"] = attn_mask
+    return model_inputs
+
+
+def evaluate_logprob(model, processor, hook, injector, items, injection_site, n_tokens, placeholder_id, device, rng):
     model.eval()
     n_correct, n_total = 0, 0
     with torch.no_grad():
@@ -147,29 +183,19 @@ def evaluate_teacher_forced(model, processor, hook, injector, items, n_tokens, p
                 option_lines, correct_letter = build_option_block(item, rng)
                 prompt_text = build_prompt_text(item["question"], option_lines)
                 inputs = build_inputs(processor, item["in_clip"], prompt_text)
-                input_ids, attn_mask, labels = append_answer_tokens(
-                    processor.tokenizer, inputs["input_ids"], inputs["attention_mask"], correct_letter
-                )
-                input_ids, attn_mask = prepend_placeholder_tokens(input_ids, attn_mask, n_tokens, placeholder_id)
-                labels = torch.cat([torch.full((1, n_tokens), -100, dtype=labels.dtype), labels], dim=1)
-
-                model_inputs = {k: v for k, v in inputs.items() if k not in ("input_ids", "attention_mask")}
-                model_inputs["input_ids"] = input_ids
+                model_inputs = prepare_model_inputs(inputs, injection_site, n_tokens, placeholder_id)
                 model_inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in model_inputs.items()}
-                model_inputs["attention_mask"] = attn_mask.to(device)
-                labels = labels.to(device)
 
                 feats = torch.from_numpy(feats_np).unsqueeze(0).to(device)
-                soft_prompt = injector(feats)
-                hook.set(soft_prompt)
-                out = model(**model_inputs)
+                condition = injector(feats) if injection_site == "prefix" else injector.condition(feats)
+                hook.set(condition)
+                scores = torch.stack([
+                    candidate_logprob(model, model_inputs, processor.tokenizer, "A"),
+                    candidate_logprob(model, model_inputs, processor.tokenizer, "B"),
+                ])
                 hook.clear()
-
-                target_pos = (labels != -100).nonzero(as_tuple=True)[1].item()
-                pred_id = out.logits[0, target_pos - 1].argmax().item()
-                true_id = labels[0, target_pos].item()
                 n_total += 1
-                n_correct += int(pred_id == true_id)
+                n_correct += int(("A" if scores[0] > scores[1] else "B") == correct_letter)
             except Exception as e:
                 # matches the training loop's per-item try/except: a small fraction of
                 # clips are corrupt/too-short (bad feature cache or torchvision frame-count
@@ -182,7 +208,11 @@ def evaluate_teacher_forced(model, processor, hook, injector, items, n_tokens, p
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default=os.path.join(BASE, "raw_data/qa_split_full.json"))
-    ap.add_argument("--injection", choices=["jepa", "random"], required=True)
+    ap.add_argument("--injection", choices=["jepa", "random", "constant"], required=True,
+                    help="condition content; constant is a content-free learned control")
+    ap.add_argument("--injection_site", choices=["prefix", "film", "cross_attn"], default="prefix")
+    ap.add_argument("--layer_strategy", choices=["middle4", "last4", "uniform4", "all"], default="middle4",
+                    help="selected decoder layers for film/cross_attn")
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--val_every_steps", type=int, default=500)
@@ -221,12 +251,22 @@ def main():
     placeholder_id = processor.tokenizer.pad_token_id
     assert placeholder_id not in (video_token_id, image_token_id)
 
-    injector = JepaInjector(
-        jepa_dim=1024, hidden_size=hidden_size, mode=args.injection, seed=args.seed, pooling="temporal",
-    ).to(device)
-    hook = LanguageModelInjectionHook(model, n_tokens)
+    if args.injection_site == "prefix":
+        injector = JepaInjector(
+            jepa_dim=1024, hidden_size=hidden_size, mode=args.injection, seed=args.seed, pooling="temporal",
+        ).to(device)
+        hook = LanguageModelInjectionHook(model, n_tokens)
+        layer_indices = []
+    else:
+        layer_indices = select_layer_indices(len(resolve_decoder_layers(model)), args.layer_strategy)
+        injector = LayerWiseJEPAInjector(
+            hidden_size=hidden_size, layer_indices=layer_indices, condition_mode=args.injection,
+            seed=args.seed, mode=args.injection_site,
+        ).to(device)
+        hook = DecoderLayerInjectionHook(model, injector)
     opt = torch.optim.AdamW(injector.parameters(), lr=args.lr)
-    print(f"[INFO] injection={args.injection}  trainable_params={sum(p.numel() for p in injector.parameters()):,}")
+    print(f"[INFO] injection={args.injection} site={args.injection_site} layers={layer_indices} "
+          f"trainable_params={sum(p.numel() for p in injector.parameters()):,}")
 
     step = 0
     best_val_acc = -1.0
@@ -240,31 +280,19 @@ def main():
                 prompt_text = build_prompt_text(item["question"], option_lines)
                 inputs = build_inputs(processor, item["in_clip"], prompt_text)
 
-                input_ids, attn_mask, labels = append_answer_tokens(
-                    processor.tokenizer, inputs["input_ids"], inputs["attention_mask"], correct_letter
-                )
-                input_ids, attn_mask = prepend_placeholder_tokens(input_ids, attn_mask, n_tokens, placeholder_id)
-                labels = torch.cat([torch.full((1, n_tokens), -100, dtype=labels.dtype), labels], dim=1)
-
-                model_inputs = {k: v for k, v in inputs.items() if k not in ("input_ids", "attention_mask")}
-                model_inputs["input_ids"] = input_ids
+                model_inputs = prepare_model_inputs(inputs, args.injection_site, n_tokens, placeholder_id)
                 model_inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in model_inputs.items()}
-                model_inputs["attention_mask"] = attn_mask.to(device)
-                labels = labels.to(device)
 
                 feats = torch.from_numpy(load_vjepa_in_feats(item["in_clip"])).unsqueeze(0).to(device)
-                soft_prompt = injector(feats)
-                hook.set(soft_prompt)
-                out = model(**model_inputs)
+                condition = injector(feats) if args.injection_site == "prefix" else injector.condition(feats)
+                hook.set(condition)
+                scores = torch.stack([
+                    candidate_logprob(model, model_inputs, processor.tokenizer, "A"),
+                    candidate_logprob(model, model_inputs, processor.tokenizer, "B"),
+                ]).unsqueeze(0)
                 hook.clear()
-
-                shift_logits = out.logits[:, :-1, :]
-                shift_labels = labels[:, 1:]
-                loss = nn.functional.cross_entropy(
-                    shift_logits.reshape(-1, shift_logits.size(-1)).float(),
-                    shift_labels.reshape(-1),
-                    ignore_index=-100,
-                )
+                target = torch.tensor([0 if correct_letter == "A" else 1], device=device)
+                loss = nn.functional.cross_entropy(scores, target)
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
@@ -279,8 +307,8 @@ def main():
             log_f.flush()
 
             if step % args.val_every_steps == 0:
-                val_acc = evaluate_teacher_forced(model, processor, hook, injector, val_items, n_tokens, placeholder_id, device, rng)
-                print(f"[epoch {epoch} step {step}] val_acc(teacher_forced)={val_acc:.4f}")
+                val_acc = evaluate_logprob(model, processor, hook, injector, val_items, args.injection_site, n_tokens, placeholder_id, device, rng)
+                print(f"[epoch {epoch} step {step}] val_acc(logprob)={val_acc:.4f}")
                 log_f.write(json.dumps({"step": step, "val_acc": val_acc}) + "\n")
                 log_f.flush()
                 if val_acc > best_val_acc:
@@ -289,7 +317,7 @@ def main():
                                os.path.join(run_dir, "best.pt"))
 
     log_f.close()
-    print(f"[DONE] injection={args.injection}  best_val_acc(teacher_forced)={best_val_acc:.4f}")
+    print(f"[DONE] injection={args.injection}  best_val_acc(logprob)={best_val_acc:.4f}")
 
 
 if __name__ == "__main__":
