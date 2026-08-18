@@ -14,6 +14,7 @@ import json
 import os
 import random
 import sys
+import traceback
 
 import numpy as np
 import torch
@@ -141,7 +142,11 @@ def append_answer_tokens(tokenizer, input_ids, attention_mask, letter):
     letters differently at a word boundary.  Scoring the complete candidate
     sequence also remains correct if a future tokenizer splits a letter.
     """
-    suffix_ids = tokenizer(f" {letter}", add_special_tokens=False, return_tensors="pt")["input_ids"]
+    # .to(input_ids.device): the tokenizer always returns a fresh CPU tensor,
+    # but input_ids is already on the model's device by the time this is
+    # called -- without this cast, torch.cat below raises a CUDA/CPU device
+    # mismatch (confirmed on a real GPU run, not just by inspection).
+    suffix_ids = tokenizer(f" {letter}", add_special_tokens=False, return_tensors="pt")["input_ids"].to(input_ids.device)
     full_ids = torch.cat([input_ids, suffix_ids], dim=1)
     full_mask = torch.cat([attention_mask, torch.ones_like(suffix_ids)], dim=1)
     return full_ids, full_mask, suffix_ids
@@ -175,7 +180,12 @@ def prepare_model_inputs(inputs, injection_site, n_tokens, placeholder_id):
 
 def evaluate_logprob(model, processor, hook, injector, items, injection_site, n_tokens, placeholder_id, device, rng):
     model.eval()
+    # Without this, JepaPoolerTemporal's internal attention dropout (p=0.1)
+    # stays active during periodic in-training validation, adding noise to
+    # the val_acc used to pick best.pt.
+    injector.eval()
     n_correct, n_total = 0, 0
+    seen_exc_types = set()
     with torch.no_grad():
         for item in items:
             try:
@@ -200,8 +210,19 @@ def evaluate_logprob(model, processor, hook, injector, items, injection_site, n_
                 # matches the training loop's per-item try/except: a small fraction of
                 # clips are corrupt/too-short (bad feature cache or torchvision frame-count
                 # errors) -- skip rather than crash a multi-hour job on one item
-                print(f"[WARN] eval: skipping item {item.get('pid')}: {type(e).__name__}: {e}", flush=True)
+                exc_name = type(e).__name__
+                print(f"[WARN] eval: skipping item {item.get('pid')}: {exc_name}: {e}", flush=True)
+                # Full traceback once per distinct exception type -- enough to
+                # diagnose a systematic bug (e.g. a device mismatch) without
+                # spamming the same trace for every corrupt-cache item.
+                if exc_name not in seen_exc_types:
+                    seen_exc_types.add(exc_name)
+                    traceback.print_exc()
+    if n_total == 0 and items:
+        print(f"[WARN] eval: 0/{len(items)} items succeeded -- val_acc is meaningless, "
+              f"not a real 0.0 score", flush=True)
     model.train()
+    injector.train()
     return n_correct / max(n_total, 1)
 
 
@@ -239,11 +260,21 @@ def main():
     rng = random.Random(args.seed)
 
     print(f"[INFO] loading {MODEL_ID} (frozen) ...")
-    model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, dtype="auto", device_map="auto")
+    # device_map="auto" can silently CPU-offload a handful of decoder layers
+    # when the node's free VRAM is tight. That's harmless for a plain
+    # generate() call, but DecoderLayerInjectionHook hooks specific decoder
+    # layers directly and combines their hidden_states with this script's own
+    # (single-device) injector params -- an offloaded layer then raises a
+    # CPU/CUDA device-mismatch RuntimeError on every single forward pass
+    # (confirmed via kubectl logs on the film-injection smoke test: 100% of
+    # items failed this way, so best_val_acc's -1.0 sentinel was never
+    # overwritten). Pin everything to one device instead; a real OOM here is
+    # a far more diagnosable failure than a silent partial offload.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, dtype="auto").to(device)
     processor = AutoProcessor.from_pretrained(MODEL_ID)
     model.requires_grad_(False)
     model.eval()
-    device = next(model.parameters()).device
     hidden_size = model.config.text_config.hidden_size
 
     video_token_id = model.config.video_token_id
@@ -269,6 +300,8 @@ def main():
           f"trainable_params={sum(p.numel() for p in injector.parameters()):,}")
 
     step = 0
+    n_skipped = 0
+    seen_exc_types = set()
     best_val_acc = -1.0
     log_f = open(os.path.join(run_dir, "train_log.jsonl"), "w")
 
@@ -297,7 +330,15 @@ def main():
                 loss.backward()
                 opt.step()
             except Exception as e:
-                print(f"[WARN] skipping item {item.get('pid')}: {type(e).__name__}: {e}")
+                n_skipped += 1
+                exc_name = type(e).__name__
+                print(f"[WARN] skipping item {item.get('pid')}: {exc_name}: {e}")
+                # Full traceback once per distinct exception type -- enough to
+                # diagnose a systematic bug (e.g. a device mismatch) without
+                # spamming the same trace for every corrupt-cache item.
+                if exc_name not in seen_exc_types:
+                    seen_exc_types.add(exc_name)
+                    traceback.print_exc()
                 continue
 
             step += 1
@@ -317,7 +358,17 @@ def main():
                                os.path.join(run_dir, "best.pt"))
 
     log_f.close()
-    print(f"[DONE] injection={args.injection}  best_val_acc(logprob)={best_val_acc:.4f}")
+    if step == 0:
+        # best_val_acc is still its -1.0 init sentinel because validation
+        # (gated on successful *training* steps hitting val_every_steps)
+        # never ran once -- every train item raised an exception. Flag this
+        # loudly instead of printing a bare -1.0000 that reads like a real
+        # (if bad) score.
+        print(f"[DONE] injection={args.injection}  best_val_acc(logprob)=N/A "
+              f"(0/{len(train_items) * args.epochs} items succeeded -- see [WARN] lines above)")
+    else:
+        print(f"[DONE] injection={args.injection}  best_val_acc(logprob)={best_val_acc:.4f}  "
+              f"steps_completed={step}  items_skipped={n_skipped}")
 
 
 if __name__ == "__main__":

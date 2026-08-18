@@ -222,17 +222,27 @@ class LayerWiseJEPAInjector(nn.Module):
 
     def apply(self, layer_idx, hidden_states, condition):
         key = str(layer_idx)
+        # The frozen VLM typically runs in bf16/fp16 (dtype="auto"), while this
+        # injector's own params default to fp32. Without an explicit cast here,
+        # cross_attn's LayerNorm on hidden_states raises a dtype mismatch
+        # immediately, and film's elementwise mix silently upcasts hidden_states
+        # to fp32, which then mismatches the next (bf16-weighted) decoder
+        # sublayer. Do the injector-side math in the injector's own dtype, then
+        # cast the update back to hidden_states' dtype right before combining --
+        # mirrors LanguageModelInjectionHook's cast-at-the-boundary pattern.
+        condition = condition.to(dtype=self.gates[key].dtype)
         if self.mode == "film":
             global_condition = condition.mean(dim=1)
             gamma, beta = self.modulators[key](global_condition).chunk(2, dim=-1)
             # Bounded scale avoids an early optimizer step exploding a frozen
             # decoder's activations.
-            update = 0.1 * torch.tanh(gamma).unsqueeze(1) * hidden_states + beta.unsqueeze(1)
+            update = 0.1 * torch.tanh(gamma).unsqueeze(1) * hidden_states.to(condition.dtype) + beta.unsqueeze(1)
         else:
             update, _ = self.cross_attention[key](
-                self.query_norm[key](hidden_states), condition, condition, need_weights=False
+                self.query_norm[key](hidden_states.to(condition.dtype)), condition, condition, need_weights=False
             )
-        return hidden_states + self.gates[key] * update
+        update = (self.gates[key] * update).to(dtype=hidden_states.dtype)
+        return hidden_states + update
 
 
 class LanguageModelInjectionHook:

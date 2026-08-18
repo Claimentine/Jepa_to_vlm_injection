@@ -1,0 +1,177 @@
+# Step 5: train the JEPA -> Qwen3-VL-2B-Thinking injection adapter on the
+# full-scale VANS QA pairs (12,032 matched, train/val/test split in
+# raw_data/qa_split_full.json). Runs vans_qa/full_scale/train_qa_full.py.
+#
+# THIS FILE IS CURRENTLY SET TO A SMOKE TEST (--max_train_items 40
+# --epochs 1 --val_every_steps 20 --max_val_items 20), on purpose: this is
+# the first time common/jepa_injection_model.py's LayerWiseJEPAInjector
+# (film / cross_attn injection sites, added alongside the original prefix
+# soft-prompt site) has run on real cluster hardware. Confirm it actually
+# runs end-to-end (loss decreasing, val_acc(logprob) logged, best.pt
+# written) and check the GPU dashboard
+# (https://grafana.nrp-nautilus.io/d/dRG9q0Ymz/k8s-compute-resources-namespace-gpus)
+# before scaling up args.max_train_items / --epochs to a real run (lab
+# onboarding guide Section 1.2, "Be Truthful") -- the resources block below
+# is a starting estimate (2B-param VLM + 64-frame video encoding, batch
+# size 1), not measured.
+#
+# Needs a GPU: Qwen3-VL-2B-Thinking forward/backward passes over video +
+# text, same as extract_vlm_guidance_full.py. V-JEPA2 itself is NOT loaded
+# here -- this only reads its already-cached vjepa_feats (.npz) written by
+# job-03, so no vjepa2 checkpoint fetch step is needed.
+#
+# --injection {jepa,random,constant} x --injection_site {prefix,film,cross_attn}
+# is a 3x3 grid of conditions this codebase supports; this Job runs exactly
+# one cell (jepa x film, layer_strategy=middle4) at a time -- edit the args
+# below (or copy this file) to run a different cell.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-train-qa-injection
+spec:
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  # Same compute-capability floor as job-03 (installed
+                  # PyTorch build only supports sm_75/80/86/90/100/120).
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                  # Excluded 2026-08-18: both hit "GPU is lost" NVLink
+                  # device-plugin admission errors on back-to-back attempts
+                  # (nrp-fiona-001, then ry-gpu-01 twice) -- a cluster-side
+                  # driver/hardware issue, not something a retry from this
+                  # Job fixes. Remove once confirmed healthy again.
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - ry-gpu-01.sdsc.optiputer.net
+      containers:
+        - name: train-qa-injection
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              # Idempotent data-layout symlinks -- same as job-03, so this
+              # Job doesn't silently depend on manual setup done ad hoc in
+              # an interactive pod.
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/train_qa_full.py \
+                --injection jepa \
+                --injection_site film \
+                --layer_strategy middle4 \
+                --max_train_items 40 \
+                --epochs 1 \
+                --val_every_steps 20 \
+                --max_val_items 20
+              # For the full run, drop --max_train_items and restore the
+              # script's defaults (--epochs 3 --val_every_steps 500
+              # --max_val_items 200), or pass whatever the smoke test
+              # showed was actually needed.
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            # Keep the Qwen3-VL-2B-Thinking download (~4-5GB) on the data
+            # PVC, not the pod's bounded ephemeral-storage -- same reasoning
+            # as job-03's checkpoint fetch and job-04's snapshot_download.
+            - name: HF_HOME
+              value: /data/hf_cache
+            # Container stdout is fully-buffered (not line-buffered) when
+            # piped, unlike a terminal -- without this, kubectl logs shows
+            # nothing for long stretches even though the script is printing.
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "6"
+              memory: "24Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "7.2"
+              memory: "28800Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+  backoffLimit: 1 # tolerate one retry for a bad-node ("GPU is lost") admission
+                  # failure, seen in practice on this cluster; a real code
+                  # error will still fail loudly on the 2nd attempt
+
+# Apply with:
+#   kubectl apply -f job-05-train-qa-injection.yaml -n williamli-scvl
+# Watch it:
+#   kubectl get pods -n williamli-scvl -w
+#   kubectl logs -f job/ruixin-train-qa-injection -n williamli-scvl
+# Clean up when done (Golden Rule #4):
+#   kubectl delete job ruixin-train-qa-injection -n williamli-scvl
+#
+# Output: raw_data/qa_full_runs/<injection>/{train_log.jsonl,best.pt} under
+# the data PVC (i.e. /data/raw_data/qa_full_runs/jepa/ for this Job's args).

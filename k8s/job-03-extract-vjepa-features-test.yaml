@@ -1,24 +1,12 @@
-# Step 3: V-JEPA2 feature extraction for the full-scale VANS QA pipeline.
-#
-# Needs a GPU (load_dense_jepa_encoder / encode_dense_jepa_video call
-# .cuda() directly -- this cannot run CPU-only, unlike job-01/job-02).
-# Idempotent: vans_qa/full_scale/extract_vjepa_features_full.py skips any
-# clip that already has an output .npz, so re-running / resuming after a
-# preemption just picks up where it left off.
-#
-# Before applying the full run: submit once with --limit 50 (edit the args
-# below) and check the GPU dashboard
-# (https://grafana.nrp-nautilus.io/d/dRG9q0Ymz/k8s-compute-resources-namespace-gpus)
-# and CPU/memory dashboard while it runs. This script's GPU work is a tight
-# per-clip loop (decode -> cuda() -> forward -> save), so utilization should
-# sit well above the 40% fair-share floor, but confirm before committing to
-# the ~13.5k-clip full run, and adjust the resources block below to match
-# what you actually observe (lab onboarding guide Section 1.2, "Be
-# Truthful") -- the numbers below are a starting estimate, not measured.
+# TEST COPY of job-03-extract-vjepa-features.yaml: --limit 50 profiling run
+# to confirm GPU utilization (>40%) and CPU/memory before submitting the
+# full ~13.5k-clip job. Delete this Job (and this file) once the check is
+# done -- it's not meant to be kept around, see k8s/job-03-extract-vjepa-features.yaml
+# for the real one.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: ruixin-extract-vjepa-features
+  name: ruixin-extract-vjepa-features-test
 spec:
   template:
     spec:
@@ -80,9 +68,7 @@ spec:
               ")"
 
               cd "$REPO"
-              exec "$PY" vans_qa/full_scale/extract_vjepa_features_full.py
-              # For the profiling run, temporarily change the line above to:
-              #   exec "$PY" vans_qa/full_scale/extract_vjepa_features_full.py --limit 50
+              exec "$PY" vans_qa/full_scale/extract_vjepa_features_full.py --limit 50
           env:
             - name: VANS_ROOT
               value: /data
@@ -225,15 +211,12 @@ spec:
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
       restartPolicy: Never
-  backoffLimit: 2
+  backoffLimit: 0
 
 # Apply with:
-#   kubectl apply -f job-03-extract-vjepa-features.yaml -n williamli-scvl
+#   kubectl apply -f job-03-extract-vjepa-features-test.yaml -n williamli-scvl
 # Watch it:
 #   kubectl get pods -n williamli-scvl -w
-#   kubectl logs -f job/ruixin-extract-vjepa-features -n williamli-scvl
-# Clean up when done (Golden Rule #4):
-#   kubectl delete job ruixin-extract-vjepa-features -n williamli-scvl
-#
-# Check GPU utilization stayed healthy (fair-share, Section 1.2):
-#   https://grafana.nrp-nautilus.io/d/dRG9q0Ymz/k8s-compute-resources-namespace-gpus
+#   kubectl logs -f job/ruixin-extract-vjepa-features-test -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-extract-vjepa-features-test -n williamli-scvl

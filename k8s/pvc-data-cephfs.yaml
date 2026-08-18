@@ -12,8 +12,13 @@ spec:
     - ReadWriteMany # Allows multiple pods to mount this
   resources:
     requests:
-      storage: 200Gi # VANS demo+CSVs is ~700MB; grow this before adding
-                      # COIN/YouCook2 raw video or full V-JEPA2 feature caches
+      storage: 400Gi # Grown from 200Gi on 2026-08-18: hit 100% full mid
+                      # V-JEPA2 feature extraction (job-03) -- vans_injection_backup
+                      # alone reached 189.6GB against the 200Gi cap, and the
+                      # full extraction over all 13,629 needed clips at
+                      # ~16MB/npz needs ~330-350GB total including the
+                      # existing backup, checkpoints, and hf_cache. rook-cephfs
+                      # supports online expansion (no pod restart needed).
 
 # Apply with:
 #   kubectl apply -f pvc-data-cephfs.yaml -n williamli-scvl

@@ -94,10 +94,16 @@ kubectl delete job ruixin-setup-env ruixin-fetch-vans-data ruixin-extract-vjepa-
 | `job-01-setup-env.yaml` | Job `ruixin-setup-env` | builds `thinkjepa`/`qwen3vl` conda envs onto the conda PVC, clones+patches ThinkJEPA |
 | `job-02-fetch-vans-data.yaml` | Job `ruixin-fetch-vans-data` | downloads VANS-Data-100K CSVs + demo bundle from `KlingTeam/VANS` on HF into the data PVC |
 | `job-03-extract-vjepa-features.yaml` | Job `ruixin-extract-vjepa-features` | downloads the V-JEPA2 ViT-L checkpoint (CPU initContainer) + extracts features for whichever of the 18,147 needed clips aren't already cached (GPU) |
+| `job-04-fetch-vans-injection-backup.yaml` | `/data/hf_data/vans_injection_backup/` | restores the `Claimentine/vans-injection-data` HF backup (clips + V-JEPA2 caches + `qa_split_full.json`) -- see `docs/data_and_checkpoints.md` |
+| `job-05-train-qa-injection.yaml` | Job `ruixin-train-qa-injection`, `raw_data/qa_full_runs/<injection>/best.pt` | trains the JEPA->Qwen3-VL-2B-Thinking injection adapter (`vans_qa/full_scale/train_qa_full.py`); currently set to a smoke-test config, see the file's header comment |
+| `job-06-eval-qa-injection.yaml` | Job `ruixin-eval-qa-injection`, `raw_data/qa_eval_full_<injection>.jsonl` | held-out test eval for a job-05 checkpoint (`vans_qa/full_scale/eval_qa_full.py`); template, edit `--checkpoint` |
+| `job-07-train-qa-{jepa,random,constant}-film.yaml` | Jobs `ruixin-train-qa-{jepa,random,constant}-film` | full-scale (script defaults: 3 epochs, all ~12k train items) film-injection 3-way comparison; submit together after job-05's smoke test passes |
 
-All three Jobs are idempotent -- re-applying/re-running skips work that's
+Jobs 01-04 are idempotent -- re-applying/re-running skips work that's
 already done (checks for existing conda env dirs / downloaded files /
-output `.npz` before redoing them).
+output `.npz` before redoing them). Jobs 05/06 are not: re-applying
+job-05 overwrites `best.pt` for that `--injection` value from scratch
+(no resume), and job-06 always rewrites its output `.jsonl`.
 
 ## Next steps (not yet built)
 

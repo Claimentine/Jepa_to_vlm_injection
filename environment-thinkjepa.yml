@@ -28,3 +28,6 @@ dependencies:
       - yt-dlp[default]==2026.7.4
       - yt-dlp-ejs   # node-based JS-challenge solver yt-dlp needs for YouTube bot-check bypass
       - decord
+      - timm   # ThinkJEPA's vjepa2/src/models/utils/modules.py imports timm.layers.drop_path
+      - h5py   # egodex/trajectory_dataset.py, egodex/utils/trajectory_data_utils.py
+      - tqdm   # cache_train/thinker_train.py, egodex/utils/trajectory_data_utils.py

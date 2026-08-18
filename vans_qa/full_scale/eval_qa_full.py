@@ -8,6 +8,7 @@ import json
 import os
 import random
 import sys
+import traceback
 
 import torch
 
@@ -52,11 +53,15 @@ def main():
     print(f"[INFO] {len(test_items)} usable test items")
 
     print(f"[INFO] loading {MODEL_ID} ...")
-    model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, dtype="auto", device_map="auto")
+    # See train_qa_full.py's model-loading comment: device_map="auto" can
+    # silently CPU-offload a decoder layer, which breaks
+    # DecoderLayerInjectionHook's film/cross_attn injection with a
+    # CPU/CUDA device-mismatch RuntimeError on every item. Pin to one device.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, dtype="auto").to(device)
     processor = AutoProcessor.from_pretrained(MODEL_ID)
     model.requires_grad_(False)
     model.eval()
-    device = next(model.parameters()).device
     hidden_size = model.config.text_config.hidden_size
 
     injector, hook, layer_indices = None, None, []
@@ -68,6 +73,13 @@ def main():
         checkpoint_site = saved_args.get("injection_site", "prefix")
         if checkpoint_site != args.injection_site:
             raise ValueError(f"checkpoint site={checkpoint_site}, requested {args.injection_site}")
+        # film/cross_attn checkpoints for jepa/random/constant conditions share
+        # identical parameter shapes, so a mismatched --injection here would
+        # load_state_dict() successfully and silently score this checkpoint
+        # under the wrong condition instead of failing loudly.
+        checkpoint_injection = saved_args.get("injection")
+        if checkpoint_injection is not None and checkpoint_injection != args.injection:
+            raise ValueError(f"checkpoint injection={checkpoint_injection}, requested {args.injection}")
         if args.injection_site == "prefix":
             injector = JepaInjector(
                 jepa_dim=1024, hidden_size=hidden_size, mode=args.injection,
@@ -88,6 +100,7 @@ def main():
         print(f"[INFO] injection={args.injection} site={args.injection_site} layers={layer_indices}")
 
     rng = random.Random(args.seed)
+    seen_exc_types = set()
 
     with open(out_path, "w") as out_f, torch.no_grad():
         for i, item in enumerate(test_items):
@@ -117,7 +130,11 @@ def main():
                     "logprob_A": float(scores[0].item()), "logprob_B": float(scores[1].item()),
                 }
             except Exception as e:
-                record = {"pid": item["pid"], "error": f"{type(e).__name__}: {e}"}
+                exc_name = type(e).__name__
+                record = {"pid": item["pid"], "error": f"{exc_name}: {e}"}
+                if exc_name not in seen_exc_types:
+                    seen_exc_types.add(exc_name)
+                    traceback.print_exc()
 
             out_f.write(json.dumps(record) + "\n")
             out_f.flush()

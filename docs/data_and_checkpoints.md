@@ -53,9 +53,12 @@ setup they can point at the same place.
 
 ## Backing up processed data
 
-A private HF dataset repo (`Claimentine/vans-injection-data`) has a partial
-backup of `clips/` (complete) and the V-JEPA2 / VLM-guidance feature caches
+An HF dataset repo (`Claimentine/vans-injection-data`) has a partial backup
+of `clips/` (complete) and the V-JEPA2 / VLM-guidance feature caches
 (uploading is slow -- HF rate-limits to 128 commits/hour and there are
 30k+ small files, so `huggingface_hub.upload_large_folder` takes many
-hours). Not wired into any script here; was done ad hoc with
-`huggingface_hub.HfApi`.
+hours). Was private originally; made public 2026-07-29, so it no longer
+needs an HF token to pull. Restored onto the data PVC via
+`k8s/job-04-fetch-vans-injection-backup.yaml` (this predates and is
+independent of `k8s/job-03-extract-vjepa-features.yaml`'s own manual-restore
+note in `k8s/README.md`).

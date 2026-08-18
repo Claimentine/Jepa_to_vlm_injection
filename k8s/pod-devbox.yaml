@@ -1,0 +1,133 @@
+# Interactive dev/debug environment -- the Nautilus equivalent of an
+# `srun --pty bash` interactive Slurm allocation that you'd then attach
+# VS Code Remote-SSH to. Kubernetes pods have no SSH server, so instead
+# this runs `code tunnel` as the pod's main process: it authenticates once
+# (via a URL printed to the pod's logs) and then your local VS Code desktop
+# app can connect to it directly over Microsoft's tunnel relay -- no
+# inbound network access to the pod required. See:
+# https://code.visualstudio.com/docs/remote/tunnels
+#
+# This is a bare Pod, not a Job -- it's meant to sit and idle while you
+# work, which is exactly what interactive dev pods are for. The lab's
+# "never sleep infinity" rule (see k8s/README.md) is about Jobs and GPU
+# pods; this is neither -- Interactive Pods are explicitly allowed to
+# sleep/idle. Still: DELETE IT when you're not actively using it (see
+# bottom of this file) -- both to be a good cluster citizen and because it
+# holds the RWO conda PVC, which blocks job-01 from running concurrently.
+#
+# IMPORTANT: per the onboarding guide's Interactive Pod lifecycle rules,
+# this pod is AUTOMATICALLY DESTROYED 6 HOURS after creation, no matter
+# whether you're using it. That's not a bug -- it's the documented cap for
+# this workload type (also capped at 2 GPUs / 32GB RAM / 16 CPU cores,
+# none of which we're anywhere near). When it disappears, just re-apply
+# this file; the VS Code CLI binary and tunnel auth persist on the conda
+# PVC under /home/jovyan, so reconnecting won't need re-authentication.
+#
+# CPU-only, no GPU -- this is for editing/debugging code, not running it.
+# Sized for a real VS Code Server + extension host session (see resources
+# below) rather than the "1 CPU + 2GB" fair-share exemption -- that
+# exemption sounded nice but wasn't enough memory in practice and got this
+# pod OOMKilled. DELETE the pod when you're done for the day; don't rely
+# on the exemption to excuse leaving it running idle.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ruixin-devbox
+spec:
+  containers:
+    - name: devbox
+      image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+      command:
+        - "bash"
+      args:
+        - "-c"
+        - |
+          set -euo pipefail
+          mkdir -p /home/jovyan/.vscode-cli-bin /home/jovyan/.tmp
+          cd /home/jovyan/.vscode-cli-bin
+          if [ ! -x ./code ]; then
+            echo "[setup] fetching VS Code CLI"
+            curl -L 'https://update.code.visualstudio.com/latest/cli-linux-x64/stable' \
+              -o vscode_cli.tar.gz
+            tar -xf vscode_cli.tar.gz
+          fi
+          echo "=================================================="
+          echo "[AUTH] first run: watch this log for a device-code URL"
+          echo "  (kubectl logs -f pod/ruixin-devbox -n williamli-scvl)"
+          echo "  and open it in a browser to sign in (GitHub account)."
+          echo "  Credentials persist under /home/jovyan on the conda PVC,"
+          echo "  so you won't need to re-auth on pod restarts."
+          echo "=================================================="
+          exec ./code tunnel --accept-server-license-terms --name ruixin-devbox
+      env:
+        - name: HOME
+          value: "/home/jovyan"
+        # VS Code Server / extension host / some pip-installed extension
+        # tooling don't all respect $HOME for scratch files -- pointing
+        # TMPDIR at the PVC keeps that off the container's small local
+        # writable-layer quota (which caused an eviction once already) and
+        # makes extension caches survive pod restarts too.
+        - name: TMPDIR
+          value: "/home/jovyan/.tmp"
+      resources:
+        requests:
+          # No longer sized to the "1 CPU + 2GB" fair-share exemption --
+          # 2400Mi wasn't enough headroom for a real VS Code Server +
+          # extension host session and this pod got OOMKilled (exit 137)
+          # after ~1.5h of actual use. Since this is a genuinely-used
+          # interactive session (not idle squatting), it's fine to size for
+          # real usage and fall under the normal 20-150%/20-200% fair-share
+          # band instead of the small-pod exemption. The mitigation is
+          # behavioral, not resource-based: DELETE this pod when you're
+          # done for the day (see bottom of file) rather than leaving it
+          # running idle -- that's what would actually risk a violation.
+          cpu: "2"
+          memory: "4Gi"
+          ephemeral-storage: "4Gi"
+        limits:
+          # Limits capped at 20% above requests (Nautilus fair-share policy).
+          cpu: "2.4"
+          memory: "4800Mi"
+          ephemeral-storage: "8Gi"
+      volumeMounts:
+        - name: conda-storage
+          mountPath: /home/jovyan
+        - name: data-storage
+          mountPath: /data
+  volumes:
+    - name: conda-storage
+      persistentVolumeClaim:
+        claimName: ruixin-conda-vol # RWO -- can't be mounted while job-01 is running, and vice versa
+    - name: data-storage
+      persistentVolumeClaim:
+        claimName: jepa-vlm-injection-data-vol # RWX -- fine to share with job-02/job-03
+  securityContext:
+    fsGroup: 1000
+    fsGroupChangePolicy: OnRootMismatch
+  restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f pod-devbox.yaml -n williamli-scvl
+# Watch for the auth URL on first run:
+#   kubectl logs -f pod/ruixin-devbox -n williamli-scvl
+# Then, on your local machine:
+#   1. Install the "Remote - Tunnels" extension in VS Code.
+#   2. Command Palette -> "Remote Tunnels: Connect to Tunnel" -> pick
+#      "ruixin-devbox". (Or just open the vscode.dev URL the CLI
+#      prints, if you'd rather work in the browser.)
+#   3. File > Open Folder -> /home/jovyan (code + conda envs) or /data
+#      (datasets).
+# NOTE: job-01 only ever checked out this repo into an ephemeral emptyDir
+# (discarded after that Job finished) -- there's no persistent copy on the
+# cluster yet. First time you connect, clone it onto the conda PVC so it
+# survives pod restarts:
+#   git clone https://github.com/Claimentine/Jepa_to_vlm_injection.git \
+#     /home/jovyan/Jepa_to_vlm_injection
+# Quick shell without VS Code, if you just need that:
+#   kubectl exec -it pod/ruixin-devbox -n williamli-scvl -- bash
+# DELETE when done for the session (frees the RWO conda PVC for job-01,
+# and is good hygiene even though this pod is exempt from the fair-share
+# CPU/memory check):
+#   kubectl delete pod ruixin-devbox -n williamli-scvl
+# It'll also vanish on its own after 6 hours regardless -- see the
+# IMPORTANT note above. Just re-apply this file to get a fresh one.

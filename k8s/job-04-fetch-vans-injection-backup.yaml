@@ -1,0 +1,163 @@
+# Step 3: pull the private-backup-turned-public HF dataset
+# Claimentine/vans-injection-data onto the data PVC.
+#
+# NOTE: docs/data_and_checkpoints.md (written while this was still a private
+# repo) says this needs an HF token for *access* -- as of 2026-08-08 the HF
+# API reports "private": false for this repo, so access itself no longer
+# needs one. BUT the first unauthenticated run of this Job (2026-08-09) hit
+# HTTP 429 (Xet backend rate limit) four times in a row within ~10min each,
+# most likely because Nautilus pods egress through shared cluster IPs. So
+# this Job now uses an HF_TOKEN anyway, purely to get a higher rate limit --
+# requires a one-time `kubectl create secret generic hf-token
+# --from-literal=token=hf_xxx -n williamli-scvl` (any free personal token,
+# read scope is enough; never commit the token itself to this repo).
+#
+# Contents (~101GB, ~30k+ files):
+#   qa_split_full.json           12,032 matched QA pairs (train/val/test split)
+#   clips/                       extracted COIN/YouCook2 video segments (.mp4)
+#   vjepa_cache_full/            V-JEPA2 ViT-L patch-token features (.npz)
+#   vlm_guidance_cache_full/     Qwen3-VL-2B-Thinking guidance features (.npz)
+#
+# CPU-only, no GPU (this is a plain download, not compute).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-fetch-vans-injection-backup
+spec:
+  template:
+    spec:
+      initContainers:
+        # CephFS provisions the volume root as root-owned. Make the empty volume
+        # writable by the non-root UID used by the PRP runtime image.
+        - name: init-data-permissions
+          image: busybox:1.36
+          command:
+            - "sh"
+          args:
+            - "-c"
+            - "chown 1000:1000 /data && chmod 0775 /data"
+          securityContext:
+            runAsUser: 0
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          volumeMounts:
+            - name: data-storage
+              mountPath: /data
+      containers:
+        - name: fetch-vans-injection-backup
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          env:
+            # Speeds up the ~30k-small-file / ~101GB transfer materially.
+            # (HF_HUB_ENABLE_HF_TRANSFER is the older knob; the PRP image's
+            # huggingface_hub uses Xet transfer by default now.)
+            - name: HF_XET_HIGH_PERFORMANCE
+              value: "1"
+            # Keep the HF cache/blob store on the PVC, not the pod's bounded
+            # ephemeral-storage -- a 101GB download would blow the 1200Mi limit
+            # below otherwise.
+            - name: HF_HOME
+              value: "/data/hf_cache"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              pip install --quiet -U huggingface_hub hf_xet
+              mkdir -p /data/hf_data/vans_injection_backup
+              python3 - <<'PY'
+              import os
+              import time
+              from huggingface_hub import snapshot_download
+
+              REPO_ID = "Claimentine/vans-injection-data"
+              DEST = "/data/hf_data/vans_injection_backup"
+              MARKER = os.path.join(DEST, ".snapshot_complete")
+              MAX_ATTEMPTS = 12  # local_dir resumes, so retries only redo the in-flight file(s)
+
+              if os.path.exists(MARKER):
+                  print(f"[skip] {DEST} already fully synced (marker present)")
+              else:
+                  print(f"[fetch] snapshot_download({REPO_ID!r}) -> {DEST}")
+                  print("[fetch] ~101GB / 30k+ files -- this is the slow step, "
+                        "and safe to re-run: already-downloaded files are skipped.")
+                  for attempt in range(1, MAX_ATTEMPTS + 1):
+                      try:
+                          snapshot_download(
+                              repo_id=REPO_ID,
+                              repo_type="dataset",
+                              local_dir=DEST,
+                              max_workers=4,  # lower burst rate against the Xet backend than the default 8
+                          )
+                          break
+                      except Exception as e:
+                          if attempt == MAX_ATTEMPTS:
+                              raise
+                          delay = min(30 * (2 ** (attempt - 1)), 900)
+                          print(f"[retry] attempt {attempt}/{MAX_ATTEMPTS} failed ({e!r}); "
+                                f"resuming in {delay}s")
+                          time.sleep(delay)
+                  open(MARKER, "w").close()
+
+              print("[fetch] done. top-level layout:")
+              for name in sorted(os.listdir(DEST)):
+                  print(" ", name)
+              PY
+
+              echo "=================================================="
+              echo "[VERIFY] expect at least: qa_split_full.json, clips/,"
+              echo "  vjepa_cache_full/, vlm_guidance_cache_full/ under"
+              echo "  /data/hf_data/vans_injection_backup"
+              echo "[NEXT] point full-scale scripts at this data with:"
+              echo "  export VANS_ROOT=/data/hf_data/vans_injection_backup"
+              echo "  export VANS_WORK_ROOT=/data/hf_data/vans_injection_backup"
+              echo "=================================================="
+          resources:
+            requests:
+              # 1 CPU / 2Gi is the documented fair-share exemption threshold
+              # ("these restrictions do not apply to small pods requesting 1
+              # CPU core and 2GB of memory") -- measured actual usage on this
+              # I/O-bound download was ~104m CPU / 206Mi mem against a prior
+              # 2 CPU / 3Gi request, i.e. ~5-7% utilization, well under the
+              # 20% floor and at real risk of a CPU/memory-waste violation.
+              # Sized to the exempt profile instead of trying to chase the
+              # 20% band on a workload that's inherently mostly idle-waiting.
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1.2"
+              memory: "2400Mi"
+              ephemeral-storage: "1200Mi"
+          volumeMounts:
+            - name: data-storage
+              mountPath: /data
+      volumes:
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        # The PRP image runs as UID 1000; this grants that group write access to new PVCs.
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+  backoffLimit: 3 # a bit more headroom than job-02: bigger transfer, more chances to hit a transient network blip
+
+# Apply with:
+#   kubectl apply -f job-03-fetch-vans-injection-backup.yaml -n williamli-scvl
+# Watch it (this will run a long time -- 101GB over many small files):
+#   kubectl logs -f job/ruixin-fetch-vans-injection-backup -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-fetch-vans-injection-backup -n williamli-scvl
