@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import sys
+import zipfile
 from pathlib import Path
 
 import cv2
@@ -73,6 +74,24 @@ def read_clip_frames(mp4_path, n_frames=NUM_FRAMES):
     return frames
 
 
+def is_valid_npz(path):
+    # A prior run wrote directly to out_path (see the save call below, now
+    # fixed) and got killed mid-write on this preemptible cluster often
+    # enough to leave ~41% of the cache as 0-byte or truncated-zip stubs.
+    # Those still pass a bare os.path.exists() check, so the "already
+    # extracted" skip below silently perpetuated them forever. Actually open
+    # the archive and touch the array data before trusting a file as done.
+    try:
+        with zipfile.ZipFile(path) as z:
+            if z.testzip() is not None:
+                return False
+            with np.load(path) as d:
+                d["feats"]
+        return True
+    except Exception:
+        return False
+
+
 def clip_to_model_input(frames, adapter):
     # load_dense_jepa_encoder's second return value is a transform *spec*
     # (resize/crop/normalize params), not a callable -- VideoObservationAdapter
@@ -108,14 +127,21 @@ def main():
     for clip_path in clips:
         name = safe_name(clip_path)
         out_path = os.path.join(OUT_DIR, f"{name}.npz")
-        if os.path.exists(out_path):
+        if os.path.exists(out_path) and is_valid_npz(out_path):
             n_skip += 1
             continue
         try:
             frames = read_clip_frames(clip_path)
             video = clip_to_model_input(frames, adapter).cuda()
             feats = encode_dense_jepa_video(video, model_pt)
-            np.savez(out_path, feats=feats[0].half().cpu().numpy())
+            # Write to a same-directory temp file and atomically rename into
+            # place, so a pod eviction/OOM kill mid-write can never leave a
+            # truncated .npz sitting at out_path -- either the full file
+            # lands, or nothing does and the next run's is_valid_npz() check
+            # above naturally redoes it.
+            tmp_path = out_path + f".tmp{os.getpid()}"
+            np.savez(tmp_path, feats=feats[0].half().cpu().numpy())
+            os.replace(tmp_path, out_path)
             n_ok += 1
         except Exception as e:
             n_err += 1
