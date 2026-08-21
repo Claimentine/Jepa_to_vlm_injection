@@ -139,7 +139,16 @@ def main():
             # truncated .npz sitting at out_path -- either the full file
             # lands, or nothing does and the next run's is_valid_npz() check
             # above naturally redoes it.
-            tmp_path = out_path + f".tmp{os.getpid()}"
+            #
+            # Must already end in ".npz": np.savez() silently *appends*
+            # ".npz" to any path that doesn't already have it, so a tmp name
+            # like "<out_path>.tmp<pid>" actually gets written to
+            # "<out_path>.tmp<pid>.npz" and the os.replace() below then
+            # raises FileNotFoundError on the un-suffixed name every single
+            # time -- confirmed on the 2026-08-20 run: ok=0 err=7494 despite
+            # exiting 0, with 7494 orphaned "*.tmp<pid>.npz" stubs left
+            # behind instead of real output.
+            tmp_path = os.path.join(OUT_DIR, f"{name}.tmp{os.getpid()}.npz")
             np.savez(tmp_path, feats=feats[0].half().cpu().numpy())
             os.replace(tmp_path, out_path)
             n_ok += 1
