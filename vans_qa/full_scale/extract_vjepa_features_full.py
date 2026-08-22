@@ -86,7 +86,18 @@ def is_valid_npz(path):
             if z.testzip() is not None:
                 return False
             with np.load(path) as d:
-                d["feats"]
+                feats = d["feats"]
+                # The shared cache dir also has ~76% of its files left over
+                # from an older extraction config -- (32,256,1024) instead of
+                # this script's (NUM_FRAMES,128,1024). Same archive validity,
+                # wrong shape: a bare readability check silently trusted them
+                # too. Downstream, JepaInjector's mode="constant" hard-asserts
+                # feats.shape[0] == NUM_FRAMES and crashes on them; mode="jepa"/
+                # "random" don't crash but silently mean-pool over the wrong
+                # number of frames. Treat shape mismatches as invalid so this
+                # script's own idempotent skip-if-done logic redoes them.
+                if feats.shape != (NUM_FRAMES, 128, 1024):
+                    return False
         return True
     except Exception:
         return False
