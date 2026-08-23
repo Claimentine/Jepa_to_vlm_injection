@@ -41,6 +41,15 @@ spec:
                       - Tesla-V100-PCIE-16GB
                       - Tesla-V100-SXM2-16GB
                       - Tesla-V100-SXM2-32GB
+                      # Excluded 2026-08-22: 11GB is enough compute
+                      # capability-wise but not memory-wise -- the frozen
+                      # Qwen3-VL-2B model alone eats ~10.5GB, leaving no
+                      # headroom for the paired A/B logprob forward+backward's
+                      # activations. Confirmed via kubectl logs: 100% of items
+                      # skipped with "CUDA out of memory ... GPU 0 has a total
+                      # capacity of 10.57 GiB". The A10 (23GB) job-07 runs
+                      # completed fine, so the floor is somewhere between.
+                      - NVIDIA-GeForce-RTX-2080-Ti
                   # Excluded 2026-08-18: both hit "GPU is lost" NVLink
                   # device-plugin admission errors on back-to-back attempts
                   # (nrp-fiona-001, then ry-gpu-01 twice) -- a cluster-side
