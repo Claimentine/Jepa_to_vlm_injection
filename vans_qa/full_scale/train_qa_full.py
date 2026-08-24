@@ -11,6 +11,7 @@ Run extract_vjepa_features_full.py and extract_vlm_guidance_full.py first.
 import argparse
 import glob
 import json
+import multiprocessing as mp
 import os
 import random
 import sys
@@ -112,22 +113,68 @@ def clamp_frame_count(mp4_path, requested):
     return (nf // 2) * 2
 
 
+DECODE_TIMEOUT_S = 60
+
+
+def _decode_video_worker(conn, abs_path, nframes, prompt_text):
+    # Runs in a throwaway child process (see build_inputs) so a hung
+    # decord.VideoReader() call on a badly corrupted clip can be killed from
+    # outside -- decord is a native/ffmpeg extension, and a call that never
+    # returns to Python can't be interrupted by a signal or a timeout in the
+    # same process (confirmed in practice: a training job sat stuck on one
+    # clip for 6+ hours at 0% GPU util with the per-item try/except doing
+    # nothing, since no exception was ever raised to catch).
+    try:
+        video_content = {
+            "type": "video", "video": f"file://{abs_path}",
+            "resized_height": 256, "resized_width": 256, "nframes": nframes,
+        }
+        messages = [{"role": "user", "content": [video_content, {"type": "text", "text": prompt_text}]}]
+        images, videos, video_kwargs = process_vision_info(
+            messages, image_patch_size=16, return_video_kwargs=True, return_video_metadata=True,
+        )
+        video_metadatas = None
+        if videos is not None:
+            videos, video_metadatas = zip(*videos)
+            videos, video_metadatas = list(videos), list(video_metadatas)
+        conn.send(("ok", (images, videos, video_metadatas, video_kwargs)))
+    except Exception as e:
+        conn.send(("err", e))
+    finally:
+        conn.close()
+
+
 def build_inputs(processor, in_clip_path, prompt_text, max_frames=32):
     abs_path = os.path.abspath(in_clip_path)
     nframes = clamp_frame_count(abs_path, max_frames)
+
+    parent_conn, child_conn = mp.Pipe(duplex=False)
+    proc = mp.Process(target=_decode_video_worker, args=(child_conn, abs_path, nframes, prompt_text))
+    proc.start()
+    child_conn.close()  # parent's copy of the write end; child still holds its own
+    if parent_conn.poll(DECODE_TIMEOUT_S):
+        status, payload = parent_conn.recv()
+    else:
+        status, payload = "timeout", None
+    parent_conn.close()
+    proc.join(5)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join()
+    if status == "timeout":
+        raise TimeoutError(f"video decode exceeded {DECODE_TIMEOUT_S}s on {in_clip_path}")
+    if status == "err":
+        raise payload
+    images, videos, video_metadatas, video_kwargs = payload
+
+    # Rebuilt here (not sent back through the pipe) since it's cheap and pure
+    # text -- no need to serialize it across the process boundary twice.
     video_content = {
         "type": "video", "video": f"file://{abs_path}",
         "resized_height": 256, "resized_width": 256, "nframes": nframes,
     }
     messages = [{"role": "user", "content": [video_content, {"type": "text", "text": prompt_text}]}]
-    images, videos, video_kwargs = process_vision_info(
-        messages, image_patch_size=16, return_video_kwargs=True, return_video_metadata=True,
-    )
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    video_metadatas = None
-    if videos is not None:
-        videos, video_metadatas = zip(*videos)
-        videos, video_metadatas = list(videos), list(video_metadatas)
     inputs = processor(
         text=text, images=images, videos=videos, video_metadata=video_metadatas,
         return_tensors="pt", do_resize=False, **(video_kwargs or {}),
