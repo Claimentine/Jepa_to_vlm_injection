@@ -2,12 +2,13 @@
 # x layer_strategy=middle4, script defaults (--epochs 3 --val_every_steps 500
 # --max_val_items 200, no --max_train_items cap -- all ~12k usable train
 # items). Sibling Jobs job-07-train-qa-random-film.yaml and
-# job-07-train-qa-constant-film.yaml run the matched random/constant control
-# conditions for the same 3-way jepa-vs-random-vs-constant comparison (see
+# job-07-train-qa-none-film.yaml run the matched random/none control
+# conditions for the same 3-way jepa-vs-random-vs-none comparison (see
 # JepaInjector's docstring in common/jepa_injection_model.py for why the
-# controls matter: `random` isolates "does the JEPA content itself help" vs
-# just extra trainable capacity, `constant` isolates
-# "video-dependent conditioning" vs "extra capacity at the injection site").
+# random control matters: it isolates "does the JEPA content itself help" vs
+# just extra trainable capacity. `none` (train_qa_full.py's
+# `--injection none`, no JepaInjector involved) is the blank baseline --
+# frozen zero-shot accuracy with no injection module at all.
 # Submit all three concurrently -- they write to distinct
 # raw_data/qa_full_runs/<injection>/ subdirs and use distinct GPUs, so they
 # don't collide.

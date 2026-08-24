@@ -229,8 +229,9 @@ def evaluate_logprob(model, processor, hook, injector, items, injection_site, n_
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default=os.path.join(BASE, "raw_data/qa_split_full.json"))
-    ap.add_argument("--injection", choices=["jepa", "random", "constant"], required=True,
-                    help="condition content; constant is a content-free learned control")
+    ap.add_argument("--injection", choices=["jepa", "random", "constant", "none"], required=True,
+                    help="condition content; constant is a content-free learned control, "
+                         "none is a frozen zero-shot baseline with no injector at all")
     ap.add_argument("--injection_site", choices=["prefix", "film", "cross_attn"], default="prefix")
     ap.add_argument("--layer_strategy", choices=["middle4", "last4", "uniform4", "all"], default="middle4",
                     help="selected decoder layers for film/cross_attn")
@@ -258,6 +259,50 @@ def main():
     val_items = val_items[: args.max_val_items]
 
     rng = random.Random(args.seed)
+
+    if args.injection == "none":
+        # Blank control: no injector, no hook, no trainable params at all --
+        # measures the frozen VLM's zero-shot accuracy on this task. Deliberately
+        # bypasses JepaInjector entirely (unlike "constant", which still routes
+        # through it with a learned-but-content-free tensor) so this condition
+        # can't inherit the injector's shape assumptions (see is_valid_npz's
+        # note in extract_vjepa_features_full.py about the 32-vs-64-frame cache
+        # mismatch that broke "constant"). There's nothing to train, so this
+        # is a single zero-shot pass over val_items, not an epoch loop.
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, dtype="auto").to(device)
+        processor = AutoProcessor.from_pretrained(MODEL_ID)
+        model.requires_grad_(False)
+        model.eval()
+        print("[INFO] injection=none (frozen zero-shot baseline, no trainable params)")
+
+        n_correct, n_total = 0, 0
+        seen_exc_types = set()
+        log_f = open(os.path.join(run_dir, "train_log.jsonl"), "w")
+        with torch.no_grad():
+            for item in val_items:
+                try:
+                    option_lines, correct_letter = build_option_block(item, rng)
+                    prompt_text = build_prompt_text(item["question"], option_lines)
+                    inputs = build_inputs(processor, item["in_clip"], prompt_text)
+                    model_inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
+                    scores = torch.stack([
+                        candidate_logprob(model, model_inputs, processor.tokenizer, "A"),
+                        candidate_logprob(model, model_inputs, processor.tokenizer, "B"),
+                    ])
+                    n_total += 1
+                    n_correct += int(("A" if scores[0] > scores[1] else "B") == correct_letter)
+                except Exception as e:
+                    exc_name = type(e).__name__
+                    print(f"[WARN] skipping item {item.get('pid')}: {exc_name}: {e}")
+                    if exc_name not in seen_exc_types:
+                        seen_exc_types.add(exc_name)
+                        traceback.print_exc()
+        val_acc = n_correct / max(n_total, 1)
+        log_f.write(json.dumps({"step": 0, "val_acc": val_acc}) + "\n")
+        log_f.close()
+        print(f"[DONE] injection=none  val_acc(logprob)={val_acc:.4f}  items_scored={n_total}/{len(val_items)}")
+        return
 
     print(f"[INFO] loading {MODEL_ID} (frozen) ...")
     # device_map="auto" can silently CPU-offload a handful of decoder layers

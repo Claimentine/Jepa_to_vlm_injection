@@ -20,10 +20,12 @@
 # here -- this only reads its already-cached vjepa_feats (.npz) written by
 # job-03, so no vjepa2 checkpoint fetch step is needed.
 #
-# --injection {jepa,random,constant} x --injection_site {prefix,film,cross_attn}
-# is a 3x3 grid of conditions this codebase supports; this Job runs exactly
-# one cell (jepa x film, layer_strategy=middle4) at a time -- edit the args
-# below (or copy this file) to run a different cell.
+# --injection {jepa,random,constant,none} x --injection_site {prefix,film,cross_attn}
+# is the grid of conditions this codebase supports (--injection_site is
+# ignored when --injection none, since that condition never builds an
+# injector or hook); this Job runs exactly one cell (jepa x film,
+# layer_strategy=middle4) at a time -- edit the args below (or copy this
+# file) to run a different cell.
 apiVersion: batch/v1
 kind: Job
 metadata:

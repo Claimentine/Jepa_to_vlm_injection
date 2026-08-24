@@ -6,7 +6,7 @@
 # to test whether gains come from JEPA content vs. just extra trainable
 # soft-prompt capacity (see JepaInjector's docstring in
 # common/jepa_injection_model.py). Sibling Jobs job-07-train-qa-jepa-film.yaml
-# and job-07-train-qa-constant-film.yaml run the same comparison's other two
+# and job-07-train-qa-none-film.yaml run the same comparison's other two
 # conditions. Submit all three concurrently -- distinct output dirs, distinct
 # GPUs, no collision.
 #

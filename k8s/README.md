@@ -97,7 +97,7 @@ kubectl delete job ruixin-setup-env ruixin-fetch-vans-data ruixin-extract-vjepa-
 | `job-04-fetch-vans-injection-backup.yaml` | `/data/hf_data/vans_injection_backup/` | restores the `Claimentine/vans-injection-data` HF backup (clips + V-JEPA2 caches + `qa_split_full.json`) -- see `docs/data_and_checkpoints.md` |
 | `job-05-train-qa-injection.yaml` | Job `ruixin-train-qa-injection`, `raw_data/qa_full_runs/<injection>/best.pt` | trains the JEPA->Qwen3-VL-2B-Thinking injection adapter (`vans_qa/full_scale/train_qa_full.py`); currently set to a smoke-test config, see the file's header comment |
 | `job-06-eval-qa-injection.yaml` | Job `ruixin-eval-qa-injection`, `raw_data/qa_eval_full_<injection>.jsonl` | held-out test eval for a job-05 checkpoint (`vans_qa/full_scale/eval_qa_full.py`); template, edit `--checkpoint` |
-| `job-07-train-qa-{jepa,random,constant}-film.yaml` | Jobs `ruixin-train-qa-{jepa,random,constant}-film` | full-scale (script defaults: 3 epochs, all ~12k train items) film-injection 3-way comparison; submit together after job-05's smoke test passes |
+| `job-07-train-qa-{jepa,random,none}-film.yaml` | Jobs `ruixin-train-qa-{jepa,random,none}-film` | full-scale (script defaults: 3 epochs, all ~12k train items) film-injection 3-way comparison (`jepa`/`random` train an injector over 3 epochs; `none` is a single zero-shot pass, no injector); submit together after job-05's smoke test passes |
 
 Jobs 01-04 are idempotent -- re-applying/re-running skips work that's
 already done (checks for existing conda env dirs / downloaded files /

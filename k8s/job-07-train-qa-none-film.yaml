@@ -1,24 +1,28 @@
-# Step 7 (3/3): full-scale training run, injection=constant x injection_site=film
-# x layer_strategy=middle4, script defaults (--epochs 3 --val_every_steps 500
-# --max_val_items 200, no --max_train_items cap -- all ~12k usable train
-# items). `constant` is the other control condition: a learned,
-# video-independent token set with the same shape as the temporal JEPA
-# condition, to test whether gains come from video-dependent content vs. just
-# extra trainable capacity at the injection site (see JepaInjector's
-# docstring in common/jepa_injection_model.py). Sibling Jobs
-# job-07-train-qa-jepa-film.yaml and job-07-train-qa-random-film.yaml run the
-# same comparison's other two conditions. Submit all three concurrently --
-# distinct output dirs, distinct GPUs, no collision.
+# Step 7 (3/3): full-scale run, injection=none -- the blank control. No
+# injector, no hook, no trainable params at all: this measures the frozen
+# Qwen3-VL-2B's zero-shot accuracy on the QA task, a single pass over
+# val_items rather than an epoch loop (see the `if args.injection == "none"`
+# branch in train_qa_full.py). Sibling Jobs job-07-train-qa-jepa-film.yaml and
+# job-07-train-qa-random-film.yaml run the other two conditions of the same
+# 3-way comparison. Submit all three concurrently -- distinct output dirs,
+# distinct GPUs, no collision.
+#
+# Replaces the former injection=constant condition (same job slot, same
+# node-affinity fixes carried over below): constant's learned video-independent
+# token set hard-asserted vjepa_feats.shape[1] == 64 and crashed 100% of items
+# once the shared feature cache turned out to have ~76% of its files left over
+# at the wrong (32,256,1024) shape from an older extraction config (see
+# is_valid_npz's note in extract_vjepa_features_full.py). `none` sidesteps
+# that whole bug family by never touching vjepa_feats or JepaInjector at all.
 #
 # Only apply this after job-05-train-qa-injection.yaml's smoke test has
 # confirmed the film injection path runs end-to-end without error on real
-# cluster hardware -- this is a genuinely long run (~12k items x 3 epochs x 2
-# forward+backward passes per item for the paired A/B logprob loss), so
-# don't commit the GPU-hours before that check.
+# cluster hardware -- injection=none itself needs no such check (no injector),
+# but keep the three siblings submitted together for a fair comparison.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: ruixin-train-qa-constant-film
+  name: ruixin-train-qa-none-film
 spec:
   template:
     spec:
@@ -38,15 +42,12 @@ spec:
                       - Tesla-V100-PCIE-16GB
                       - Tesla-V100-SXM2-16GB
                       - Tesla-V100-SXM2-32GB
-                      # Excluded 2026-08-22: 11GB is enough compute
-                      # capability-wise but not memory-wise -- the frozen
-                      # Qwen3-VL-2B model alone eats ~10.5GB, leaving no
-                      # headroom for the paired A/B logprob forward+backward's
-                      # activations. Confirmed via kubectl logs on the sibling
-                      # jepa-film run: 100% of items skipped with "CUDA out of
-                      # memory ... GPU 0 has a total capacity of 10.57 GiB".
-                      # The A10 (23GB) job-07 runs completed fine, so the
-                      # floor is somewhere between.
+                      # Carried over from the old constant-film job: the frozen
+                      # Qwen3-VL-2B alone eats ~10.5GB, so an 11GB card leaves
+                      # little headroom. injection=none is forward-only (no
+                      # backward graph, no injector activations) so it may
+                      # well fit on an RTX 2080 Ti, but this hasn't been
+                      # confirmed and there's no cost to staying conservative.
                       - NVIDIA-GeForce-RTX-2080-Ti
                   # Excluded 2026-08-18: both hit "GPU is lost" NVLink
                   # device-plugin admission errors (see
@@ -60,7 +61,7 @@ spec:
                       - nrp-fiona-001.sdmz.amnh.org
                       - ry-gpu-01.sdsc.optiputer.net
       containers:
-        - name: train-qa-constant-film
+        - name: train-qa-none-film
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
           command:
             - "bash"
@@ -77,7 +78,7 @@ spec:
 
               cd "$REPO"
               exec "$PY" vans_qa/full_scale/train_qa_full.py \
-                --injection constant \
+                --injection none \
                 --injection_site film \
                 --layer_strategy middle4
           env:
@@ -148,10 +149,11 @@ spec:
                   # failure, seen in practice on this cluster
 
 # Apply with:
-#   kubectl apply -f job-07-train-qa-constant-film.yaml -n williamli-scvl
+#   kubectl apply -f job-07-train-qa-none-film.yaml -n williamli-scvl
 # Watch it:
-#   kubectl logs -f job/ruixin-train-qa-constant-film -n williamli-scvl
+#   kubectl logs -f job/ruixin-train-qa-none-film -n williamli-scvl
 # Clean up when done (Golden Rule #4):
-#   kubectl delete job ruixin-train-qa-constant-film -n williamli-scvl
+#   kubectl delete job ruixin-train-qa-none-film -n williamli-scvl
 #
-# Output: /data/raw_data/qa_full_runs/constant/{train_log.jsonl,best.pt}
+# Output: /data/raw_data/qa_full_runs/none/train_log.jsonl (no best.pt -- no
+# trainable params to checkpoint)
