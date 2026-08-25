@@ -2,18 +2,26 @@
 # full-scale VANS QA pairs (12,032 matched, train/val/test split in
 # raw_data/qa_split_full.json). Runs vans_qa/full_scale/train_qa_full.py.
 #
-# THIS FILE IS CURRENTLY SET TO A SMOKE TEST (--max_train_items 40
-# --epochs 1 --val_every_steps 20 --max_val_items 20), on purpose: this is
-# the first time common/jepa_injection_model.py's LayerWiseJEPAInjector
-# (film / cross_attn injection sites, added alongside the original prefix
-# soft-prompt site) has run on real cluster hardware. Confirm it actually
-# runs end-to-end (loss decreasing, val_acc(logprob) logged, best.pt
-# written) and check the GPU dashboard
-# (https://grafana.nrp-nautilus.io/d/dRG9q0Ymz/k8s-compute-resources-namespace-gpus)
-# before scaling up args.max_train_items / --epochs to a real run (lab
-# onboarding guide Section 1.2, "Be Truthful") -- the resources block below
-# is a starting estimate (2B-param VLM + 64-frame video encoding, batch
-# size 1), not measured.
+# THIS FILE IS CURRENTLY SET TO A QUICK TREND-CHECK RUN (jepa x cross_attn,
+# --max_train_items 1600 --epochs 1 --val_every_steps 200), not the 3-epoch
+# full run: `film`'s injection_site collapses LayerWiseJEPAInjector's (B, T,
+# H) temporal condition down to one global vector via `condition.mean(dim=1)`
+# before modulating (see apply()'s mode=="film" branch) -- the same
+# global-pooling failure mode JepaPoolerTemporal was built to avoid (see its
+# docstring's post-mortem on "random beat jepa"). The job-07 film 3-way
+# comparison's jepa run showed exactly that signature (val_acc oscillating
+# 0.42-0.58 with no trend, same ballpark as injection=none's 0.4427 zero-shot
+# baseline -- see run_logs/jepa_film_run1.log). `cross_attn` doesn't mean-pool
+# -- each decoder token individually cross-attends all 64 temporal JEPA
+# tokens -- so this run checks whether that's actually the fix, cheaply,
+# before committing to a full 3-epoch run or fixing `film` itself.
+# --out_dir points at a separate directory so this doesn't clobber the film
+# run's checkpoint/log under qa_full_runs/jepa/.
+#
+# (Originally a smoke test for LayerWiseJEPAInjector's film/cross_attn sites
+# the first time they ran on real cluster hardware -- that already passed,
+# see job-07's completed film runs -- edit the args below, or copy this file,
+# to run a different cell.)
 #
 # Needs a GPU: Qwen3-VL-2B-Thinking forward/backward passes over video +
 # text, same as extract_vlm_guidance_full.py. V-JEPA2 itself is NOT loaded
@@ -23,7 +31,7 @@
 # --injection {jepa,random,constant,none} x --injection_site {prefix,film,cross_attn}
 # is the grid of conditions this codebase supports (--injection_site is
 # ignored when --injection none, since that condition never builds an
-# injector or hook); this Job runs exactly one cell (jepa x film,
+# injector or hook); this Job runs exactly one cell (jepa x cross_attn,
 # layer_strategy=middle4) at a time -- edit the args below (or copy this
 # file) to run a different cell.
 apiVersion: batch/v1
@@ -93,16 +101,20 @@ spec:
               cd "$REPO"
               exec "$PY" vans_qa/full_scale/train_qa_full.py \
                 --injection jepa \
-                --injection_site film \
+                --injection_site cross_attn \
                 --layer_strategy middle4 \
-                --max_train_items 40 \
+                --max_train_items 1600 \
                 --epochs 1 \
-                --val_every_steps 20 \
-                --max_val_items 20
-              # For the full run, drop --max_train_items and restore the
-              # script's defaults (--epochs 3 --val_every_steps 500
-              # --max_val_items 200), or pass whatever the smoke test
-              # showed was actually needed.
+                --val_every_steps 200 \
+                --max_val_items 200 \
+                --out_dir /data/raw_data/qa_full_runs_crossattn_test
+              # ~34% of items get skipped (bad/missing clips), so 1600 raw
+              # train items lands around 1000 successful steps -- enough to
+              # see whether val_acc trends up instead of oscillating around
+              # chance the way the film run did. If it does, scale up
+              # --max_train_items / --epochs for a real run (and switch
+              # --out_dir back to the default so it lands under
+              # qa_full_runs/jepa/ alongside the other conditions).
           env:
             - name: VANS_ROOT
               value: /data
