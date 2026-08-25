@@ -115,6 +115,18 @@ def clamp_frame_count(mp4_path, requested):
 
 DECODE_TIMEOUT_S = 60
 
+# By the time build_inputs() is first called, the parent process has already
+# initialized a CUDA context (the frozen VLM is loaded onto `device` earlier
+# in main()). fork() -- the default start method on Linux -- after CUDA init
+# is documented as unsafe by NVIDIA and manifests here as a near-universal
+# hang in the child: every single distinct clip timed out at exactly
+# DECODE_TIMEOUT_S with 0% GPU util and near-zero CPU, which isn't what a
+# slow *decode* looks like (that would vary per clip and burn CPU) -- it's
+# what a child stuck at startup on inherited, fork-unsafe CUDA driver state
+# looks like. spawn re-execs a fresh interpreter instead of forking, so the
+# child never touches the parent's CUDA context.
+_MP_CTX = mp.get_context("spawn")
+
 
 def _decode_video_worker(conn, abs_path, requested_frames, prompt_text):
     # Runs in a throwaway child process (see build_inputs) so a hung native
@@ -153,8 +165,8 @@ def _decode_video_worker(conn, abs_path, requested_frames, prompt_text):
 def build_inputs(processor, in_clip_path, prompt_text, max_frames=32):
     abs_path = os.path.abspath(in_clip_path)
 
-    parent_conn, child_conn = mp.Pipe(duplex=False)
-    proc = mp.Process(target=_decode_video_worker, args=(child_conn, abs_path, max_frames, prompt_text))
+    parent_conn, child_conn = _MP_CTX.Pipe(duplex=False)
+    proc = _MP_CTX.Process(target=_decode_video_worker, args=(child_conn, abs_path, max_frames, prompt_text))
     proc.start()
     child_conn.close()  # parent's copy of the write end; child still holds its own
     if parent_conn.poll(DECODE_TIMEOUT_S):
