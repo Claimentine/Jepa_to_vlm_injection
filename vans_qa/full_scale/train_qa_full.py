@@ -128,6 +128,44 @@ DECODE_TIMEOUT_S = 60
 _MP_CTX = mp.get_context("spawn")
 
 
+def _to_ipc_safe(obj):
+    # torch registers a custom multiprocessing reducer for every Tensor
+    # (even over a plain mp.Pipe, not just torch.multiprocessing.Queue) that
+    # ships it via a shared-memory segment plus a file-descriptor handoff
+    # through a side-channel `multiprocessing.resource_sharer` Unix socket,
+    # instead of just writing the bytes into the pipe. That handoff only
+    # works while the sending (child) process is still alive to serve it --
+    # nothing here synchronizes "parent finished unpickling" with "child may
+    # now exit", so a child that tears down right after conn.send() races the
+    # parent's parent_conn.recv(), which sometimes loses: confirmed in
+    # practice via ConnectionResetError / FileNotFoundError inside
+    # torch/multiprocessing/reductions.py's rebuild_storage_fd, accounting
+    # for close to a third of all "corrupt clip" skips before this fix.
+    # Converting to plain numpy sidesteps torch's reducer entirely -- numpy
+    # arrays just get pickled inline into the pipe's normal byte stream.
+    if isinstance(obj, torch.Tensor):
+        return obj.numpy()
+    if isinstance(obj, dict):
+        return {k: _to_ipc_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_ipc_safe(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_to_ipc_safe(v) for v in obj)
+    return obj
+
+
+def _from_ipc_safe(obj):
+    if isinstance(obj, np.ndarray):
+        return torch.from_numpy(obj)
+    if isinstance(obj, dict):
+        return {k: _from_ipc_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_from_ipc_safe(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_from_ipc_safe(v) for v in obj)
+    return obj
+
+
 def _decode_video_worker(conn, abs_path, requested_frames, prompt_text):
     # Runs in a throwaway child process (see build_inputs) so a hung native
     # call on a badly corrupted clip can be killed from outside -- both
@@ -155,7 +193,7 @@ def _decode_video_worker(conn, abs_path, requested_frames, prompt_text):
         if videos is not None:
             videos, video_metadatas = zip(*videos)
             videos, video_metadatas = list(videos), list(video_metadatas)
-        conn.send(("ok", (nframes, images, videos, video_metadatas, video_kwargs)))
+        conn.send(("ok", _to_ipc_safe((nframes, images, videos, video_metadatas, video_kwargs))))
     except Exception as e:
         conn.send(("err", e))
     finally:
@@ -182,7 +220,7 @@ def build_inputs(processor, in_clip_path, prompt_text, max_frames=32):
         raise TimeoutError(f"video decode exceeded {DECODE_TIMEOUT_S}s on {in_clip_path}")
     if status == "err":
         raise payload
-    nframes, images, videos, video_metadatas, video_kwargs = payload
+    nframes, images, videos, video_metadatas, video_kwargs = _from_ipc_safe(payload)
 
     # Rebuilt here (not sent back through the pipe) since it's cheap and pure
     # text -- no need to serialize it across the process boundary twice.
