@@ -125,13 +125,14 @@ def main():
                 pred_letter = "A" if scores[0] > scores[1] else "B"
 
                 record = {
-                    "pid": item["pid"], "correct_letter": correct_letter, "pred_letter": pred_letter,
+                    "pid": item["pid"], "difficulty": item.get("difficulty"),
+                    "correct_letter": correct_letter, "pred_letter": pred_letter,
                     "correct": pred_letter == correct_letter,
                     "logprob_A": float(scores[0].item()), "logprob_B": float(scores[1].item()),
                 }
             except Exception as e:
                 exc_name = type(e).__name__
-                record = {"pid": item["pid"], "error": f"{exc_name}: {e}"}
+                record = {"pid": item["pid"], "difficulty": item.get("difficulty"), "error": f"{exc_name}: {e}"}
                 if exc_name not in seen_exc_types:
                     seen_exc_types.add(exc_name)
                     traceback.print_exc()

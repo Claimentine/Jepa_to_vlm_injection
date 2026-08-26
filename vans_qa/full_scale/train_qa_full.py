@@ -280,13 +280,50 @@ def prepare_model_inputs(inputs, injection_site, n_tokens, placeholder_id):
     return model_inputs
 
 
+class AccTally:
+    """Overall + per-`difficulty` accuracy (qa_split_temporal.json tags each
+    val/test row "easy" or "hard"; qa_split_full.json has no such field, so
+    by_difficulty just stays empty and summary_str() degrades to a bare
+    overall number -- old-split runs are unaffected).
+    """
+
+    def __init__(self):
+        self.n_correct = 0
+        self.n_total = 0
+        self.by_difficulty = {}
+
+    def add(self, item, is_correct):
+        self.n_correct += int(is_correct)
+        self.n_total += 1
+        diff = item.get("difficulty")
+        if diff is not None:
+            c = self.by_difficulty.setdefault(diff, [0, 0])
+            c[0] += int(is_correct)
+            c[1] += 1
+
+    @property
+    def acc(self):
+        return self.n_correct / max(self.n_total, 1)
+
+    @property
+    def acc_by_difficulty(self):
+        return {k: v[0] / max(v[1], 1) for k, v in self.by_difficulty.items()}
+
+    def summary_str(self):
+        s = f"{self.acc:.4f}"
+        if self.by_difficulty:
+            parts = " ".join(f"{k}={v:.4f}" for k, v in sorted(self.acc_by_difficulty.items()))
+            s += f" ({parts})"
+        return s
+
+
 def evaluate_logprob(model, processor, hook, injector, items, injection_site, n_tokens, placeholder_id, device, rng):
     model.eval()
     # Without this, JepaPoolerTemporal's internal attention dropout (p=0.1)
     # stays active during periodic in-training validation, adding noise to
     # the val_acc used to pick best.pt.
     injector.eval()
-    n_correct, n_total = 0, 0
+    tally = AccTally()
     seen_exc_types = set()
     with torch.no_grad():
         for item in items:
@@ -306,8 +343,7 @@ def evaluate_logprob(model, processor, hook, injector, items, injection_site, n_
                     candidate_logprob(model, model_inputs, processor.tokenizer, "B"),
                 ])
                 hook.clear()
-                n_total += 1
-                n_correct += int(("A" if scores[0] > scores[1] else "B") == correct_letter)
+                tally.add(item, ("A" if scores[0] > scores[1] else "B") == correct_letter)
             except Exception as e:
                 # matches the training loop's per-item try/except: a small fraction of
                 # clips are corrupt/too-short (bad feature cache or torchvision frame-count
@@ -320,12 +356,12 @@ def evaluate_logprob(model, processor, hook, injector, items, injection_site, n_
                 if exc_name not in seen_exc_types:
                     seen_exc_types.add(exc_name)
                     traceback.print_exc()
-    if n_total == 0 and items:
+    if tally.n_total == 0 and items:
         print(f"[WARN] eval: 0/{len(items)} items succeeded -- val_acc is meaningless, "
               f"not a real 0.0 score", flush=True)
     model.train()
     injector.train()
-    return n_correct / max(n_total, 1)
+    return tally
 
 
 def main():
@@ -378,7 +414,7 @@ def main():
         model.eval()
         print("[INFO] injection=none (frozen zero-shot baseline, no trainable params)")
 
-        n_correct, n_total = 0, 0
+        tally = AccTally()
         seen_exc_types = set()
         log_f = open(os.path.join(run_dir, "train_log.jsonl"), "w")
         with torch.no_grad():
@@ -392,18 +428,18 @@ def main():
                         candidate_logprob(model, model_inputs, processor.tokenizer, "A"),
                         candidate_logprob(model, model_inputs, processor.tokenizer, "B"),
                     ])
-                    n_total += 1
-                    n_correct += int(("A" if scores[0] > scores[1] else "B") == correct_letter)
+                    tally.add(item, ("A" if scores[0] > scores[1] else "B") == correct_letter)
                 except Exception as e:
                     exc_name = type(e).__name__
                     print(f"[WARN] skipping item {item.get('pid')}: {exc_name}: {e}")
                     if exc_name not in seen_exc_types:
                         seen_exc_types.add(exc_name)
                         traceback.print_exc()
-        val_acc = n_correct / max(n_total, 1)
-        log_f.write(json.dumps({"step": 0, "val_acc": val_acc}) + "\n")
+        log_f.write(json.dumps({
+            "step": 0, "val_acc": tally.acc, "val_acc_by_difficulty": tally.acc_by_difficulty,
+        }) + "\n")
         log_f.close()
-        print(f"[DONE] injection=none  val_acc(logprob)={val_acc:.4f}  items_scored={n_total}/{len(val_items)}")
+        print(f"[DONE] injection=none  val_acc(logprob)={tally.summary_str()}  items_scored={tally.n_total}/{len(val_items)}")
         return
 
     print(f"[INFO] loading {MODEL_ID} (frozen) ...")
@@ -495,12 +531,14 @@ def main():
             log_f.flush()
 
             if step % args.val_every_steps == 0:
-                val_acc = evaluate_logprob(model, processor, hook, injector, val_items, args.injection_site, n_tokens, placeholder_id, device, rng)
-                print(f"[epoch {epoch} step {step}] val_acc(logprob)={val_acc:.4f}")
-                log_f.write(json.dumps({"step": step, "val_acc": val_acc}) + "\n")
+                val_tally = evaluate_logprob(model, processor, hook, injector, val_items, args.injection_site, n_tokens, placeholder_id, device, rng)
+                print(f"[epoch {epoch} step {step}] val_acc(logprob)={val_tally.summary_str()}")
+                log_f.write(json.dumps({
+                    "step": step, "val_acc": val_tally.acc, "val_acc_by_difficulty": val_tally.acc_by_difficulty,
+                }) + "\n")
                 log_f.flush()
-                if val_acc > best_val_acc:
-                    best_val_acc = val_acc
+                if val_tally.acc > best_val_acc:
+                    best_val_acc = val_tally.acc
                     torch.save({"args": vars(args), "injector_state": injector.state_dict()},
                                os.path.join(run_dir, "best.pt"))
 
