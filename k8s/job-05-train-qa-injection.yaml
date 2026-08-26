@@ -74,11 +74,17 @@ spec:
                   # (nrp-fiona-001, then ry-gpu-01 twice) -- a cluster-side
                   # driver/hardware issue, not something a retry from this
                   # Job fixes. Remove once confirmed healthy again.
+                  #
+                  # hcc-chase-shor-c4705.unl.edu added 2026-08-27: same
+                  # UnexpectedAdmissionError / PodScheduled=False signature,
+                  # hit on both of this job's backoffLimit=1 attempts (both
+                  # landed on this same node).
                   - key: kubernetes.io/hostname
                     operator: NotIn
                     values:
                       - nrp-fiona-001.sdmz.amnh.org
                       - ry-gpu-01.sdsc.optiputer.net
+                      - hcc-chase-shor-c4705.unl.edu
       containers:
         - name: train-qa-injection
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
