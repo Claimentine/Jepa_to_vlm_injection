@@ -5,18 +5,21 @@
 # regex answer parsing.
 #
 # TEMPLATE: --checkpoint below must point at a best.pt that already exists
-# on the data PVC (written by job-05, under
-# /data/raw_data/qa_full_runs/<injection>/best.pt) -- this Job will fail
-# fast (checkpoint not found) if you apply it before job-05 has produced
-# one. --injection / --injection_site / --layer_strategy must match what
-# that checkpoint was trained with (eval_qa_full.py now asserts this and
-# raises instead of silently mis-scoring a mismatched checkpoint -- see the
-# code-review notes in the commit that added this Job).
+# on the data PVC. --injection / --injection_site / --layer_strategy must
+# match what that checkpoint was trained with (eval_qa_full.py asserts this
+# and raises instead of silently mis-scoring a mismatched checkpoint).
 #
-# Set to a --max_test_items 30 smoke test for the same reason as job-05: the
-# paired-logprob eval path is new. Raise it (up to the script's default 300,
-# or drop the flag for the full test split) once a smoke run confirms
-# correct/total counts look sane.
+# THIS RUN: scores the completed job-05 jepa x cross_attn checkpoint
+# (best.pt, val_acc(logprob)=1.0000 on the OLD split's easy-only val) against
+# qa_split_temporal.json's test set instead -- every anchor there contributes
+# both an "easy" (old-style, any-video) and a "hard" (same-source-video) row,
+# and eval_qa_full.py now tags each output record with its difficulty. Since
+# build_qa_pairs_temporal.py emits them as adjacent easy/hard pairs per
+# anchor, the first --max_test_items items are already ~50/50 balanced
+# without any extra stratified sampling. The question this answers: does
+# val_acc=1.0000 hold on the hard tier (real temporal understanding) or
+# crater toward chance (the scene-matching shortcut suspected from job-05's
+# suspiciously fast convergence)?
 #
 # Needs a GPU, same compute-capability floor as job-03/job-05.
 apiVersion: batch/v1
@@ -54,12 +57,14 @@ spec:
                   # Excluded 2026-08-18: both hit "GPU is lost" NVLink
                   # device-plugin admission errors (see
                   # job-05-train-qa-injection.yaml for the original note).
-                  # Remove once confirmed healthy again.
+                  # hcc-chase-shor-c4705.unl.edu added 2026-08-27, same
+                  # signature. Remove once confirmed healthy again.
                   - key: kubernetes.io/hostname
                     operator: NotIn
                     values:
                       - nrp-fiona-001.sdmz.amnh.org
                       - ry-gpu-01.sdsc.optiputer.net
+                      - hcc-chase-shor-c4705.unl.edu
       containers:
         - name: eval-qa-injection
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
@@ -78,11 +83,13 @@ spec:
 
               cd "$REPO"
               exec "$PY" vans_qa/full_scale/eval_qa_full.py \
+                --split /data/raw_data/qa_split_temporal.json \
                 --injection jepa \
-                --injection_site film \
+                --injection_site cross_attn \
                 --layer_strategy middle4 \
-                --checkpoint /data/raw_data/qa_full_runs/jepa/best.pt \
-                --max_test_items 30
+                --checkpoint /data/raw_data/qa_full_runs_crossattn_test/jepa/best.pt \
+                --max_test_items 600 \
+                --out /data/raw_data/qa_eval_temporal_jepa_crossattn.jsonl
           env:
             - name: VANS_ROOT
               value: /data
@@ -157,6 +164,7 @@ spec:
 # Clean up when done:
 #   kubectl delete job ruixin-eval-qa-injection -n williamli-scvl
 #
-# Output: raw_data/qa_eval_full_<injection>.jsonl on the data PVC, one
-# record per test item ({pid, correct_letter, pred_letter, correct,
-# logprob_A, logprob_B} or {pid, error} for skipped items).
+# Output: raw_data/qa_eval_temporal_jepa_crossattn.jsonl on the data PVC, one
+# record per test item ({pid, difficulty, correct_letter, pred_letter,
+# correct, logprob_A, logprob_B} or {pid, difficulty, error} for skipped
+# items) -- group by "difficulty" to get the easy vs. hard accuracy split.
