@@ -15,6 +15,7 @@ import multiprocessing as mp
 import os
 import random
 import sys
+import time
 import traceback
 
 import numpy as np
@@ -488,9 +489,24 @@ def main():
     best_val_acc = -1.0
     log_f = open(os.path.join(run_dir, "train_log.jsonl"), "w")
 
+    # Nautilus/PRP federates GPUs from dozens of campuses onto one cluster
+    # backed by a single shared CephFS -- a node's path to that storage can
+    # be fine or badly congested/distant depending on which campus it's on,
+    # and that's invisible from the GPU spec alone. A slow path shows up here
+    # as the GPU sitting mostly idle while every item's video decode /
+    # feature read crawls -- confirmed in practice via a run stuck at
+    # ~70s/step (vs. ~20-35s/step on a healthy node) for 13+ hours before
+    # anyone noticed. Surface that within the first handful of steps instead
+    # of leaving it to be discovered many hours later.
+    SLOW_NODE_SAMPLE_SIZE = 20
+    SLOW_NODE_THRESHOLD_S = 45.0
+    step_times = []
+    slow_node_checked = False
+
     for epoch in range(args.epochs):
         rng.shuffle(train_items)
         for item in train_items:
+            item_start = time.time()
             try:
                 option_lines, correct_letter = build_option_block(item, rng)
                 prompt_text = build_prompt_text(item["question"], option_lines)
@@ -525,6 +541,16 @@ def main():
                 continue
 
             step += 1
+            step_times.append(time.time() - item_start)
+            if not slow_node_checked and len(step_times) >= SLOW_NODE_SAMPLE_SIZE:
+                slow_node_checked = True
+                avg_s = sum(step_times[-SLOW_NODE_SAMPLE_SIZE:]) / SLOW_NODE_SAMPLE_SIZE
+                if avg_s > SLOW_NODE_THRESHOLD_S:
+                    print(f"[WARN] this node looks I/O-bound: avg {avg_s:.1f}s/step over the "
+                          f"first {SLOW_NODE_SAMPLE_SIZE} successful steps (healthy nodes have "
+                          f"run ~20-35s/step) -- the GPU is likely idle most of the time waiting "
+                          f"on video/feature reads from network storage. Consider killing this "
+                          f"job and resubmitting to get scheduled onto a different node.", flush=True)
             if step % 50 == 0:
                 print(f"[epoch {epoch} step {step}] loss={loss.item():.4f}")
             log_f.write(json.dumps({"step": step, "epoch": epoch, "loss": loss.item()}) + "\n")
