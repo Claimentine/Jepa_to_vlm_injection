@@ -63,11 +63,16 @@ spec:
                   # missing here is why all three job-07 runs failed with
                   # BackoffLimitExceeded and zero pod logs). Remove once
                   # confirmed healthy again.
+                  #
+                  # ry-gpu-03.sdsc.optiputer.net added 2026-08-28: same
+                  # UnexpectedAdmissionError signature, hit on both of this
+                  # job's backoffLimit=1 attempts within 15s of each other.
                   - key: kubernetes.io/hostname
                     operator: NotIn
                     values:
                       - nrp-fiona-001.sdmz.amnh.org
                       - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
       containers:
         - name: train-qa-none-film
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp

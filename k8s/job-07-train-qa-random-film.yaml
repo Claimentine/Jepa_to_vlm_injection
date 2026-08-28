@@ -59,6 +59,7 @@ spec:
                     values:
                       - nrp-fiona-001.sdmz.amnh.org
                       - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
       containers:
         - name: train-qa-random-film
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
