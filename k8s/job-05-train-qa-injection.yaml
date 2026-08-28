@@ -4,19 +4,27 @@
 #
 # THIS FILE IS CURRENTLY SET TO A QUICK TREND-CHECK RUN (jepa x cross_attn,
 # --max_train_items 1600 --epochs 1 --val_every_steps 200), not the 3-epoch
-# full run: `film`'s injection_site collapses LayerWiseJEPAInjector's (B, T,
-# H) temporal condition down to one global vector via `condition.mean(dim=1)`
-# before modulating (see apply()'s mode=="film" branch) -- the same
-# global-pooling failure mode JepaPoolerTemporal was built to avoid (see its
-# docstring's post-mortem on "random beat jepa"). The job-07 film 3-way
-# comparison's jepa run showed exactly that signature (val_acc oscillating
-# 0.42-0.58 with no trend, same ballpark as injection=none's 0.4427 zero-shot
-# baseline -- see run_logs/jepa_film_run1.log). `cross_attn` doesn't mean-pool
-# -- each decoder token individually cross-attends all 64 temporal JEPA
-# tokens -- so this run checks whether that's actually the fix, cheaply,
-# before committing to a full 3-epoch run or fixing `film` itself.
-# --out_dir points at a separate directory so this doesn't clobber the film
-# run's checkpoint/log under qa_full_runs/jepa/.
+# full run.
+#
+# 2026-08-27: rebuilt from scratch on the temporal-hard split
+# (qa_split_temporal.json, see --split below) instead of the original
+# qa_split_full.json. The prior trend-check on the old split (jepa x
+# cross_attn, this same cell) hit val_acc=1.0000 within 200 steps -- too fast
+# for genuine 2-choice reasoning. Re-scoring that exact checkpoint against
+# qa_split_temporal.json's same-video "hard" distractor tier (job-06) dropped
+# it to 0.4300 (below chance) while the "easy" tier held at 0.9900: the model
+# had learned scene-topic matching, not temporal understanding. This run
+# retrains cross_attn from scratch on the new split, whose train rows are all
+# same-video hard negatives (no easy-tier shortcut available during
+# training), to see whether cross_attn's full per-frame token access is
+# actually enough to solve the harder task, or whether it just tracked the
+# global-pooling story before too. `film`'s mean-pool-then-modulate collapse
+# is the earlier lead (see job-07's completed film runs, val_acc oscillating
+# 0.42-0.58 with no trend) but the shortcut finding means that comparison
+# needs redoing on this split too, once this cell's result is in.
+# --out_dir points at a directory separate from both the old split's run and
+# the smoke-test's qa_full_runs_crossattn_test/, so none of the three clobber
+# each other.
 #
 # (Originally a smoke test for LayerWiseJEPAInjector's film/cross_attn sites
 # the first time they ran on real cluster hardware -- that already passed,
@@ -106,19 +114,25 @@ spec:
 
               cd "$REPO"
               exec "$PY" vans_qa/full_scale/train_qa_full.py \
+                --split /data/raw_data/qa_split_temporal.json \
                 --injection jepa \
                 --injection_site cross_attn \
                 --layer_strategy middle4 \
-                --max_train_items 1600 \
+                --max_train_items 2000 \
                 --epochs 1 \
                 --val_every_steps 200 \
-                --max_val_items 200 \
-                --out_dir /data/raw_data/qa_full_runs_crossattn_test
-              # ~34% of items get skipped (bad/missing clips), so 1600 raw
-              # train items lands around 1000 successful steps -- enough to
-              # see whether val_acc trends up instead of oscillating around
-              # chance the way the film run did. If it does, scale up
-              # --max_train_items / --epochs for a real run (and switch
+                --max_val_items 400 \
+                --out_dir /data/raw_data/qa_full_runs_temporal_crossattn_test
+              # All train rows in qa_split_temporal.json are already the
+              # same-video "hard" tier (see build_qa_pairs_temporal.py), so
+              # no easy/hard balancing is needed here the way it was for val.
+              # --max_val_items 400 -> 200 anchors -> 200 easy + 200 hard
+              # rows, enough for both per-tier accuracies to be readable at
+              # each checkpoint. ~34% of items get skipped (bad/missing
+              # clips), so 2000 raw train items lands around 1300 successful
+              # steps -- enough to see whether hard-tier val_acc actually
+              # trends up this time. If it does, scale up --max_train_items /
+              # --epochs for a real run (and switch
               # --out_dir back to the default so it lands under
               # qa_full_runs/jepa/ alongside the other conditions).
           env:

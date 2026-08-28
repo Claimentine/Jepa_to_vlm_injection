@@ -7,6 +7,14 @@
 # 3-way comparison. Submit all three concurrently -- distinct output dirs,
 # distinct GPUs, no collision.
 #
+# 2026-08-27: pointed at qa_split_temporal.json (see --split below) instead
+# of the default qa_split_full.json. The old split's distractor is sampled
+# from any random video in the ~28K-row pool, so a jepa x cross_attn run hit
+# val_acc=1.0000 within 200 steps -- too fast/clean, and re-scoring that same
+# checkpoint against qa_split_temporal.json's same-video "hard" distractors
+# dropped it to 0.4300 (below chance). This job now measures the zero-shot
+# baseline against that harder split's easy/hard tiers for comparison.
+#
 # Replaces the former injection=constant condition (same job slot, same
 # node-affinity fixes carried over below): constant's learned video-independent
 # token set hard-asserted vjepa_feats.shape[1] == 64 and crashed 100% of items
@@ -78,9 +86,17 @@ spec:
 
               cd "$REPO"
               exec "$PY" vans_qa/full_scale/train_qa_full.py \
+                --split /data/raw_data/qa_split_temporal.json \
                 --injection none \
                 --injection_site film \
                 --layer_strategy middle4
+              # --split points at the same-video-hard-negative benchmark
+              # (qa_split_temporal.json) instead of the default
+              # qa_split_full.json -- its val rows are tagged "easy"/"hard"
+              # per anchor, and train_qa_full.py's AccTally reports accuracy
+              # for each automatically. This gives the frozen zero-shot
+              # baseline's accuracy on both tiers, for comparison against the
+              # trained conditions run on the same split.
           env:
             - name: VANS_ROOT
               value: /data
