@@ -2,9 +2,9 @@
 # full-scale VANS QA pairs (12,032 matched, train/val/test split in
 # raw_data/qa_split_full.json). Runs vans_qa/full_scale/train_qa_full.py.
 #
-# THIS FILE IS CURRENTLY SET TO A QUICK TREND-CHECK RUN (jepa x cross_attn,
-# --max_train_items 1600 --epochs 1 --val_every_steps 200), not the 3-epoch
-# full run.
+# THIS FILE IS CURRENTLY SET TO jepa x cross_attn, 1 epoch over the full
+# ~6690-row temporal-hard train split (see 2026-08-28 note below) -- not the
+# original 3-epoch qa_split_full.json run.
 #
 # 2026-08-27: rebuilt from scratch on the temporal-hard split
 # (qa_split_temporal.json, see --split below) instead of the original
@@ -119,23 +119,25 @@ spec:
                 --injection jepa \
                 --injection_site cross_attn \
                 --layer_strategy middle4 \
-                --max_train_items 2000 \
                 --epochs 1 \
-                --val_every_steps 200 \
-                --max_val_items 400 \
-                --out_dir /data/raw_data/qa_full_runs_temporal_crossattn_test
-              # All train rows in qa_split_temporal.json are already the
-              # same-video "hard" tier (see build_qa_pairs_temporal.py), so
-              # no easy/hard balancing is needed here the way it was for val.
-              # --max_val_items 400 -> 200 anchors -> 200 easy + 200 hard
-              # rows, enough for both per-tier accuracies to be readable at
-              # each checkpoint. ~34% of items get skipped (bad/missing
-              # clips), so 2000 raw train items lands around 1300 successful
-              # steps -- enough to see whether hard-tier val_acc actually
-              # trends up this time. If it does, scale up --max_train_items /
-              # --epochs for a real run (and switch
-              # --out_dir back to the default so it lands under
-              # qa_full_runs/jepa/ alongside the other conditions).
+                --val_every_steps 500 \
+                --max_val_items 100 \
+                --out_dir /data/raw_data/qa_full_runs_temporal
+              # 2026-08-28: dropped --max_train_items -- the earlier
+              # --max_train_items 2000 cap was only ever meant as a quick
+              # first read, not a real limit, and step 200's healthy
+              # near-chance start (0.4372, no shortcut available) already
+              # confirmed the pipeline works on this split. Use the full
+              # ~6690 same-video-hard train rows for a real run instead.
+              # --val_every_steps raised to 500 and --max_val_items dropped
+              # to 100 (50 anchors -> 50 easy + 50 hard rows) to bound
+              # periodic-validation cost: the prior run's 400-item eval alone
+              # took 7.5h on a slow node (see train_qa_full.py's new
+              # I/O-bound early-warning check, added after that run went
+              # unnoticed for 13+ hours). --out_dir points at a fresh
+              # directory (not the smoke-test's
+              # qa_full_runs_temporal_crossattn_test/) since this is meant as
+              # the real run, not a disposable trend-check.
           env:
             - name: VANS_ROOT
               value: /data
