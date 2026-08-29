@@ -67,6 +67,18 @@ spec:
                   # ry-gpu-03.sdsc.optiputer.net added 2026-08-28: same
                   # UnexpectedAdmissionError signature, hit on both of this
                   # job's backoffLimit=1 attempts within 15s of each other.
+                  #
+                  # hcc-nrp-shor-c6017.unl.edu added 2026-08-28: a third
+                  # failure mode -- schedules and runs fine, but the very
+                  # first CUDA kernel call on the very first item raised
+                  # "AcceleratorError: CUDA error: an illegal memory access
+                  # was encountered", which poisons the CUDA context for the
+                  # rest of the process (every subsequent item then fails the
+                  # same way, hence val_acc=0.0000 items_scored=0/200 despite
+                  # the job exiting 0/"Complete"). This exact frozen-model
+                  # forward+decode code path has run cleanly dozens of times
+                  # elsewhere this project, so this reads as this node's
+                  # GPU/driver being bad, not a code bug.
                   - key: kubernetes.io/hostname
                     operator: NotIn
                     values:
@@ -74,6 +86,7 @@ spec:
                       - ry-gpu-01.sdsc.optiputer.net
                       - ry-gpu-03.sdsc.optiputer.net
                       - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
       containers:
         - name: train-qa-none-film
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp

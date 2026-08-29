@@ -105,6 +105,7 @@ spec:
                       - ry-gpu-03.sdsc.optiputer.net
                       - hcc-chase-shor-c4705.unl.edu
                       - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
       containers:
         - name: train-qa-injection
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
