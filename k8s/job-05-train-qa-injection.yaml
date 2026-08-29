@@ -97,6 +97,19 @@ spec:
                   # admission failure, so it wouldn't be caught by the
                   # UnexpectedAdmissionError signature above -- caught
                   # instead by train_qa_full.py's early I/O-bound warning.
+                  #
+                  # hcc-nrp-shor-c6009.unl.edu added 2026-08-28: a fourth
+                  # node hung completely (D-state, ~0% CPU, GPU 0MiB/0%
+                  # util, no log output at all for 75+ min) rather than just
+                  # running slow. This is the THIRD distinct
+                  # "hcc-*-shor-*.unl.edu" hostname to misbehave (c4705
+                  # admission-failed, c6017 poisoned its CUDA context, c6009
+                  # hung outright) -- if a fourth UNL host shows up here,
+                  # suspect a site-level network problem between UNL and the
+                  # shared CephFS rather than individual bad nodes, and
+                  # consider whether there's a coarser way to exclude the
+                  # whole site (kubectl get nodes is Forbidden for this
+                  # namespace's user, so its labels haven't been inspected).
                   - key: kubernetes.io/hostname
                     operator: NotIn
                     values:
@@ -106,6 +119,7 @@ spec:
                       - hcc-chase-shor-c4705.unl.edu
                       - k8s-gen4-05.calit2.optiputer.net
                       - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
       containers:
         - name: train-qa-injection
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
