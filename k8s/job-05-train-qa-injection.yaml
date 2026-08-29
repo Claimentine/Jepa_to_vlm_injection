@@ -87,6 +87,16 @@ spec:
                   # UnexpectedAdmissionError / PodScheduled=False signature,
                   # hit on both of this job's backoffLimit=1 attempts (both
                   # landed on this same node).
+                  #
+                  # k8s-gen4-05.calit2.optiputer.net added 2026-08-28: a
+                  # different failure mode -- admits fine, but its path to
+                  # the shared CephFS is badly congested/distant, so every
+                  # item's video/feature read crawls (confirmed ~70-75s/step
+                  # vs. ~20-35s/step on a healthy node, GPU util ~26%) on TWO
+                  # separate runs landing on this exact node. Not an
+                  # admission failure, so it wouldn't be caught by the
+                  # UnexpectedAdmissionError signature above -- caught
+                  # instead by train_qa_full.py's early I/O-bound warning.
                   - key: kubernetes.io/hostname
                     operator: NotIn
                     values:
@@ -94,6 +104,7 @@ spec:
                       - ry-gpu-01.sdsc.optiputer.net
                       - ry-gpu-03.sdsc.optiputer.net
                       - hcc-chase-shor-c4705.unl.edu
+                      - k8s-gen4-05.calit2.optiputer.net
       containers:
         - name: train-qa-injection
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp

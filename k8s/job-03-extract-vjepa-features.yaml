@@ -55,6 +55,7 @@ spec:
                       - nrp-fiona-001.sdmz.amnh.org
                       - ry-gpu-01.sdsc.optiputer.net
                       - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
       containers:
         - name: extract-vjepa-features
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
