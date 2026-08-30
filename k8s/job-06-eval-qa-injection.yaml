@@ -9,17 +9,24 @@
 # match what that checkpoint was trained with (eval_qa_full.py asserts this
 # and raises instead of silently mis-scoring a mismatched checkpoint).
 #
-# THIS RUN: scores the completed job-05 jepa x cross_attn checkpoint
-# (best.pt, val_acc(logprob)=1.0000 on the OLD split's easy-only val) against
-# qa_split_temporal.json's test set instead -- every anchor there contributes
-# both an "easy" (old-style, any-video) and a "hard" (same-source-video) row,
-# and eval_qa_full.py now tags each output record with its difficulty. Since
-# build_qa_pairs_temporal.py emits them as adjacent easy/hard pairs per
-# anchor, the first --max_test_items items are already ~50/50 balanced
-# without any extra stratified sampling. The question this answers: does
-# val_acc=1.0000 hold on the hard tier (real temporal understanding) or
-# crater toward chance (the scene-matching shortcut suspected from job-05's
-# suspiciously fast convergence)?
+# THIS RUN (2026-08-29): scores the checkpoint from job-05's full retrain on
+# qa_split_temporal.json itself (all-hard train rows, 1 epoch, 6641 steps,
+# best_val_acc(logprob)=0.8100 -- easy and hard tiers moved together
+# throughout training instead of the old split's shortcut pattern where only
+# easy improved). That in-training number came from --max_val_items 100 (50
+# anchors) per checkpoint, a small sample given the step-5000 checkpoint's
+# val_acc briefly dropped to 0.53 before recovering by step 5500 -- likely
+# eval noise, but worth confirming on a bigger, held-out sample rather than
+# taking it on faith. --max_test_items 800 (400 anchors -> 400 easy + 400
+# hard rows, same adjacent-pairing trick as before) roughly doubles the
+# per-tier sample size used during training.
+#
+# (Prior run here scored job-05's OLD smoke-test checkpoint, trained on the
+# original qa_split_full.json with its any-video distractor: hit
+# val_acc=1.0000 there but dropped to 0.4300 -- below chance -- on this
+# split's hard tier while holding 0.9900 on easy, confirming that checkpoint
+# had learned scene-topic matching, not temporal understanding. That's the
+# comparison point for whatever this run's hard-tier number turns out to be.)
 #
 # Needs a GPU, same compute-capability floor as job-03/job-05.
 apiVersion: batch/v1
@@ -91,9 +98,9 @@ spec:
                 --injection jepa \
                 --injection_site cross_attn \
                 --layer_strategy middle4 \
-                --checkpoint /data/raw_data/qa_full_runs_crossattn_test/jepa/best.pt \
-                --max_test_items 600 \
-                --out /data/raw_data/qa_eval_temporal_jepa_crossattn.jsonl
+                --checkpoint /data/raw_data/qa_full_runs_temporal/jepa/best.pt \
+                --max_test_items 800 \
+                --out /data/raw_data/qa_eval_temporal_jepa_crossattn_v2.jsonl
           env:
             - name: VANS_ROOT
               value: /data
@@ -168,7 +175,7 @@ spec:
 # Clean up when done:
 #   kubectl delete job ruixin-eval-qa-injection -n williamli-scvl
 #
-# Output: raw_data/qa_eval_temporal_jepa_crossattn.jsonl on the data PVC, one
+# Output: raw_data/qa_eval_temporal_jepa_crossattn_v2.jsonl on the data PVC, one
 # record per test item ({pid, difficulty, correct_letter, pred_letter,
 # correct, logprob_A, logprob_B} or {pid, difficulty, error} for skipped
 # items) -- group by "difficulty" to get the easy vs. hard accuracy split.
