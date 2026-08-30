@@ -53,6 +53,7 @@ spec:
                     operator: NotIn
                     values:
                       - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
                       - ry-gpu-01.sdsc.optiputer.net
                       - ry-gpu-03.sdsc.optiputer.net
                       - k8s-gen4-05.calit2.optiputer.net

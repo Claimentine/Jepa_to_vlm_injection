@@ -1,20 +1,28 @@
-# Step 7 (2/3): full-scale training run, injection=random x injection_site=film
-# x layer_strategy=middle4, script defaults (--epochs 3 --val_every_steps 500
-# --max_val_items 200, no --max_train_items cap -- all ~12k usable train
-# items). `random` is the control condition: ignores vjepa_feats and projects
-# a fixed-seed random tensor of the same shape through an identical adapter,
-# to test whether gains come from JEPA content vs. just extra trainable
+# Step 7 (2/3): training run, injection=random x injection_site=cross_attn.
+# `random` is the control condition: ignores vjepa_feats and projects a
+# fixed-seed random tensor of the same shape through an identical adapter, to
+# test whether gains come from JEPA content vs. just extra trainable
 # soft-prompt capacity (see JepaInjector's docstring in
-# common/jepa_injection_model.py). Sibling Jobs job-07-train-qa-jepa-film.yaml
-# and job-07-train-qa-none-film.yaml run the same comparison's other two
-# conditions. Submit all three concurrently -- distinct output dirs, distinct
-# GPUs, no collision.
+# common/jepa_injection_model.py).
+#
+# 2026-08-30: pointed at qa_split_temporal.json, same settings as job-05's
+# jepa x cross_attn full retrain there (1 epoch over all ~6690 same-video-hard
+# train rows, --val_every_steps 500, --max_val_items 100), so the two are
+# directly comparable. That jepa run hit best_val_acc(logprob)=0.8100
+# in-training, and its checkpoint scored easy=0.7920 / hard=0.5650 on an
+# 800-item held-out test (job-06) -- hard sits ~6.5 points above chance and
+# ~16.5 points above the frozen zero-shot baseline's hard=0.4000 (job-07
+# none run), suggesting cross_attn learned *something* real once the
+# any-video shortcut was removed from training. This run is the missing
+# control: if `random` reaches a similar hard-tier number with the identical
+# adapter but no real video content, that gain is more likely just "extra
+# trainable capacity helps a little" rather than JEPA content specifically
+# being useful for the harder task.
 #
 # Only apply this after job-05-train-qa-injection.yaml's smoke test has
-# confirmed the film injection path runs end-to-end without error on real
-# cluster hardware -- this is a genuinely long run (~12k items x 3 epochs x 2
-# forward+backward passes per item for the paired A/B logprob loss), so
-# don't commit the GPU-hours before that check.
+# confirmed the injection path runs end-to-end without error on real cluster
+# hardware -- this is a genuinely long run, so don't commit the GPU-hours
+# before that check.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -58,6 +66,7 @@ spec:
                     operator: NotIn
                     values:
                       - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
                       - ry-gpu-01.sdsc.optiputer.net
                       - ry-gpu-03.sdsc.optiputer.net
                       - k8s-gen4-05.calit2.optiputer.net
@@ -81,9 +90,14 @@ spec:
 
               cd "$REPO"
               exec "$PY" vans_qa/full_scale/train_qa_full.py \
+                --split /data/raw_data/qa_split_temporal.json \
                 --injection random \
-                --injection_site film \
-                --layer_strategy middle4
+                --injection_site cross_attn \
+                --layer_strategy middle4 \
+                --epochs 1 \
+                --val_every_steps 500 \
+                --max_val_items 100 \
+                --out_dir /data/raw_data/qa_full_runs_temporal
           env:
             - name: VANS_ROOT
               value: /data
@@ -158,4 +172,4 @@ spec:
 # Clean up when done (Golden Rule #4):
 #   kubectl delete job ruixin-train-qa-random-film -n williamli-scvl
 #
-# Output: /data/raw_data/qa_full_runs/random/{train_log.jsonl,best.pt}
+# Output: /data/raw_data/qa_full_runs_temporal/random/{train_log.jsonl,best.pt}
