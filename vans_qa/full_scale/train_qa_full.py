@@ -377,6 +377,8 @@ def main():
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--val_every_steps", type=int, default=500)
+    ap.add_argument("--save_every_steps", type=int, default=1000,
+                    help="periodic checkpoint cadence, independent of best.pt (0 disables)")
     ap.add_argument("--max_val_items", type=int, default=200, help="cap for periodic in-training eval")
     ap.add_argument("--max_train_items", type=int, default=None, help="smoke-test cap")
     ap.add_argument("--seed", type=int, default=42)
@@ -567,6 +569,19 @@ def main():
                     best_val_acc = val_tally.acc
                     torch.save({"args": vars(args), "injector_state": injector.state_dict()},
                                os.path.join(run_dir, "best.pt"))
+
+            if args.save_every_steps and step % args.save_every_steps == 0:
+                # Independent of best.pt: best.pt only ever holds the single
+                # snapshot that first reached the run's high-water mark, so a
+                # later tie or a noisy dip-then-recover (e.g. val_acc cratering
+                # at one checkpoint and climbing back by the next) leaves no
+                # way to go back and compare intermediate states -- confirmed
+                # in practice on the jepa x cross_attn temporal-split run,
+                # where best.pt froze at step 3000 despite training continuing
+                # to step 6641. These periodic snapshots keep that history.
+                torch.save({"args": vars(args), "injector_state": injector.state_dict(), "step": step},
+                           os.path.join(run_dir, f"step_{step}.pt"))
+                print(f"[epoch {epoch} step {step}] saved checkpoint -> step_{step}.pt")
 
     log_f.close()
     if step == 0:
