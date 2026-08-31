@@ -1,0 +1,149 @@
+# Smoke test for the VLM-guides-JEPA (reverse injection) data pipeline,
+# after fixing vans_qa/demo/extract_vlm_guidance.py and
+# vans_qa/full_scale/extract_vlm_guidance_full.py to point at the real
+# extractor. "qwen3_cache_extractor.py" (what both scripts previously shelled
+# out to) never existed in the public ThinkJEPA release -- it was a wrong
+# filename baked into our own wrappers. The real, complete, unmodified
+# implementation is cache_train/rebuild_causal_cache.py, confirmed 2026-08-31
+# by reading the live checkout on this cluster (it does both Qwen3-VL
+# guidance extraction and its own V-JEPA2 past/target encoding in one pass).
+#
+# Two steps in one pod:
+#  1. --self_test (CPU only, no model load) -- validates rebuild_causal_cache.py's
+#     own sampling/atomic-write logic and that our wrapper's CLI wiring to it
+#     is correct, before spending any GPU time.
+#  2. A real extraction over 2 demo clips (vans_qa/demo/extract_vlm_guidance.py
+#     --limit 2), which loads Qwen3-VL-2B-Thinking + V-JEPA2 ViT-L for real and
+#     writes actual vlm_old/vlm_new + vjepa_input_feats/vjepa_target_feats
+#     into vlm_guidance_cache/ -- confirms the full pipeline runs end-to-end
+#     before committing to a full-scale run.
+#
+# Needs a GPU for step 2, same compute-capability floor as job-03/job-05.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-smoke-vlm-guidance
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+      containers:
+        - name: smoke-vlm-guidance
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/thinkjepa/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              cd "$REPO"
+
+              echo "=== step 1/2: rebuild_causal_cache.py --self_test (CPU, no model load) ==="
+              "$PY" vans_qa/full_scale/extract_vlm_guidance_full.py --self_test
+
+              echo ""
+              echo "=== step 2/2: real extraction over 2 demo clips (GPU) ==="
+              exec "$PY" vans_qa/demo/extract_vlm_guidance.py --limit 2
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: VJEPA2_CKPT
+              value: /data/checkpoints/vjepa2/vitl.pt
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "19200Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-08-smoke-vlm-guidance.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-smoke-vlm-guidance -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-smoke-vlm-guidance -n williamli-scvl
+#
+# Output (step 2): /data/vlm_guidance_cache/<pid>.npz per demo clip, each
+# holding the full rebuild_causal_cache.py schema-v2 payload (vlm_old,
+# vlm_new, vjepa_input_feats, vjepa_target_feats, imgs, provenance, etc.).

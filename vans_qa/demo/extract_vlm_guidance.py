@@ -3,10 +3,17 @@ Extract Qwen3-VL guidance features (vlm_old/vlm_new) for the VANS demo
 pairs' "_in" clips only -- this is the "past/context" video the VLM branch
 summarizes to condition the JEPA predictor, matching ThinkJEPA's design.
 
-Just stages symlinks to the *_in.mp4 files (so qwen3_cache_extractor.py's
+Just stages symlinks to the *_in.mp4 files (so rebuild_causal_cache.py's
 recursive mp4 walk doesn't also pick up the *_out.mp4 files we don't need
 guidance for) and shells out to the existing, unmodified extractor script --
 zero new extraction logic, 100% reuse of the already-tested ThinkJEPA code.
+
+Note: "qwen3_cache_extractor.py" (this docstring's earlier name for the
+extractor) never existed in the public ThinkJEPA release -- wrong filename
+baked into this wrapper. The real, unmodified-since-the-original-commit
+implementation is cache_train/rebuild_causal_cache.py, confirmed 2026-08-31
+by reading the live checkout; see extract_vlm_guidance_full.py's docstring
+for details.
 """
 import argparse
 import glob
@@ -20,15 +27,16 @@ STAGE_DIR = os.path.join(VANS_ROOT, "vlm_stage_in_only")
 OUT_DIR = os.path.join(VANS_ROOT, "vlm_guidance_cache")
 EXTRACTOR = os.path.join(
     os.environ.get("THINKJEPA_ROOT", "/projects/bhay/william/ruixin/ThinkJEPA"),
-    "cache_train/qwen3_cache_extractor.py",
+    "cache_train/rebuild_causal_cache.py",
 )
+VJEPA_CHECKPOINT = os.environ.get("VJEPA2_CKPT", "/data/checkpoints/vjepa2/vitl.pt")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=None, help="stage only first N pairs (smoke test)")
-    ap.add_argument("--max_frames", type=int, default=32)
     ap.add_argument("--layers", type=int, nargs="+", default=[0, 4, 8, 12, 16, 20, 24, 27])
+    ap.add_argument("--vjepa_checkpoint", default=VJEPA_CHECKPOINT)
     args = ap.parse_args()
 
     os.makedirs(STAGE_DIR, exist_ok=True)
@@ -50,13 +58,12 @@ def main():
         "--file_dir", STAGE_DIR,
         "--output_dir", OUT_DIR,
         "--pretrained", "Qwen/Qwen3-VL-2B-Thinking",
+        "--vjepa_checkpoint", args.vjepa_checkpoint,
         "--layers", *[str(x) for x in args.layers],
-        "--max_frames", str(args.max_frames),
         "--max_new_token_num", "16",
         "--save_dtype", "fp16",
-        "--res", "256",
+        "--qwen_res", "256",
         "--prompt", "Describe this video.",
-        "--force_video_backend", "decord",
     ]
     print("[INFO] running:", " ".join(cmd))
     subprocess.run(cmd, check=True)

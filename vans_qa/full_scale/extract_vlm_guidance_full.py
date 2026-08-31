@@ -1,8 +1,19 @@
 """
 Full-scale VLM guidance extraction: stages symlinks for all 12,032 unique
 in_clips referenced by qa_split_full.json, keyed by the same safe_name
-scheme as extract_vjepa_features_full.py, then shells out to the existing
-qwen3_cache_extractor.py (unmodified) -- same approach as the demo version.
+scheme as extract_vjepa_features_full.py, then shells out to
+cache_train/rebuild_causal_cache.py (unmodified) -- same approach as the demo
+version.
+
+Note: what this project's own wrapper scripts (and an earlier version of
+this docstring) called "qwen3_cache_extractor.py" never existed in the
+public ThinkJEPA release -- that was just a wrong filename baked into these
+wrappers. The real, complete, unmodified-since-the-original-commit
+implementation is cache_train/rebuild_causal_cache.py: it does both the
+Qwen3-VL guidance extraction (vlm_old/vlm_new) *and* its own V-JEPA2
+past/target encoding in one pass, per its own causal-cache schema (distinct
+from this project's separate, single-clip V-JEPA cache used for the forward
+QA-injection direction). Confirmed 2026-08-31 by reading the live checkout.
 """
 import argparse
 import json
@@ -16,8 +27,13 @@ STAGE_DIR = os.path.join(BASE, "raw_data/vlm_stage_full")  # just symlinks, tiny
 OUT_DIR = os.path.join(WORK_BASE, "vlm_guidance_cache_full")
 EXTRACTOR = os.path.join(
     os.environ.get("THINKJEPA_ROOT", "/projects/bhay/william/ruixin/ThinkJEPA"),
-    "cache_train/qwen3_cache_extractor.py",
+    "cache_train/rebuild_causal_cache.py",
 )
+# Same checkpoint job-03 already downloads for the forward-direction V-JEPA2
+# extraction (facebook/vjepa2-vitl-fpc64-256, original/model.pth) -- this
+# script's VJEPA_IMAGE_SIZE=256/VJEPA_PATCH_SIZE=16/VJEPA_EMBED_DIM=1024
+# constants match it exactly, so there's no separate checkpoint to source.
+VJEPA_CHECKPOINT = os.environ.get("VJEPA2_CKPT", "/data/checkpoints/vjepa2/vitl.pt")
 
 
 def safe_name(clip_path):
@@ -28,9 +44,18 @@ def safe_name(clip_path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=None)
-    ap.add_argument("--max_frames", type=int, default=32)
     ap.add_argument("--layers", type=int, nargs="+", default=[0, 4, 8, 12, 16, 20, 24, 27])
+    ap.add_argument("--vjepa_checkpoint", default=VJEPA_CHECKPOINT)
+    ap.add_argument("--max_videos", type=int, default=0, help="forwarded to rebuild_causal_cache.py; 0=all assigned to this rank")
+    ap.add_argument("--self_test", action="store_true", help="run rebuild_causal_cache.py's own --self_test and exit (no staging, no model load)")
     args = ap.parse_args()
+
+    if args.self_test:
+        cmd = [sys.executable, EXTRACTOR, "--file_dir", ".", "--output_dir", ".",
+               "--vjepa_checkpoint", args.vjepa_checkpoint, "--self_test"]
+        print("[INFO] running:", " ".join(cmd))
+        subprocess.run(cmd, check=True)
+        return
 
     os.makedirs(STAGE_DIR, exist_ok=True)
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -67,14 +92,18 @@ def main():
         "--file_dir", STAGE_DIR,
         "--output_dir", OUT_DIR,
         "--pretrained", "Qwen/Qwen3-VL-2B-Thinking",
+        "--vjepa_checkpoint", args.vjepa_checkpoint,
         "--layers", *[str(x) for x in args.layers],
-        "--max_frames", str(args.max_frames),
+        # max_frames/res/force_video_backend dropped: rebuild_causal_cache.py
+        # hardcodes NUM_PAST_FRAMES=32 (matches what we were passing) and
+        # decord (its only supported decode backend) -- neither is a CLI flag.
         "--max_new_token_num", "16",
         "--save_dtype", "fp16",
-        "--res", "256",
+        "--qwen_res", "256",
         "--prompt", "Describe this video.",
-        "--force_video_backend", "decord",
     ]
+    if args.max_videos:
+        cmd += ["--max_videos", str(args.max_videos)]
     print("[INFO] running:", " ".join(cmd))
     subprocess.run(cmd, check=True)
 

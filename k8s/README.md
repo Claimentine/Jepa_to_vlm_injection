@@ -99,6 +99,7 @@ kubectl delete job ruixin-setup-env ruixin-fetch-vans-data ruixin-extract-vjepa-
 | `job-06-eval-qa-injection.yaml` | Job `ruixin-eval-qa-injection`, `raw_data/qa_eval_full_<injection>.jsonl` | held-out test eval for a job-05 checkpoint (`vans_qa/full_scale/eval_qa_full.py`); template, edit `--checkpoint` |
 | `job-06b-eval-qa-multi-checkpoint.yaml` | Job `ruixin-eval-qa-multi-checkpoint`, `raw_data/qa_eval_multi_<injection>.jsonl` | scores several checkpoints from one run_dir against the same held-out items in one pass, decoding each item once (`vans_qa/full_scale/eval_qa_multi_checkpoint.py`); template, edit `--run_dir`/`--checkpoint_names` |
 | `job-07-train-qa-{jepa,random,none}-film.yaml` | Jobs `ruixin-train-qa-{jepa,random,none}-film` | full-scale (script defaults: 3 epochs, all ~12k train items) film-injection 3-way comparison (`jepa`/`random` train an injector over 3 epochs; `none` is a single zero-shot pass, no injector); submit together after job-05's smoke test passes |
+| `job-08-smoke-vlm-guidance.yaml` | Job `ruixin-smoke-vlm-guidance`, `/data/vlm_guidance_cache/*.npz` | one-off smoke test for the VLM-guides-JEPA (reverse injection) direction: `--self_test` on `cache_train/rebuild_causal_cache.py`, then a real 2-clip extraction via `vans_qa/demo/extract_vlm_guidance.py` -- run before committing to a full-scale VLM guidance extraction job |
 
 Jobs 01-04 are idempotent -- re-applying/re-running skips work that's
 already done (checks for existing conda env dirs / downloaded files /
@@ -115,13 +116,19 @@ job-05 overwrites `best.pt` for that `--injection` value from scratch
   `vans_qa/full_scale/download_videos.py`) -- per the repo's own docs this
   is the real bottleneck (YouTube bot-detection rate-limiting), budget for
   it separately as a long-running CPU Job.
-- **VLM guidance caching** (`extract_vlm_guidance_full.py`) is currently
-  **blocked, independent of the checkpoint**: it shells out to
-  `$THINKJEPA_ROOT/cache_train/qwen3_cache_extractor.py`, which does not
-  exist in the public `Hai-chao-Zhang/ThinkJEPA` checkout (verified --
-  `scripts/patch_thinkjepa.sh`'s second patch step assumes it exists and
-  just no-ops if it's missing). Needs sourcing that file from somewhere
-  before a job-04 can be written.
+- **VLM guidance caching** (`extract_vlm_guidance_full.py`): previously
+  thought blocked on a missing `qwen3_cache_extractor.py`, but that name
+  never existed in the public `Hai-chao-Zhang/ThinkJEPA` checkout -- it was
+  just the wrong filename baked into our own wrapper. Confirmed 2026-08-31
+  by reading the live checkout: the real, complete, unmodified extractor is
+  `cache_train/rebuild_causal_cache.py` (does both Qwen3-VL guidance
+  extraction and its own V-JEPA2 past/target encoding in one pass, per its
+  own causal-cache schema). Wrapper scripts (`extract_vlm_guidance_full.py`,
+  `vans_qa/demo/extract_vlm_guidance.py`) now point at it with the correct
+  CLI (`--vjepa_checkpoint /data/checkpoints/vjepa2/vitl.pt`, reusing job-03's
+  checkpoint; `--qwen_res` not `--res`; no `--max_frames`/
+  `--force_video_backend`, both hardcoded now). Still needs a GPU smoke test
+  before a job-04-equivalent full run is written.
 - **EgoDex** intentionally excluded from this pass (out of scope per current
   instructions; also note the full public EgoDex release is ~2TB, so it'll
   need its own PVC sizing conversation before pulling anything).
