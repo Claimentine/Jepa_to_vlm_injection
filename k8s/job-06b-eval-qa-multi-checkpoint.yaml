@@ -1,0 +1,156 @@
+# Step 6b: score several checkpoints from one run_dir against the same
+# held-out test items in a single pass (vans_qa/full_scale/eval_qa_multi_checkpoint.py).
+# Each item's video is decoded once and reused across all requested
+# checkpoints -- decode is the dominant per-item cost throughout this
+# project, so this is much cheaper than running job-06 once per checkpoint.
+#
+# THIS RUN (2026-08-31): random x cross_attn's training on qa_split_temporal.json
+# had a noisy val_acc trajectory -- easy crashed to 0.08 at step 5000 before
+# recovering to 0.60 by step 6000, and best.pt (step 3500, val_acc=0.8000)
+# is a near-tie with jepa's best.pt (step 3000, val_acc=0.8100) despite very
+# different easy/hard behavior underneath. Score best.pt plus the last three
+# periodic snapshots (step_4000/5000/6000.pt, saved by --save_every_steps)
+# on 800 held-out test items to see whether that in-training noise reflects
+# genuine instability or just small-sample (50-anchor) variance, and to get
+# a hard-tier number worth comparing against jepa's held-out
+# easy=0.7920/hard=0.5650 (job-06).
+#
+# Needs a GPU, same compute-capability floor as job-03/job-05.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-eval-qa-multi-checkpoint
+spec:
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+      containers:
+        - name: eval-qa-multi-checkpoint
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/eval_qa_multi_checkpoint.py \
+                --split /data/raw_data/qa_split_temporal.json \
+                --injection random \
+                --injection_site cross_attn \
+                --layer_strategy middle4 \
+                --run_dir /data/raw_data/qa_full_runs_temporal/random \
+                --checkpoint_names best.pt,step_4000.pt,step_5000.pt,step_6000.pt \
+                --max_test_items 800 \
+                --out /data/raw_data/qa_eval_multi_random.jsonl
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "6"
+              memory: "24Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "7.2"
+              memory: "28800Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+  backoffLimit: 1 # tolerate one retry for a bad-node ("GPU is lost") admission
+                  # failure, seen in practice on this cluster
+
+# Apply with:
+#   kubectl apply -f job-06b-eval-qa-multi-checkpoint.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-eval-qa-multi-checkpoint -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-eval-qa-multi-checkpoint -n williamli-scvl
+#
+# Output: raw_data/qa_eval_multi_random.jsonl on the data PVC, one record per
+# (item, checkpoint) pair ({pid, difficulty, checkpoint, correct_letter,
+# pred_letter, correct, logprob_A, logprob_B} or the error variant) -- group
+# by ("checkpoint", "difficulty") to get each snapshot's easy/hard accuracy.
