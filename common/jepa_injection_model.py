@@ -184,14 +184,53 @@ class JepaInjector(nn.Module):
         return self.adapter(pooled)  # temporal: (B, T, hidden_size); global: (B, n_tokens, hidden_size)
 
 
+class TemporalFiLMPool(nn.Module):
+    """Order-aware pooling of (B, T, H) JEPA condition tokens into a single
+    (B, H) global summary for FiLM's gamma/beta.
+
+    LayerWiseJEPAInjector's original film path computed
+    ``condition.mean(dim=1)`` -- a plain mean over T is permutation-invariant,
+    so shuffling the 64 frames leaves gamma/beta completely unchanged: FiLM
+    could never distinguish "moves left then right" from "moves right then
+    left" (or from any other reordering). This adds learned per-position
+    embeddings, then mixes tokens with one self-attention layer (whose
+    output depends on both content AND position, unlike the mean) before
+    attention-pooling to one vector. FiLM itself still ends up as a single
+    global affine transform broadcast uniformly over the whole decoder
+    sequence -- it stays architecturally distinct from cross_attn, which
+    lets each decoder token attend differently to the condition tokens; only
+    the way the T=64 axis gets collapsed into that one transform changes.
+    """
+
+    def __init__(self, hidden_size, n_positions=64, nhead=8, p=0.1):
+        super().__init__()
+        self.pos_embed = nn.Parameter(torch.randn(1, n_positions, hidden_size) * 0.02)
+        self.ln = nn.LayerNorm(hidden_size)
+        self.mix = nn.MultiheadAttention(hidden_size, nhead, batch_first=True, dropout=p)
+        self.query = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
+        self.pool = nn.MultiheadAttention(hidden_size, nhead, batch_first=True, dropout=p)
+
+    def forward(self, condition):
+        B, T, H = condition.shape
+        if T > self.pos_embed.shape[1]:
+            raise ValueError(f"TemporalFiLMPool initialized for <= {self.pos_embed.shape[1]} positions, got T={T}")
+        x = self.ln(condition + self.pos_embed[:, :T, :])
+        mixed, _ = self.mix(x, x, x, need_weights=False)
+        q = self.query.expand(B, -1, -1)
+        pooled, _ = self.pool(q, mixed, mixed, need_weights=False)
+        return pooled.squeeze(1)  # (B, H), sensitive to the order of the T frames
+
+
 class LayerWiseJEPAInjector(nn.Module):
     """Turn JEPA tokens into zero-initialized, gated decoder-layer updates.
 
     ``mode='film'`` applies sample-specific FiLM-style scale/shift to the
-    hidden states entering selected decoder blocks.  ``mode='cross_attn'``
-    lets every language token attend to the 64 temporally ordered JEPA tokens.
-    The gates start at zero, so attaching this module is initially an exact
-    no-op for the frozen VLM rather than a destructive distribution shift.
+    hidden states entering selected decoder blocks, using an order-aware
+    pooling of the 64 temporally ordered JEPA tokens (see TemporalFiLMPool).
+    ``mode='cross_attn'`` lets every language token attend to the 64 tokens
+    directly instead of collapsing them. The gates start at zero, so
+    attaching this module is initially an exact no-op for the frozen VLM
+    rather than a destructive distribution shift.
     """
 
     def __init__(self, hidden_size, layer_indices, condition_mode="jepa", seed=0,
@@ -205,6 +244,7 @@ class LayerWiseJEPAInjector(nn.Module):
         )
         keys = [str(i) for i in self.layer_indices]
         if mode == "film":
+            self.temporal_pool = TemporalFiLMPool(hidden_size, nhead=nhead)
             self.modulators = nn.ModuleDict({k: nn.Linear(hidden_size, 2 * hidden_size) for k in keys})
             for modulator in self.modulators.values():
                 nn.init.zeros_(modulator.weight)
@@ -217,8 +257,16 @@ class LayerWiseJEPAInjector(nn.Module):
         self.gates = nn.ParameterDict({k: nn.Parameter(torch.zeros(())) for k in keys})
 
     def condition(self, vjepa_feats):
-        """Return (B, T, H) once; reuse it for both A/B likelihood calls."""
-        return self.conditioner(vjepa_feats)
+        """Return the per-mode condition tensor once; reuse it for both A/B
+        likelihood calls. film: (B, H), already order-aware pooled -- computed
+        once here rather than once per injected layer, since every layer's
+        modulator consumes the same pooled summary. cross_attn: (B, T, H),
+        the full per-frame sequence each layer's attention needs directly.
+        """
+        cond = self.conditioner(vjepa_feats)
+        if self.mode == "film":
+            return self.temporal_pool(cond)
+        return cond
 
     def apply(self, layer_idx, hidden_states, condition):
         key = str(layer_idx)
@@ -232,8 +280,7 @@ class LayerWiseJEPAInjector(nn.Module):
         # mirrors LanguageModelInjectionHook's cast-at-the-boundary pattern.
         condition = condition.to(dtype=self.gates[key].dtype)
         if self.mode == "film":
-            global_condition = condition.mean(dim=1)
-            gamma, beta = self.modulators[key](global_condition).chunk(2, dim=-1)
+            gamma, beta = self.modulators[key](condition).chunk(2, dim=-1)
             # Bounded scale avoids an early optimizer step exploding a frozen
             # decoder's activations.
             update = 0.1 * torch.tanh(gamma).unsqueeze(1) * hidden_states.to(condition.dtype) + beta.unsqueeze(1)
