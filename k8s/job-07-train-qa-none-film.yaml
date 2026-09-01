@@ -89,6 +89,7 @@ spec:
                       - k8s-gen4-05.calit2.optiputer.net
                       - hcc-nrp-shor-c6017.unl.edu
                       - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
       containers:
         - name: train-qa-none-film
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
