@@ -1,0 +1,167 @@
+# Step 10: full-scale VLM guidance extraction for the VLM-guides-JEPA
+# (reverse injection) direction -- vans_qa/full_scale/extract_vlm_guidance_full.py,
+# which stages symlinks for every unique in_clip in qa_split_full.json and
+# shells out to cache_train/rebuild_causal_cache.py (see job-08's header for
+# why that's the real extractor, not the never-existent
+# "qwen3_cache_extractor.py").
+#
+# THIS RUN: --limit 50, a bounded timing/GPU-utilization check before
+# committing to the full ~12k-clip run, per the lab onboarding guide's
+# "run once with --limit 50 first and check the GPU dashboard" convention
+# (Section 1.2, "Be Truthful") -- this job's per-clip cost is higher than
+# job-03's (which only runs V-JEPA2 once per clip): rebuild_causal_cache.py
+# runs V-JEPA2 TWICE per clip (past + target, encoded separately) plus a
+# Qwen3-VL generate() call with decoder-layer hooks, so the real per-clip
+# time and GPU memory footprint needs measuring here before scaling to ~12k.
+#
+# 2026-09-01: uses ruixin-conda-vol-vlm (see pvc-conda-rbd-vlm.yaml), NOT
+# ruixin-conda-vol -- deliberately independent of the forward JEPA->VLM
+# QA-injection jobs' volume so this can run concurrently with e.g.
+# job-07/job-09's training without either blocking on the other's
+# ReadWriteOnce mount (see pvc-conda-rbd-vlm.yaml's header for what happened
+# when both directions shared one volume). data-storage stays on the shared
+# jepa-vlm-injection-data-vol (CephFS ReadWriteMany, not a bottleneck) --
+# writes to raw_data/vlm_stage_full/ (symlinks) and
+# vlm_guidance_cache_full/ (output), distinct from every forward-direction
+# subdir.
+#
+# Needs a GPU: loads both Qwen3-VL-2B-Thinking AND V-JEPA2 ViT-L
+# simultaneously, same compute-capability floor as job-03/job-05, likely a
+# similar or slightly higher memory floor than job-05's Qwen3-VL-2B-alone
+# ~10.5GB (untested until this run) -- keep the RTX-2080-Ti (11GB) exclusion
+# until proven otherwise.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-extract-vlm-guidance-full
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+      containers:
+        - name: extract-vlm-guidance-full
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              # See job-08: qwen3vl has transformers but not timm, which
+              # ThinkJEPA's own vendored vjepa2 encoder needs
+              # (timm.layers.drop_path). Bridge the gap rather than
+              # reworking either conda env.
+              "$PY" -m pip install --quiet timm
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/extract_vlm_guidance_full.py --limit 50
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: VJEPA2_CKPT
+              value: /data/checkpoints/vjepa2/vitl.pt
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "6"
+              memory: "24Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "7.2"
+              memory: "28800Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-10-extract-vlm-guidance-full.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-extract-vlm-guidance-full -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-extract-vlm-guidance-full -n williamli-scvl
+#
+# Output: /data/vans_work/vlm_guidance_cache_full/*.npz (50 clips this run),
+# each holding the full rebuild_causal_cache.py schema-v2 payload. Once
+# timing/memory look healthy, remove --limit 50 for the full ~12k-clip run.
