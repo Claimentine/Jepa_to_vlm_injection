@@ -245,10 +245,24 @@ class LayerWiseJEPAInjector(nn.Module):
         keys = [str(i) for i in self.layer_indices]
         if mode == "film":
             self.temporal_pool = TemporalFiLMPool(hidden_size, nhead=nhead)
+            # Deliberately keep nn.Linear's default (non-zero) init here.
+            # Zero-initializing gamma/beta on top of the zero-initialized gate
+            # below made the whole injector a true fixed point: with
+            # gamma=beta=0 identically (independent of `condition`), the FiLM
+            # update is gate * 0 = 0 for ANY gate value, so d(loss)/d(gate) =
+            # 0 too -- both factors of the gate*update product had zero
+            # gradient simultaneously, and nothing (including AdamW, whose
+            # moment estimates decay to 0 under a persistently-zero gradient)
+            # could ever move off that point. cross_attn never had this
+            # problem because its transform (nn.MultiheadAttention) was never
+            # zero-initialized -- only its gate was, which is what actually
+            # makes "zero-init gated residual" work: the gate needs a
+            # non-degenerate transform output to get a real gradient and
+            # start opening. Confirmed 2026-09-01: a full jepa x film run on
+            # the temporal-hard split never moved off chance-level val_acc
+            # (0.39-0.54 the entire run, no trend) -- consistent with the
+            # injector having contributed exactly zero the whole time.
             self.modulators = nn.ModuleDict({k: nn.Linear(hidden_size, 2 * hidden_size) for k in keys})
-            for modulator in self.modulators.values():
-                nn.init.zeros_(modulator.weight)
-                nn.init.zeros_(modulator.bias)
         else:
             self.cross_attention = nn.ModuleDict({
                 k: nn.MultiheadAttention(hidden_size, nhead, batch_first=True) for k in keys
