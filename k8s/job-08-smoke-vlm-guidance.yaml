@@ -19,6 +19,17 @@
 #     before committing to a full-scale run.
 #
 # Needs a GPU for step 2, same compute-capability floor as job-03/job-05.
+#
+# 2026-09-01: switched conda-storage to ruixin-conda-vol-vlm (a clone of
+# ruixin-conda-vol, see pvc-conda-rbd-vlm.yaml) so this direction no longer
+# fights the forward JEPA->VLM QA-injection jobs (job-05/07/09) over the
+# same ReadWriteOnce volume -- hit that directly: this job and
+# job-09-train-qa-random-film.yaml both sat in PodInitializing for 17h
+# waiting for ruixin-conda-vol to free up, on three different nodes, with no
+# events left to explain it (etcd's 1h event TTL had already expired).
+# data-storage stays on the shared jepa-vlm-injection-data-vol (CephFS
+# ReadWriteMany) -- that one was never the bottleneck, both directions were
+# already writing to distinct subdirs on it concurrently without issue.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -150,7 +161,7 @@ spec:
           emptyDir: {}
         - name: conda-storage
           persistentVolumeClaim:
-            claimName: ruixin-conda-vol
+            claimName: ruixin-conda-vol-vlm
         - name: data-storage
           persistentVolumeClaim:
             claimName: jepa-vlm-injection-data-vol

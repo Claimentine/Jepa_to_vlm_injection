@@ -21,6 +21,17 @@ kubectl apply -f job-02-fetch-vans-data.yaml -n williamli-scvl
 kubectl apply -f job-03-extract-vjepa-features.yaml -n williamli-scvl   # after 01+02 finish; needs a GPU
 ```
 
+For the VLM-guides-JEPA (reverse) direction, also apply
+`pvc-conda-rbd-vlm.yaml` once -- it clones `ruixin-conda-vol` (fast,
+copy-on-write) rather than rebuilding the conda envs from scratch, and gives
+that direction's jobs (job-08 and successors) an independent
+ReadWriteOnce volume so they don't block on the forward direction's jobs
+holding `ruixin-conda-vol`:
+
+```bash
+kubectl apply -f pvc-conda-rbd-vlm.yaml -n williamli-scvl
+```
+
 job-01/job-02 are independent (different PVCs) and can run concurrently,
 CPU-only. job-03 needs the conda env from job-01 and the clip data from
 the (manual, see below) data restore, and requests a GPU.
@@ -89,8 +100,9 @@ kubectl delete job ruixin-setup-env ruixin-fetch-vans-data ruixin-extract-vjepa-
 
 | file | creates | purpose |
 |---|---|---|
-| `pvc-conda-rbd.yaml` | `ruixin-conda-vol` (rook-ceph-block, 50Gi) | conda envs, ThinkJEPA checkout |
-| `pvc-data-cephfs.yaml` | `jepa-vlm-injection-data-vol` (rook-cephfs, 200Gi) | VANS CSVs + demo clips |
+| `pvc-conda-rbd.yaml` | `ruixin-conda-vol` (rook-ceph-block, 50Gi) | conda envs, ThinkJEPA checkout -- used by the forward JEPA->VLM QA-injection jobs (job-01/03/05/06/06b/07/09) |
+| `pvc-conda-rbd-vlm.yaml` | `ruixin-conda-vol-vlm` (rook-ceph-block, 50Gi, cloned from `ruixin-conda-vol`) | same conda envs + ThinkJEPA checkout, but its own volume -- used by the reverse VLM->JEPA jobs (job-08 and its successors) so the two directions don't fight over one ReadWriteOnce volume. See its header comment for why this was needed. |
+| `pvc-data-cephfs.yaml` | `jepa-vlm-injection-data-vol` (rook-cephfs, 200Gi requested / 400Gi actual) | VANS CSVs + demo clips -- shared by BOTH directions (ReadWriteMany, not a bottleneck; each direction writes to its own subdir) |
 | `job-01-setup-env.yaml` | Job `ruixin-setup-env` | builds `thinkjepa`/`qwen3vl` conda envs onto the conda PVC, clones+patches ThinkJEPA |
 | `job-02-fetch-vans-data.yaml` | Job `ruixin-fetch-vans-data` | downloads VANS-Data-100K CSVs + demo bundle from `KlingTeam/VANS` on HF into the data PVC |
 | `job-03-extract-vjepa-features.yaml` | Job `ruixin-extract-vjepa-features` | downloads the V-JEPA2 ViT-L checkpoint (CPU initContainer) + extracts features for whichever of the 18,147 needed clips aren't already cached (GPU) |

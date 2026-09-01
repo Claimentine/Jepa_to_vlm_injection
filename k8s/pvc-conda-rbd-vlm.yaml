@@ -1,0 +1,50 @@
+# Dedicated conda-envs/ThinkJEPA-checkout volume for the VLM-guides-JEPA
+# (reverse injection) direction, cloned from ruixin-conda-vol so the two
+# research directions can run truly concurrently.
+#
+# 2026-09-01: ruixin-conda-vol is rook-ceph-block, genuinely ReadWriteOnce --
+# only one pod cluster-wide can ever mount it, regardless of node. Running
+# a job-07/job-09 (forward JEPA->VLM QA injection) training job and a
+# job-08-style (reverse VLM->JEPA) job at the same time both mount
+# conda-storage, so the second one silently sits in PodInitializing forever
+# waiting for the volume to free up -- hit this directly (both
+# ruixin-smoke-vlm-guidance and ruixin-train-qa-random-film-v2 stuck for 17h
+# with zero events, because the FailedAttachVolume-style events had already
+# aged out of etcd's 1h default TTL by the time it was noticed).
+#
+# The data PVC (jepa-vlm-injection-data-vol) is CephFS ReadWriteMany and
+# is NOT the bottleneck -- it was already being shared concurrently by both
+# directions without issue (jobs write to distinct subdirs:
+# vlm_guidance_cache/ vs qa_full_runs_temporal_film/ etc.), so it was
+# deliberately NOT cloned -- reusing one 400Gi RWX volume for both
+# directions is fine and saves duplicating that much storage.
+#
+# `dataSource` triggers a Ceph RBD clone (fast, copy-on-write -- took ~15s
+# for the initial 50Gi conda-envs+ThinkJEPA checkout, not a real byte-for-byte
+# copy) ONLY on first creation. If this PVC is ever deleted and this file
+# re-applied, it will re-clone from whatever ruixin-conda-vol contains AT
+# THAT TIME, which may have drifted from what job-08 was validated against --
+# re-verify (see job-08's smoke test) after any such recreation.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ruixin-conda-vol-vlm
+spec:
+  storageClassName: rook-ceph-block
+  accessModes:
+    - ReadWriteOnce # Can only be attached to one pod at a time -- same
+                    # constraint as ruixin-conda-vol, just a separate lock
+                    # so the two research directions don't fight over it.
+  resources:
+    requests:
+      storage: 50Gi
+  dataSource:
+    kind: PersistentVolumeClaim
+    name: ruixin-conda-vol
+
+# Apply with:
+#   kubectl apply -f pvc-conda-rbd-vlm.yaml -n williamli-scvl
+#
+# Reminder (Golden Rule #2): this is active-computation storage, not archival.
+# A PVC untouched for 6 months can be purged without notice -- move final
+# results to lab-approved long-term storage when a project wraps up.
