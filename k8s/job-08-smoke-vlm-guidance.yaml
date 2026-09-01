@@ -63,8 +63,29 @@ spec:
             - "-c"
             - |
               set -euo pipefail
-              PY=/home/jovyan/conda-envs/thinkjepa/bin/python
+              # rebuild_causal_cache.py needs both transformers (Qwen3-VL) and
+              # V-JEPA2 loading in the same process. The "thinkjepa" conda env
+              # (per environment-thinkjepa.yml) does NOT have transformers --
+              # confirmed 2026-08-31 the hard way, ModuleNotFoundError partway
+              # through the real extraction step. "qwen3vl" has transformers,
+              # torch, decord, opencv -- everything else this script imports
+              # (confirmed separately: `import transformers` succeeds in this
+              # env). The script's own top-of-file sys.path setup
+              # (REPO_ROOT = Path(__file__).resolve().parents[1], inserted
+              # onto sys.path) makes its `cache_train.*` package imports work
+              # regardless of which env or cwd invokes it.
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
               REPO=/code/Jepa_to_vlm_injection
+
+              # qwen3vl doesn't have timm either -- needed by ThinkJEPA's own
+              # vendored vjepa2/src/models/utils/modules.py
+              # (timm.layers.drop_path), which load_vjepa_encoder() in
+              # rebuild_causal_cache.py pulls in. Neither existing conda env
+              # has transformers AND timm together (see
+              # environment-thinkjepa.yml/environment-qwen3vl.yml), so bridge
+              # the one-package gap here rather than reworking either env for
+              # a smoke test.
+              "$PY" -m pip install --quiet timm
 
               cd "$REPO"
 
