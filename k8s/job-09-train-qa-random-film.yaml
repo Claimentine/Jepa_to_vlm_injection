@@ -1,29 +1,22 @@
-# Step 7 (1/2): full-scale training run, injection=jepa x injection_site=film
-# x layer_strategy=middle4, on the temporal-hard split.
+# Step 9: full-scale training run, injection=random x injection_site=film x
+# layer_strategy=middle4, on the temporal-hard split -- the matched control
+# for job-07-train-qa-jepa-film.yaml's order-aware FiLM run. Same rationale
+# as job-06b's random x cross_attn control: mode="random" ignores
+# vjepa_feats and projects a fixed-seed random tensor of the same shape
+# through an identical adapter, so if this does just as well as jepa x film,
+# the gain is coming from extra trainable capacity, not JEPA content.
 #
-# 2026-08-31: rewritten for the order-aware FiLM fix. LayerWiseJEPAInjector's
-# film path used to collapse the 64 temporally ordered JEPA tokens via
-# condition.mean(dim=1) -- a plain mean is permutation-invariant, so
-# shuffling the frames left FiLM's gamma/beta completely unchanged (see
-# TemporalFiLMPool in common/jepa_injection_model.py). Decided against
-# re-running cross_attn (already trained+evaluated on this split, see job-05/
-# job-06b) and instead fixed FiLM to pool the T axis in an order-sensitive
-# way, then re-run the jepa-vs-random comparison on film specifically. This
-# was never actually exercised as a real run before (only a smoke test on the
-# old qa_split_full.json ever completed here) -- --split/--out_dir below now
-# match job-05's proven config, on a *separate* out_dir
-# (qa_full_runs_temporal_film) so this doesn't clobber jepa's existing
-# cross_attn checkpoint at qa_full_runs_temporal/jepa/. Sibling Job
-# job-09-train-qa-random-film.yaml runs the matched random control (isolates
-# "does the JEPA content itself help" vs just extra trainable capacity --
-# see JepaInjector's docstring). --save_every_steps defaults to 1000 in
-# train_qa_full.py now, so this run gets periodic checkpoints from the start
-# (the original jepa x cross_attn run predated that flag and only has
-# best.pt, which limited how much job-06b's stability check could say).
+# 2026-08-31: new file (rather than repurposing the old
+# job-07-train-qa-random-film.yaml, which currently documents the completed
+# random x cross_attn run evaluated in job-06b -- kept as-is to preserve that
+# record). --split/--out_dir match job-07-train-qa-jepa-film.yaml exactly so
+# the two are directly comparable; --out_dir is separate from
+# qa_full_runs_temporal/random (the cross_attn run) so neither clobbers the
+# other.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: ruixin-train-qa-jepa-film
+  name: ruixin-train-qa-random-film-v2
 spec:
   template:
     spec:
@@ -47,21 +40,8 @@ spec:
                       # capability-wise but not memory-wise -- the frozen
                       # Qwen3-VL-2B model alone eats ~10.5GB, leaving no
                       # headroom for the paired A/B logprob forward+backward's
-                      # activations. Confirmed via kubectl logs: 100% of items
-                      # skipped with "CUDA out of memory ... GPU 0 has a total
-                      # capacity of 10.57 GiB". The A10 (23GB) job-07 runs
-                      # completed fine, so the floor is somewhere between.
+                      # activations (see job-07-train-qa-jepa-film.yaml).
                       - NVIDIA-GeForce-RTX-2080-Ti
-                  # Excluded 2026-08-18: both hit "GPU is lost" NVLink
-                  # device-plugin admission errors on back-to-back attempts
-                  # (nrp-fiona-001, then ry-gpu-01 twice) -- a cluster-side
-                  # driver/hardware issue, not something a retry from this
-                  # Job fixes. Remove once confirmed healthy again. This
-                  # exclusion was already on job-05-train-qa-injection.yaml
-                  # but got missed on job-07 when it was written the same
-                  # day -- likely why all three job-07 runs failed
-                  # (BackoffLimitExceeded, zero pod logs -- consistent with
-                  # admission failing before the container ever started).
                   - key: kubernetes.io/hostname
                     operator: NotIn
                     values:
@@ -73,7 +53,7 @@ spec:
                       - hcc-nrp-shor-c6017.unl.edu
                       - hcc-nrp-shor-c6009.unl.edu
       containers:
-        - name: train-qa-jepa-film
+        - name: train-qa-random-film-v2
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
           command:
             - "bash"
@@ -91,7 +71,7 @@ spec:
               cd "$REPO"
               exec "$PY" vans_qa/full_scale/train_qa_full.py \
                 --split /data/raw_data/qa_split_temporal.json \
-                --injection jepa \
+                --injection random \
                 --injection_site film \
                 --layer_strategy middle4 \
                 --epochs 1 \
@@ -166,11 +146,11 @@ spec:
                   # failure, seen in practice on this cluster
 
 # Apply with:
-#   kubectl apply -f job-07-train-qa-jepa-film.yaml -n williamli-scvl
+#   kubectl apply -f job-09-train-qa-random-film.yaml -n williamli-scvl
 # Watch it:
-#   kubectl logs -f job/ruixin-train-qa-jepa-film -n williamli-scvl
+#   kubectl logs -f job/ruixin-train-qa-random-film-v2 -n williamli-scvl
 # Clean up when done (Golden Rule #4):
-#   kubectl delete job ruixin-train-qa-jepa-film -n williamli-scvl
+#   kubectl delete job ruixin-train-qa-random-film-v2 -n williamli-scvl
 #
-# Output: /data/raw_data/qa_full_runs_temporal_film/jepa/{train_log.jsonl,
+# Output: /data/raw_data/qa_full_runs_temporal_film/random/{train_log.jsonl,
 # best.pt, step_<N>.pt}
