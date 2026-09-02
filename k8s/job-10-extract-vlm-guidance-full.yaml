@@ -5,31 +5,49 @@
 # why that's the real extractor, not the never-existent
 # "qwen3_cache_extractor.py").
 #
-# THIS RUN: --limit 50, a bounded timing/GPU-utilization check before
-# committing to the full ~12k-clip run, per the lab onboarding guide's
-# "run once with --limit 50 first and check the GPU dashboard" convention
-# (Section 1.2, "Be Truthful") -- this job's per-clip cost is higher than
-# job-03's (which only runs V-JEPA2 once per clip): rebuild_causal_cache.py
-# runs V-JEPA2 TWICE per clip (past + target, encoded separately) plus a
-# Qwen3-VL generate() call with decoder-layer hooks, so the real per-clip
-# time and GPU memory footprint needs measuring here before scaling to ~12k.
+# 2026-09-02: full run (no --limit, all ~12k unique in_clips), wrapped in a
+# bash watchdog rather than a code patch to ThinkJEPA. The --limit 50 timing
+# run measured a healthy ~11-30s/clip steady state (implying ~36-37h for the
+# full run) but also hit one clip that hung indefinitely at 0% GPU
+# utilization for 90+ minutes. Reproducing that exact clip's decode/frame-
+# selection logic in isolation (fresh process) completed in well under a
+# second -- so this is much more likely resource accumulation inside
+# rebuild_causal_cache.py's long-running per-video loop (decord reader
+# handles, GPU memory fragmentation, etc.) than a genuinely corrupt file,
+# and it has no per-item timeout of its own (unlike our own
+# train_qa_full.py's DECODE_TIMEOUT_S).
 #
-# 2026-09-01: uses ruixin-conda-vol-vlm (see pvc-conda-rbd-vlm.yaml), NOT
-# ruixin-conda-vol -- deliberately independent of the forward JEPA->VLM
-# QA-injection jobs' volume so this can run concurrently with e.g.
-# job-07/job-09's training without either blocking on the other's
-# ReadWriteOnce mount (see pvc-conda-rbd-vlm.yaml's header for what happened
-# when both directions shared one volume). data-storage stays on the shared
-# jepa-vlm-injection-data-vol (CephFS ReadWriteMany, not a bottleneck) --
-# writes to raw_data/vlm_stage_full/ (symlinks) and
+# Rather than patch rebuild_causal_cache.py's internals (real risk of
+# introducing a new bug into ~1600 lines of vendored code we don't fully
+# own), this watchdog wraps the WHOLE invocation from the outside:
+#   - up to $STARTUP_TIMEOUT for the first progress line (covers the
+#     legitimately slow ~37min cold model-load observed in the timing run)
+#   - up to $ITEM_TIMEOUT of silence once items are flowing (steady state is
+#     ~11-30s/clip, so 10 minutes is a wide safety margin before treating it
+#     as hung, not just a slow clip)
+#   - on either timeout, kill the WHOLE process group (setsid + negative PID
+#     -- a plain `kill` on the wrapper's PID would NOT kill the
+#     rebuild_causal_cache.py child it subprocess.run()s, leaking GPU memory)
+#     and restart. rebuild_causal_cache.py validates each output archive and
+#     skips it if already valid, and only ever writes the final .npz via an
+#     atomic rename-on-success -- a killed clip leaves no valid output
+#     behind, so a restart just resumes at the first not-yet-done clip,
+#     nothing already-saved is redone or lost.
+#   - capped at $MAX_RESTARTS so a systemic problem (e.g. every clip hanging)
+#     fails loudly instead of retrying near-indefinitely.
+#
+# Uses ruixin-conda-vol-vlm (see pvc-conda-rbd-vlm.yaml), NOT
+# ruixin-conda-vol -- independent of the forward JEPA->VLM QA-injection
+# jobs' volume so this runs concurrently with e.g. job-07/job-09's training
+# without either blocking on the other's ReadWriteOnce mount. data-storage
+# stays on the shared jepa-vlm-injection-data-vol (CephFS ReadWriteMany, not
+# a bottleneck) -- writes to raw_data/vlm_stage_full/ (symlinks) and
 # vlm_guidance_cache_full/ (output), distinct from every forward-direction
 # subdir.
 #
 # Needs a GPU: loads both Qwen3-VL-2B-Thinking AND V-JEPA2 ViT-L
-# simultaneously, same compute-capability floor as job-03/job-05, likely a
-# similar or slightly higher memory floor than job-05's Qwen3-VL-2B-alone
-# ~10.5GB (untested until this run) -- keep the RTX-2080-Ti (11GB) exclusion
-# until proven otherwise.
+# simultaneously; the --limit 50 run saw ~5.3GB used on a healthy card, so
+# keep the existing memory-floor exclusions (RTX-2080-Ti) as a safety margin.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -74,7 +92,7 @@ spec:
           args:
             - "-c"
             - |
-              set -euo pipefail
+              set -uo pipefail
               PY=/home/jovyan/conda-envs/qwen3vl/bin/python
               REPO=/code/Jepa_to_vlm_injection
 
@@ -89,7 +107,56 @@ spec:
               ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
 
               cd "$REPO"
-              exec "$PY" vans_qa/full_scale/extract_vlm_guidance_full.py --limit 50
+
+              STARTUP_TIMEOUT=3600   # 60 min grace for cold model loading
+              ITEM_TIMEOUT=600       # 10 min silence once items are flowing => treat as hung
+              MAX_RESTARTS=20
+              LOG=/tmp/extract.log
+
+              attempt=0
+              while [ "$attempt" -lt "$MAX_RESTARTS" ]; do
+                attempt=$((attempt + 1))
+                echo "=== attempt $attempt/$MAX_RESTARTS ($(date -u +%FT%TZ)) ==="
+                : > "$LOG"
+                setsid "$PY" vans_qa/full_scale/extract_vlm_guidance_full.py > "$LOG" 2>&1 &
+                PYPID=$!
+
+                seen_first_progress=0
+                start_ts=$(date +%s)
+
+                while kill -0 "$PYPID" 2>/dev/null; do
+                  sleep 15
+                  now=$(date +%s)
+                  if [ "$seen_first_progress" -eq 0 ] && grep -qE "^\[BUILD 1/|^\[SAVED 1/" "$LOG"; then
+                    seen_first_progress=1
+                  fi
+                  mtime=$(stat -c %Y "$LOG" 2>/dev/null || echo "$start_ts")
+                  if [ "$seen_first_progress" -eq 0 ]; then
+                    if [ $((now - start_ts)) -gt "$STARTUP_TIMEOUT" ]; then
+                      echo "[WATCHDOG] no first progress line within ${STARTUP_TIMEOUT}s -- killing process group"
+                      kill -9 -- -"$PYPID" 2>/dev/null
+                      break
+                    fi
+                  else
+                    if [ $((now - mtime)) -gt "$ITEM_TIMEOUT" ]; then
+                      echo "[WATCHDOG] no log activity for ${ITEM_TIMEOUT}s -- likely a hung item, killing process group"
+                      kill -9 -- -"$PYPID" 2>/dev/null
+                      break
+                    fi
+                  fi
+                done
+                wait "$PYPID" 2>/dev/null
+                EXIT_CODE=$?
+                cat "$LOG"
+                if [ "$EXIT_CODE" -eq 0 ]; then
+                  echo "=== completed successfully on attempt $attempt ==="
+                  exit 0
+                fi
+                echo "=== attempt $attempt exited $EXIT_CODE -- restarting (already-saved clips are skipped instantly, nothing redone) ==="
+              done
+
+              echo "[FATAL] exceeded $MAX_RESTARTS restarts without a clean completion"
+              exit 1
           env:
             - name: VANS_ROOT
               value: /data
@@ -162,6 +229,8 @@ spec:
 # Clean up when done:
 #   kubectl delete job ruixin-extract-vlm-guidance-full -n williamli-scvl
 #
-# Output: /data/vans_work/vlm_guidance_cache_full/*.npz (50 clips this run),
-# each holding the full rebuild_causal_cache.py schema-v2 payload. Once
-# timing/memory look healthy, remove --limit 50 for the full ~12k-clip run.
+# Output: /data/vans_work/vlm_guidance_cache_full/*.npz, one per unique
+# in_clip (~12k), each holding the full rebuild_causal_cache.py schema-v2
+# payload. At ~11-30s/clip steady state this is a multi-day job -- expect
+# the watchdog to fire occasionally; each restart just resumes, it does not
+# restart the whole extraction from clip 1.
