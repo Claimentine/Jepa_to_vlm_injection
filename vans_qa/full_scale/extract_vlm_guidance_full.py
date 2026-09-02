@@ -35,6 +35,20 @@ EXTRACTOR = os.path.join(
 # constants match it exactly, so there's no separate checkpoint to source.
 VJEPA_CHECKPOINT = os.environ.get("VJEPA2_CKPT", "/data/checkpoints/vjepa2/vitl.pt")
 
+# rebuild_causal_cache.py hangs deterministically and indefinitely partway
+# through processing these specific clips, confirmed via a watchdog-
+# restarted rerun (see job-10-extract-vlm-guidance-full.yaml) landing on the
+# exact same clip every attempt (17-20 consecutive fresh-process attempts,
+# each with models freshly reloaded) -- despite the file decoding and
+# frame-selecting fine when reproduced in isolation outside the main loop.
+# The actual cause inside rebuild_causal_cache.py's per-video loop is
+# unknown, but retrying clearly does not help for these, so skip them
+# outright rather than burn another ~20 doomed retry cycles (each costing a
+# ~1h model-reload). Add to this set as new persistent hangs are found.
+EXCLUDE_CLIPS = {
+    "-9oqHVK5-5c/598.mp4",  # confirmed 2026-09-02: hangs every attempt, 0% GPU util, decodes fine standalone
+}
+
 
 def safe_name(clip_path):
     rel = os.path.relpath(clip_path, os.path.join(WORK_BASE, "clips"))
@@ -70,9 +84,20 @@ def main():
         in_clips = in_clips[: args.limit]
 
     n_new = 0
+    n_excluded = 0
     for clip_path in in_clips:
+        rel = os.path.relpath(clip_path, os.path.join(WORK_BASE, "clips"))
         name = safe_name(clip_path)
         link_path = os.path.join(STAGE_DIR, f"{name}.mp4")
+        if rel in EXCLUDE_CLIPS:
+            n_excluded += 1
+            # rebuild_causal_cache.py discovers videos by walking STAGE_DIR
+            # directly, not through this script's in-memory clip list -- a
+            # symlink staged by an earlier run would still be picked up even
+            # though we're excluding it here now, so remove it too.
+            if os.path.lexists(link_path):
+                os.remove(link_path)
+            continue
         # os.path.exists() follows symlinks and returns False for a *broken*
         # one (e.g. stale links left over from before the clips/ relocation
         # to /work), which then made os.symlink() below crash with
@@ -85,7 +110,8 @@ def main():
                 continue
         os.symlink(os.path.abspath(clip_path), link_path)
         n_new += 1
-    print(f"[INFO] staged {len(in_clips)} clips ({n_new} new symlinks) -> {STAGE_DIR}")
+    print(f"[INFO] staged {len(in_clips) - n_excluded} clips ({n_new} new symlinks, "
+          f"{n_excluded} excluded as known-bad) -> {STAGE_DIR}")
 
     cmd = [
         sys.executable, EXTRACTOR,
