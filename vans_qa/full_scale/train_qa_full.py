@@ -376,6 +376,18 @@ def main():
                     help="selected decoder layers for film/cross_attn")
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--gate_lr_multiplier", type=float, default=1.0,
+                     help="film/cross_attn only: multiply --lr for the injector's gate "
+                          "parameters (LayerWiseJEPAInjector.gates), which otherwise share "
+                          "the same lr as everything else. Diagnosed 2026-09-02 on a film "
+                          "run: after 6000 steps the modulator's weights had moved "
+                          "substantially (abs_max grew ~0.03->~0.07) but the gates stayed "
+                          "within +-0.003 of their zero-init, oscillating in sign rather than "
+                          "opening -- consistent with a real but weak, slow-to-accumulate "
+                          "gradient signal on the gate specifically (it depends on the "
+                          "modulator's own still-small output). A higher gate-specific lr "
+                          "tests whether that slow opening, not modulator quality, is the "
+                          "bottleneck.")
     ap.add_argument("--val_every_steps", type=int, default=500)
     ap.add_argument("--save_every_steps", type=int, default=1000,
                     help="periodic checkpoint cadence, independent of best.pt (0 disables)")
@@ -481,9 +493,23 @@ def main():
             seed=args.seed, mode=args.injection_site,
         ).to(device)
         hook = DecoderLayerInjectionHook(model, injector)
-    opt = torch.optim.AdamW(injector.parameters(), lr=args.lr)
+    if hasattr(injector, "gates") and args.gate_lr_multiplier != 1.0:
+        # Separate param group so the gate can move faster than everything
+        # else under AdamW's own per-parameter adaptive step size, without
+        # changing the effective lr for the modulator/cross-attention/
+        # conditioner params. See --gate_lr_multiplier's help text.
+        gate_params = list(injector.gates.parameters())
+        gate_ids = {id(p) for p in gate_params}
+        other_params = [p for p in injector.parameters() if id(p) not in gate_ids]
+        opt = torch.optim.AdamW([
+            {"params": other_params, "lr": args.lr},
+            {"params": gate_params, "lr": args.lr * args.gate_lr_multiplier},
+        ])
+    else:
+        opt = torch.optim.AdamW(injector.parameters(), lr=args.lr)
     print(f"[INFO] injection={args.injection} site={args.injection_site} layers={layer_indices} "
-          f"trainable_params={sum(p.numel() for p in injector.parameters()):,}")
+          f"trainable_params={sum(p.numel() for p in injector.parameters()):,} "
+          f"gate_lr_multiplier={args.gate_lr_multiplier}")
 
     step = 0
     n_skipped = 0
