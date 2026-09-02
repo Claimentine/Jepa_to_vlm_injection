@@ -5,26 +5,37 @@
 # why that's the real extractor, not the never-existent
 # "qwen3_cache_extractor.py").
 #
-# 2026-09-02: full run (no --limit, all ~12k unique in_clips), wrapped in a
-# bash watchdog rather than a code patch to ThinkJEPA. The --limit 50 timing
-# run measured a healthy ~11-30s/clip steady state (implying ~36-37h for the
-# full run) but also hit one clip that hung indefinitely at 0% GPU
-# utilization for 90+ minutes. Reproducing that exact clip's decode/frame-
-# selection logic in isolation (fresh process) completed in well under a
-# second -- so this is much more likely resource accumulation inside
-# rebuild_causal_cache.py's long-running per-video loop (decord reader
-# handles, GPU memory fragmentation, etc.) than a genuinely corrupt file,
-# and it has no per-item timeout of its own (unlike our own
-# train_qa_full.py's DECODE_TIMEOUT_S).
+# 2026-09-02: full run (no --limit, all ~12k unique in_clips).
 #
-# Rather than patch rebuild_causal_cache.py's internals (real risk of
-# introducing a new bug into ~1600 lines of vendored code we don't fully
-# own), this watchdog wraps the WHOLE invocation from the outside:
+# History: the --limit 50 timing run measured a healthy ~11-30s/clip steady
+# state (implying ~36-37h for the full run) but also hit clip
+# -9oqHVK5-5c/598.mp4 hanging indefinitely at 0% GPU utilization. The first
+# full-run attempt (a bash watchdog restarting the WHOLE process on any
+# staleness) confirmed this is a *deterministic* hang, not resource
+# accumulation: 17-20 consecutive fresh-process attempts (each reloading
+# both multi-GB models, ~30-60min) all hung at the exact same clip. That
+# clip is now excluded outright in extract_vlm_guidance_full.py.
+#
+# But a whole-process restart is a wasteful way to handle any *other*,
+# not-yet-discovered clip that behaves the same way among the remaining
+# ~12k -- ~30-60min lost just to skip one clip. So
+# rebuild_causal_cache.py's per-clip decode/frame-selection step now gets
+# its own hard subprocess timeout (scripts/patch_thinkjepa.sh's third patch
+# step, applied at the top of this job before running the real extraction --
+# see rebuild_causal_cache_decode_timeout.py for why this needs to be a
+# subprocess rather than an in-process signal/thread timeout). A hung clip
+# now costs at most ~5 minutes and gets skipped+logged in place, without
+# losing the already-loaded models.
+#
+# The outer bash watchdog stays, but only as a backstop for failure modes
+# the per-clip patch doesn't cover (e.g. a hang during model loading itself,
+# or something in the GPU-bound V-JEPA2/Qwen3-VL steps rather than decode) --
+# expected to rarely if ever fire now:
 #   - up to $STARTUP_TIMEOUT for the first progress line (covers the
 #     legitimately slow ~37min cold model-load observed in the timing run)
-#   - up to $ITEM_TIMEOUT of silence once items are flowing (steady state is
-#     ~11-30s/clip, so 10 minutes is a wide safety margin before treating it
-#     as hung, not just a slow clip)
+#   - up to $ITEM_TIMEOUT of silence once items are flowing, now generous
+#     (well beyond the in-script decode timeout) since it's a backstop, not
+#     the primary defense
 #   - on either timeout, kill the WHOLE process group (setsid + negative PID
 #     -- a plain `kill` on the wrapper's PID would NOT kill the
 #     rebuild_causal_cache.py child it subprocess.run()s, leaking GPU memory)
@@ -33,8 +44,8 @@
 #     atomic rename-on-success -- a killed clip leaves no valid output
 #     behind, so a restart just resumes at the first not-yet-done clip,
 #     nothing already-saved is redone or lost.
-#   - capped at $MAX_RESTARTS so a systemic problem (e.g. every clip hanging)
-#     fails loudly instead of retrying near-indefinitely.
+#   - capped at $MAX_RESTARTS so a systemic problem fails loudly instead of
+#     retrying near-indefinitely.
 #
 # Uses ruixin-conda-vol-vlm (see pvc-conda-rbd-vlm.yaml), NOT
 # ruixin-conda-vol -- independent of the forward JEPA->VLM QA-injection
@@ -108,8 +119,14 @@ spec:
 
               cd "$REPO"
 
+              # Idempotent: gives rebuild_causal_cache.py's per-clip decode
+              # step its own hard subprocess timeout, so one hung clip costs
+              # ~5 minutes instead of a full ~30-60min process restart. See
+              # this file's header comment.
+              bash scripts/patch_thinkjepa.sh
+
               STARTUP_TIMEOUT=3600   # 60 min grace for cold model loading
-              ITEM_TIMEOUT=600       # 10 min silence once items are flowing => treat as hung
+              ITEM_TIMEOUT=3600      # backstop only now (per-clip timeout lives inside the script) -- 60 min silence => treat as hung
               MAX_RESTARTS=20
               LOG=/tmp/extract.log
 
