@@ -1,0 +1,155 @@
+# Step 11: jepa x film x middle4 on the temporal-hard split, with
+# --gate_lr_multiplier 10 -- tests whether the gate's slow opening (not
+# modulator quality) is the val_acc bottleneck.
+#
+# 2026-09-03: the completed job-07 run (both FiLM fixes applied -- order-aware
+# TemporalFiLMPool + non-zero modulator init, confirmed via checkpoint
+# inspection: modulator abs_max grew ~0.03->~0.07 over 6000 steps) still
+# hovered around chance (val_acc 0.48-0.60, no clear trend). But its gates
+# stayed within +-0.003 of their zero-init the whole run, oscillating in
+# sign rather than opening -- consistent with a real but weak gradient
+# signal on the gate specifically (see --gate_lr_multiplier's help text in
+# train_qa_full.py). This run gives the gate its own AdamW param group at
+# 10x --lr to see if that changes the trajectory.
+#
+# --out_dir is separate from job-07's qa_full_runs_temporal_film so this
+# doesn't clobber the already-analyzed baseline run's checkpoints.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-train-qa-jepa-film-gatelr
+spec:
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - hpc-nrp-g1.nmsu.edu
+      containers:
+        - name: train-qa-jepa-film-gatelr
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/train_qa_full.py \
+                --split /data/raw_data/qa_split_temporal.json \
+                --injection jepa \
+                --injection_site film \
+                --layer_strategy middle4 \
+                --epochs 1 \
+                --val_every_steps 500 \
+                --max_val_items 100 \
+                --gate_lr_multiplier 10 \
+                --out_dir /data/raw_data/qa_full_runs_temporal_film_gatelr
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "6"
+              memory: "24Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "7.2"
+              memory: "28800Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+  backoffLimit: 1 # tolerate one retry for a bad-node ("GPU is lost") admission
+                  # failure, seen in practice on this cluster
+
+# Apply with:
+#   kubectl apply -f job-11-train-qa-jepa-film-gatelr.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-train-qa-jepa-film-gatelr -n williamli-scvl
+# Clean up when done (Golden Rule #4):
+#   kubectl delete job ruixin-train-qa-jepa-film-gatelr -n williamli-scvl
+#
+# Output: /data/raw_data/qa_full_runs_temporal_film_gatelr/jepa/{train_log.jsonl,
+# best.pt, step_<N>.pt}
