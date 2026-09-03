@@ -1,0 +1,215 @@
+# Step 12: full-scale VLM guidance extraction using VANS's real
+# in_clip -> out_clip pairing and real correct_caption text
+# (vans_qa/full_scale/extract_vlm_guidance_paired.py) -- replaces
+# job-10-extract-vlm-guidance-full.yaml's approach (rebuild_causal_cache.py
+# bisecting one file, with Qwen3-VL freely generating a guess about content
+# it never saw). See extract_vlm_guidance_paired.py's module docstring for
+# the full rationale; smoke-tested 2026-09-03 on 3 real pairs, output
+# verified (prompt_token_ids/answer_token_ids lengths match vlm_old/vlm_new
+# sequence dims exactly, question/correct_caption round-trip correctly).
+#
+# 2026-09-03: job-10's full run (v1, 580/11979 clips) was stopped in favor
+# of this one -- no point continuing to spend GPU time on a known-inferior
+# design once v2 was validated.
+#
+# This script has its own native per-clip decode timeout (spawn-isolated,
+# matching train_qa_full.py's proven pattern) since it owns its own decode
+# step end to end -- no ThinkJEPA patch needed here, unlike job-10. The
+# outer bash watchdog below is kept only as a backstop for failure modes
+# the per-clip timeout doesn't cover (e.g. a hang during model loading
+# itself -- observed multiple times today across unrelated jobs, likely
+# broader cluster storage load rather than anything specific to this
+# script).
+#
+# Uses ruixin-conda-vol-vlm (see pvc-conda-rbd-vlm.yaml) so this runs
+# concurrently with the forward JEPA->VLM QA-injection jobs without
+# fighting over ruixin-conda-vol's ReadWriteOnce mount. data-storage stays
+# on the shared jepa-vlm-injection-data-vol (CephFS ReadWriteMany, not a
+# bottleneck) -- writes to vans_work/vlm_guidance_cache_paired/, distinct
+# from job-10's vlm_guidance_cache_full/ (that output is not reused; this
+# is a clean full re-extraction).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-extract-vlm-guidance-paired
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+      containers:
+        - name: extract-vlm-guidance-paired
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -uo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              # See job-08: qwen3vl has transformers but not timm, which
+              # ThinkJEPA's own vendored vjepa2 encoder needs
+              # (timm.layers.drop_path).
+              "$PY" -m pip install --quiet timm
+
+              cd "$REPO"
+
+              STARTUP_TIMEOUT=3600   # 60 min grace for cold model loading
+              ITEM_TIMEOUT=3600      # backstop only (per-pair timeout lives inside the script) -- 60 min silence => treat as hung
+              MAX_RESTARTS=20
+              LOG=/tmp/extract.log
+
+              attempt=0
+              while [ "$attempt" -lt "$MAX_RESTARTS" ]; do
+                attempt=$((attempt + 1))
+                echo "=== attempt $attempt/$MAX_RESTARTS ($(date -u +%FT%TZ)) ==="
+                : > "$LOG"
+                setsid "$PY" vans_qa/full_scale/extract_vlm_guidance_paired.py \
+                  --split /data/raw_data/qa_split_full.json \
+                  --output_dir /data/vans_work/vlm_guidance_cache_paired \
+                  > "$LOG" 2>&1 &
+                PYPID=$!
+
+                seen_first_progress=0
+                start_ts=$(date +%s)
+
+                while kill -0 "$PYPID" 2>/dev/null; do
+                  sleep 15
+                  now=$(date +%s)
+                  if [ "$seen_first_progress" -eq 0 ] && grep -qE "^\[SAVED 1/|^\[SKIP 1/|^\[FAIL 1/" "$LOG"; then
+                    seen_first_progress=1
+                  fi
+                  mtime=$(stat -c %Y "$LOG" 2>/dev/null || echo "$start_ts")
+                  if [ "$seen_first_progress" -eq 0 ]; then
+                    if [ $((now - start_ts)) -gt "$STARTUP_TIMEOUT" ]; then
+                      echo "[WATCHDOG] no first progress line within ${STARTUP_TIMEOUT}s -- killing process group"
+                      kill -9 -- -"$PYPID" 2>/dev/null
+                      break
+                    fi
+                  else
+                    if [ $((now - mtime)) -gt "$ITEM_TIMEOUT" ]; then
+                      echo "[WATCHDOG] no log activity for ${ITEM_TIMEOUT}s -- likely a hung item, killing process group"
+                      kill -9 -- -"$PYPID" 2>/dev/null
+                      break
+                    fi
+                  fi
+                done
+                wait "$PYPID" 2>/dev/null
+                EXIT_CODE=$?
+                cat "$LOG"
+                if [ "$EXIT_CODE" -eq 0 ]; then
+                  echo "=== completed successfully on attempt $attempt ==="
+                  exit 0
+                fi
+                echo "=== attempt $attempt exited $EXIT_CODE -- restarting (already-saved pairs are skipped instantly, nothing redone) ==="
+              done
+
+              echo "[FATAL] exceeded $MAX_RESTARTS restarts without a clean completion"
+              exit 1
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: VJEPA2_CKPT
+              value: /data/checkpoints/vjepa2/vitl.pt
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "6"
+              memory: "24Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "7.2"
+              memory: "28800Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-12-extract-vlm-guidance-paired.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-extract-vlm-guidance-paired -n williamli-scvl
+#   (note: the extraction's own stdout goes to /tmp/extract.log inside the
+#   pod and is only cat'd to the container's stdout once the current
+#   attempt's loop exits -- kubectl exec in and `tail -f /tmp/extract.log`
+#   for live progress instead of waiting)
+# Clean up when done:
+#   kubectl delete job ruixin-extract-vlm-guidance-paired -n williamli-scvl
+#
+# Output: /data/vans_work/vlm_guidance_cache_paired/<pid>.npz, one per
+# unique (in_clip, out_clip) pair (~12k).
