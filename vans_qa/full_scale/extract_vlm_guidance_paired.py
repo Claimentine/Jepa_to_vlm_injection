@@ -1,39 +1,49 @@
-"""VLM guidance extraction using VANS's *actual* in_clip -> out_clip pairing,
-instead of cache_train/rebuild_causal_cache.py's generic single-file T//2
-self-split.
+"""VLM guidance extraction using VANS's *actual* in_clip -> out_clip pairing
+and *actual* correct_caption text, instead of
+cache_train/rebuild_causal_cache.py's generic single-file T//2 self-split
+plus free-form generation.
 
-Why this is a separate file, not a change to extract_vlm_guidance_full.py:
-that script feeds only in_clip into rebuild_causal_cache.py, which then
-bisects in_clip itself into a pseudo-past/pseudo-future -- the "future" it
-predicts is just the second half of in_clip, never actually reaching
-out_clip, which is VANS's real, dataset-provided continuation of the same
-source video (pid convention "<video_id>__<n>" confirms in_clip/out_clip
-are sequential segments of one source video, not the shortcut-diagnosis
-cross-video distractors that motivated qa_split_temporal.json -- that
-diagnosis was about *distractor* out_clips sampled from other videos, not
-about the true (in_clip, out_clip) pairing itself). Using in_clip as the
-full past and out_clip as the full target instead means predicting a
-genuinely longer-horizon, dataset-intended future.
+Two departures from the original ThinkJEPA design, both because VANS gives
+us real supervision that raw, caption-free video doesn't have:
+
+1. Pairing: rebuild_causal_cache.py bisects one file into a pseudo-past/
+   pseudo-future -- the "future" it predicts never reaches past the
+   midpoint of in_clip. VANS's in_clip/out_clip are real, dataset-provided
+   sequential segments of the same source video (pid convention
+   "<video_id>__<n>" confirms this -- and this is about the *true* pairing,
+   not the cross-video shortcut distractors that motivated
+   qa_split_temporal.json). Using in_clip as the full past and out_clip as
+   the full target predicts a genuinely longer-horizon, dataset-intended
+   future.
+
+2. vlm_new content: the original design has Qwen3-VL freely generate() a
+   continuation of what it just watched -- a guess, possibly hallucinated,
+   about content it never saw. VANS gives us `correct_caption`, a real,
+   dataset-authored description of what out_clip actually shows. Teacher-
+   forcing that known text (tokenize prompt and answer *separately*, then
+   concatenate token ids and run one forward pass -- exactly
+   train_qa_full.py's append_answer_tokens/candidate_logprob pattern, which
+   keeps the prompt/answer boundary exact without re-tokenizing a combined
+   string) grounds vlm_new in the true future instead of a guess, and is
+   cheaper besides: one forward pass instead of an autoregressive
+   generate() loop.
 
 Reuses (via import, not copy-paste) the proven pieces of
-cache_train/rebuild_causal_cache.py: Qwen3-VL loading + decoder-hook
-registration (load_qwen), V-JEPA2 loading (load_vjepa_encoder), frame
-preprocessing (preprocess_vjepa_frames), V-JEPA2 encoding (encode_vjepa_clip),
-and the past-only Qwen inference call (infer_qwen_past_only) -- all of
-these are file-agnostic single-clip utilities, they don't care whether the
-32 "past" frames came from bisecting one file or from a whole separate
-in_clip file. Only the top-level orchestration (which two files to decode,
-how to sample frames from each, the output schema) is new here.
+cache_train/rebuild_causal_cache.py that are agnostic to both of the above:
+Qwen3-VL loading + decoder-hook registration (load_qwen), V-JEPA2 loading
+(load_vjepa_encoder), frame preprocessing (preprocess_vjepa_frames), and
+V-JEPA2 encoding (encode_vjepa_clip). The Qwen inference call itself is new
+here (infer_qwen_teacher_forced below) since it needs the item's real
+question/correct_caption, not rebuild_causal_cache.py's generic
+--prompt + generate().
 """
 import argparse
 import json
 import os
 import sys
-import time
 import traceback
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 
@@ -131,8 +141,112 @@ def collect_pairs(split_path):
         for item in part:
             pid = item["pid"]
             if pid not in seen:
-                seen[pid] = (item["in_clip"], item["out_clip"])
-    return seen  # pid -> (in_clip, out_clip)
+                seen[pid] = {
+                    "in_clip": item["in_clip"],
+                    "out_clip": item["out_clip"],
+                    "question": item["question"],
+                    "correct_caption": item["correct_caption"],
+                }
+    return seen  # pid -> {in_clip, out_clip, question, correct_caption}
+
+
+def infer_qwen_teacher_forced(args, model, processor, saved, device, past_frames, past_times, in_fps, question, correct_caption):
+    """Like rebuild_causal_cache.py's infer_qwen_past_only, but the "new"
+    half of the sequence is the real correct_caption (teacher-forced via one
+    forward pass), not a freely generate()'d guess -- see module docstring.
+
+    `saved` is the dict register_thinker_decoder_hooks() (inside load_qwen)
+    populates on every forward call; a hook fires exactly once here since
+    there is exactly one forward call, so each layer's list holds exactly
+    one [1, full_len, D] tensor, no generation-step stacking needed.
+    """
+    import torch
+    from PIL import Image
+    from qwen_vl_utils import process_vision_info
+    from cache_train.rebuild_causal_cache import _effective_sample_fps
+
+    for values in saved.values():
+        values.clear()
+
+    # Qwen3-VL uses sample_fps/raw_fps to place the video's temporal/RoPE
+    # position embeddings -- passing the true rate the 32 frames were
+    # actually sampled at (not left to some processor default) keeps this
+    # consistent with what rebuild_causal_cache.py does for its own past-only
+    # inference call.
+    effective_fps = _effective_sample_fps(past_times, in_fps)
+    exact_past_pil = [Image.fromarray(frame) for frame in past_frames]
+    video_content = {
+        "type": "video",
+        "video": exact_past_pil,
+        "resized_height": int(args.qwen_res),
+        "resized_width": int(args.qwen_res),
+        "sample_fps": effective_fps,
+        "raw_fps": effective_fps,
+    }
+    messages = [{"role": "user", "content": [video_content, {"type": "text", "text": str(question)}]}]
+    images, videos, video_kwargs = process_vision_info(
+        messages, image_patch_size=16, return_video_kwargs=True, return_video_metadata=True,
+    )
+    if not videos or len(videos) != 1:
+        raise RuntimeError("Qwen vision processing did not return exactly one video")
+    video_tensors, video_metadata = [], []
+    for value in videos:
+        if isinstance(value, tuple):
+            video_tensors.append(value[0])
+            video_metadata.append(value[1])
+        else:
+            video_tensors.append(value)
+    if int(video_tensors[0].shape[0]) != past_frames.shape[0]:
+        raise AssertionError(
+            f"Qwen vision processing changed the exact past-frame count: {tuple(video_tensors[0].shape)}"
+        )
+
+    rendered_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    processor_kwargs = {
+        "text": [rendered_text], "videos": video_tensors, "return_tensors": "pt",
+        "padding": True, "do_resize": False,
+    }
+    if images:
+        processor_kwargs["images"] = images
+    if video_metadata:
+        processor_kwargs["video_metadata"] = video_metadata
+    processor_kwargs.update(video_kwargs or {})
+    prompt_inputs = processor(**processor_kwargs)
+    prefix_len = prompt_inputs["input_ids"].shape[1]
+
+    # Tokenized separately from the prompt (not appended-then-retokenized as
+    # one string) so the prompt/answer boundary is exact regardless of BPE
+    # merge behavior at the join point -- same reasoning as
+    # train_qa_full.py's append_answer_tokens.
+    answer_ids = processor.tokenizer(
+        f" {correct_caption}", add_special_tokens=False, return_tensors="pt",
+    )["input_ids"]
+    full_ids = torch.cat([prompt_inputs["input_ids"], answer_ids], dim=1)
+    full_mask = torch.cat([prompt_inputs["attention_mask"], torch.ones_like(answer_ids)], dim=1)
+
+    call_inputs = {k: v for k, v in prompt_inputs.items() if k not in ("input_ids", "attention_mask")}
+    call_inputs["input_ids"] = full_ids
+    call_inputs["attention_mask"] = full_mask
+    call_inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in call_inputs.items()}
+
+    with torch.inference_mode():
+        model(**call_inputs)
+
+    layer_states = []
+    for layer_idx in args.layers:
+        calls = saved[f"dec_{layer_idx}"]
+        if len(calls) != 1:
+            raise RuntimeError(f"expected exactly one forward call per item, got {len(calls)} for layer {layer_idx}")
+        layer_states.append(calls[0][0])  # [1, full_len, D] -> [full_len, D]
+    all_states = torch.stack(layer_states, dim=0)  # [L, full_len, D]
+    vlm_old = all_states[:, :prefix_len, :]
+    vlm_new = all_states[:, prefix_len:, :]
+    return {
+        "vlm_old_tensor": vlm_old,
+        "vlm_new_tensor": vlm_new,
+        "prompt_token_ids": prompt_inputs["input_ids"][0].cpu().numpy().astype(np.int32),
+        "answer_token_ids": answer_ids[0].cpu().numpy().astype(np.int32),
+    }
 
 
 def main():
@@ -144,8 +258,6 @@ def main():
     ap.add_argument("--qwen_checkpoint_sha", default="")
     ap.add_argument("--vjepa_checkpoint", default=os.environ.get("VJEPA2_CKPT", "/data/checkpoints/vjepa2/vitl.pt"))
     ap.add_argument("--layers", type=int, nargs="+", default=[0, 4, 8, 12, 16, 20, 24, 27])
-    ap.add_argument("--prompt", default="Describe this video.")
-    ap.add_argument("--max_new_token_num", type=int, default=16)
     ap.add_argument("--qwen_res", type=int, default=256)
     ap.add_argument("--save_dtype", choices=["fp16", "fp32"], default="fp16")
     ap.add_argument("--limit", type=int, default=None, help="cap number of pairs (smoke test)")
@@ -155,8 +267,7 @@ def main():
     from cache_train.rebuild_causal_cache import (
         NUM_PAST_FRAMES, NUM_TARGET_FRAMES,
         load_qwen, load_vjepa_encoder, preprocess_vjepa_frames,
-        encode_vjepa_clip, infer_qwen_past_only, tensor_to_numpy,
-        sha256_file,
+        encode_vjepa_clip, tensor_to_numpy, sha256_file,
     )
 
     output_root = Path(args.output_dir)
@@ -180,7 +291,8 @@ def main():
     saved_count = skipped_count = failed_count = 0
     seen_exc_types = set()
     with torch.no_grad():
-        for i, (pid, (in_clip, out_clip)) in enumerate(items, start=1):
+        for i, (pid, pair) in enumerate(items, start=1):
+            in_clip, out_clip = pair["in_clip"], pair["out_clip"]
             output_path = output_root / f"{pid}.npz"
             if is_valid_output(output_path):
                 skipped_count += 1
@@ -190,9 +302,9 @@ def main():
                 past_frames, past_times, in_fps = decode_clip_with_timeout(in_clip, NUM_PAST_FRAMES)
                 target_frames, target_times, _out_fps = decode_clip_with_timeout(out_clip, NUM_TARGET_FRAMES)
 
-                selection_like = SimpleNamespace(past_times=past_times, source_fps=in_fps)
-                qwen_result = infer_qwen_past_only(
-                    args, qwen_model, qwen_processor, qwen_saved, device, past_frames, selection_like,
+                qwen_result = infer_qwen_teacher_forced(
+                    args, qwen_model, qwen_processor, qwen_saved, device,
+                    past_frames, past_times, in_fps, pair["question"], pair["correct_caption"],
                 )
 
                 past_clip, past_imgs = preprocess_vjepa_frames(past_frames)
@@ -201,10 +313,12 @@ def main():
                 vjepa_target_feats = encode_vjepa_clip(vjepa_model, target_clip, device)
 
                 payload = {
-                    "schema_name": np.asarray("vlm_guidance_paired_v1"),
+                    "schema_name": np.asarray("vlm_guidance_paired_v2_teacher_forced"),
                     "pid": np.asarray(pid),
                     "in_clip_relpath": np.asarray(str(in_clip)),
                     "out_clip_relpath": np.asarray(str(out_clip)),
+                    "question": np.asarray(pair["question"]),
+                    "correct_caption": np.asarray(pair["correct_caption"]),
                     "past_frame_times_seconds": past_times.astype(np.float64),
                     "target_frame_times_seconds": target_times.astype(np.float64),
                     "past_imgs": past_imgs,
@@ -216,8 +330,8 @@ def main():
                     "qwen_model": np.asarray(args.pretrained),
                     "qwen_checkpoint_sha": np.asarray(qwen_sha),
                     "layers": np.asarray(args.layers, dtype=np.int32),
-                    "text": qwen_result["text"],
-                    "token_ids": qwen_result["token_ids"],
+                    "prompt_token_ids": qwen_result["prompt_token_ids"],
+                    "answer_token_ids": qwen_result["answer_token_ids"],
                     "vlm_old": tensor_to_numpy(qwen_result["vlm_old_tensor"], args.save_dtype),
                     "vlm_new": tensor_to_numpy(qwen_result["vlm_new_tensor"], args.save_dtype),
                 }
