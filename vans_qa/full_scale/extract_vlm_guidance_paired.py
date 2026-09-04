@@ -127,11 +127,24 @@ def is_valid_output(path):
 def atomic_write_npz(output_path, payload):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = output_path.parent / f".{output_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}.npz"
-    with tmp_path.open("wb") as handle:
-        np.savez_compressed(handle, **payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp_path, output_path)
+    try:
+        with tmp_path.open("wb") as handle:
+            np.savez_compressed(handle, **payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, output_path)
+    finally:
+        # A failed write (e.g. disk quota exceeded mid-write) otherwise
+        # leaves the half-written temp file behind forever -- confirmed
+        # 2026-09-03: a disk-full run left 10,517 orphaned .tmp.*.npz files
+        # on disk, matching the failure count almost exactly, both wasting
+        # space and making `find -name "*.npz"` wildly overcount real
+        # output. os.replace() above already consumed tmp_path on success,
+        # so this is a no-op then.
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def collect_pairs(split_path):
@@ -350,6 +363,14 @@ def main():
 
     print(f"[DONE] saved={saved_count} skipped_valid={skipped_count} failed={failed_count} "
           f"output={output_root}", flush=True)
+    # Matches rebuild_causal_cache.py's own convention (return 1 if
+    # failed_count else 0) -- without this, a run that failed on nearly
+    # every item (e.g. a disk-full stretch) still exits 0, so job-12's
+    # outer watchdog treats it as a clean success and never retries the
+    # items that never got a valid output. Confirmed 2026-09-03: exactly
+    # this happened, 10772/12032 failed on one run and it was reported
+    # "completed successfully".
+    return 1 if failed_count else 0
 
 
 def tensor_or_array_to_dtype(value, save_dtype):
@@ -360,4 +381,4 @@ def tensor_or_array_to_dtype(value, save_dtype):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
