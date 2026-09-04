@@ -76,6 +76,7 @@ spec:
                       - hcc-nrp-shor-c6017.unl.edu
                       - hcc-nrp-shor-c6009.unl.edu
                       - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
                       - hcc-chase-shor-c4705.unl.edu
       containers:
         - name: eval-qa-injection
