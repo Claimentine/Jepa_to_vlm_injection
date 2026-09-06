@@ -1,0 +1,159 @@
+# Step 13: full-scale training run, injection=jepa x injection_site=cross_attn
+# x layer_strategy=middle4, on the temporal-hard split -- the clean
+# apples-to-apples counterpart to job-07-train-qa-jepa-film.yaml, same split/
+# layer_strategy/epochs/val schedule, only injection_site differs.
+#
+# 2026-09-06: job-07's own docstring says cross_attn was deliberately NOT
+# re-run when FiLM's order-aware pooling fix landed ("already trained+
+# evaluated on this split, see job-05/job-06b"). But the only temporal-split
+# cross_attn checkpoint that actually exists on disk
+# (qa_full_runs_temporal_crossattn_test/jepa, best.pt) only has 313 steps in
+# its train_log.jsonl -- an interrupted/incomplete run, not the full ~6000+
+# step budget job-07/job-11 actually ran. The qa_eval_temporal_jepa_crossattn*
+# .jsonl eval files on disk were generated against that undertrained
+# checkpoint. Meanwhile gate_lr_multiplier=10 diagnostics on FiLM (job-11)
+# showed gates stuck under 0.01 magnitude even with a 10x boosted LR --
+# consistent with FiLM being architecturally bandwidth-limited, not just
+# slow to train -- so a *properly completed* cross_attn run is needed for a
+# real final comparison, not a re-use of the old partial checkpoint.
+# qa_full_runs_temporal_crossattn_test/ was deleted before this run so this
+# --out_dir starts clean (no relation to the old undertrained checkpoint).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-train-qa-jepa-crossattn
+spec:
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+                      - hpc-nrp-g1.nmsu.edu
+      containers:
+        - name: train-qa-jepa-crossattn
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/train_qa_full.py \
+                --split /data/raw_data/qa_split_temporal.json \
+                --injection jepa \
+                --injection_site cross_attn \
+                --layer_strategy middle4 \
+                --epochs 1 \
+                --val_every_steps 500 \
+                --max_val_items 100 \
+                --out_dir /data/raw_data/qa_full_runs_temporal_crossattn
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "6"
+              memory: "24Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "7.2"
+              memory: "28800Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+  backoffLimit: 1 # tolerate one retry for a bad-node ("GPU is lost") admission
+                  # failure, seen in practice on this cluster
+
+# Apply with:
+#   kubectl apply -f job-13-train-qa-jepa-crossattn.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-train-qa-jepa-crossattn -n williamli-scvl
+# Clean up when done (Golden Rule #4):
+#   kubectl delete job ruixin-train-qa-jepa-crossattn -n williamli-scvl
+#
+# Output: /data/raw_data/qa_full_runs_temporal_crossattn/jepa/{train_log.jsonl,
+# best.pt, step_<N>.pt}

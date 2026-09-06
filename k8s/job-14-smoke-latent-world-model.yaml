@@ -1,0 +1,150 @@
+# Step 14 smoke test: vans_qa/full_scale/train_latent_world_model_full.py,
+# a new script (never run before) that trains CortexGuidedVideoPredictor on
+# the real, full-scale extract_vlm_guidance_paired.py output to test whether
+# VLM guidance actually helps V-JEPA2's self-supervised future-latent
+# prediction, vs. a no-guidance control. See the script's module docstring
+# for why the older demo script (vans_qa/demo/train_latent_world_model.py)
+# couldn't just be reused (wrong cache schema/shapes, no control condition,
+# hardcoded film mode).
+#
+# This smoke test runs both conditions (--guidance crossattn and --guidance
+# none) for a handful of steps each, on whatever subset of
+# vlm_guidance_cache_paired/ is already extracted (job-12 is still running,
+# ~98% done as of 2026-09-06 -- plenty of real data already on disk for a
+# smoke test even before it finishes) -- validates shapes/imports actually
+# work end to end before committing GPU time to a full run.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-smoke-latent-world-model
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+      containers:
+        - name: smoke-latent-world-model
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+
+              echo "=== smoke 1/2: --guidance crossattn ==="
+              "$PY" vans_qa/full_scale/train_latent_world_model_full.py \
+                --guidance crossattn \
+                --max_train_items 8 \
+                --val_every_steps 4 \
+                --save_every_steps 100000 \
+                --max_val_items 4 \
+                --out_dir /data/raw_data/latent_world_model_smoke
+
+              echo ""
+              echo "=== smoke 2/2: --guidance none ==="
+              "$PY" vans_qa/full_scale/train_latent_world_model_full.py \
+                --guidance none \
+                --max_train_items 8 \
+                --val_every_steps 4 \
+                --save_every_steps 100000 \
+                --max_val_items 4 \
+                --out_dir /data/raw_data/latent_world_model_smoke
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "19200Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-14-smoke-latent-world-model.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-smoke-latent-world-model -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-smoke-latent-world-model -n williamli-scvl
