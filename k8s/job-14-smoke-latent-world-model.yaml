@@ -61,6 +61,15 @@ spec:
               set -euo pipefail
               PY=/home/jovyan/conda-envs/qwen3vl/bin/python
               REPO=/code/Jepa_to_vlm_injection
+
+              # cache_train.thinker_train unconditionally imports EgoDex's
+              # h5py-dependent dataloader (egodex/trajectory_dataset.py) even
+              # though this script never touches EgoDex -- confirmed
+              # 2026-09-07, ModuleNotFoundError: no module named 'h5py' on
+              # first smoke attempt. qwen3vl env has neither h5py nor timm
+              # (see job-08/job-12's same pattern for timm).
+              "$PY" -m pip install --quiet h5py
+
               cd "$REPO"
 
               echo "=== smoke 1/2: --guidance crossattn ==="
