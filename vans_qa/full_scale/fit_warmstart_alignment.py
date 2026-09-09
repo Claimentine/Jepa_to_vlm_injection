@@ -71,7 +71,9 @@ def pooled_stats(cache_dir, limit):
         files = files[:limit]
     X_in, X_tgt, Y_old, Y_new = [], [], [], []
     n_skipped = 0
-    for f in files:
+    for i, f in enumerate(files, start=1):
+        if i % 200 == 0:
+            print(f"[PROGRESS] {i}/{len(files)} files read", flush=True)
         try:
             d = np.load(f)
             vj_in = d["vjepa_input_feats"].astype(np.float64)   # (T,N,1024)
