@@ -55,7 +55,6 @@ Output: a single .pt file consumed by train_qa_full.py's
 --warmstart_alignment flags.
 """
 import argparse
-import glob
 import os
 import signal
 
@@ -86,8 +85,28 @@ def _raise_timeout(signum, frame):
     raise _ReadTimeout()
 
 
-def pooled_stats(cache_dir, limit):
-    files = sorted(glob.glob(os.path.join(cache_dir, "*.npz")))
+def candidate_paths_from_split(qa_split_path, cache_dir):
+    """Build candidate {cache_dir}/{pid}.npz paths directly from
+    qa_split_full.json's own pid list, instead of glob.glob()-ing the whole
+    cache_dir -- confirmed 2026-09-09: that directory holds ~18.4k entries
+    (11.8k valid outputs plus ~6.6k stale leaked .tmp.* files from an
+    earlier disk-full incident, see extract_vlm_guidance_paired.py), and
+    under CephFS metadata-server load a single glob() over it took 23-33+
+    minutes on its own, before a single file was even read. Reading one
+    ~9MB JSON and building path strings locally avoids that directory
+    listing entirely; is_valid_output-style existence is instead checked
+    per-candidate as each file is opened in pooled_stats below.
+    """
+    import json
+    split = json.load(open(qa_split_path))
+    pids = []
+    for part in split.values():
+        for item in part:
+            pids.append(item["pid"])
+    return [os.path.join(cache_dir, f"{pid}.npz") for pid in sorted(set(pids))]
+
+
+def pooled_stats(files, limit):
     if limit:
         files = files[:limit]
     X_in, X_tgt, Y_old, Y_new = [], [], [], []
@@ -116,7 +135,7 @@ def pooled_stats(cache_dir, limit):
                 signal.alarm(0)
     finally:
         signal.signal(signal.SIGALRM, old_handler)
-    print(f"[INFO] pooled {len(X_in)} pairs ({n_skipped} skipped) from {cache_dir}", flush=True)
+    print(f"[INFO] pooled {len(X_in)} pairs ({n_skipped} skipped, {len(files)} candidates)", flush=True)
     return (np.stack(X_in), np.stack(X_tgt), np.stack(Y_old), np.stack(Y_new))
 
 
@@ -143,6 +162,9 @@ def r_squared(X, Y, W, b):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--cache_dir", default=os.path.join(WORK_BASE, "vlm_guidance_cache_paired"))
+    ap.add_argument("--qa_split", default=os.path.join(BASE, "raw_data/qa_split_full.json"),
+                     help="pid source for candidate paths -- see candidate_paths_from_split's docstring "
+                          "for why this replaces a glob.glob() over cache_dir")
     ap.add_argument("--limit", type=int, default=1500,
                      help="cap #pairs used for the fit -- closed-form ridge doesn't need all ~11.8k, "
                           "and each file's vlm_old array is large enough that reading thousands of "
@@ -159,7 +181,9 @@ def main():
     ap.add_argument("--out", default=os.path.join(BASE, "raw_data/warmstart_alignment.pt"))
     args = ap.parse_args()
 
-    X_in, X_tgt, Y_old, Y_new = pooled_stats(args.cache_dir, args.limit)
+    files = candidate_paths_from_split(args.qa_split, args.cache_dir)
+    print(f"[INFO] {len(files)} candidate pids from {args.qa_split}", flush=True)
+    X_in, X_tgt, Y_old, Y_new = pooled_stats(files, args.limit)
 
     W_fwd, b_fwd = fit_ridge(X_in, Y_old, args.ridge_lambda)
     W_rev_old, b_rev_old = fit_ridge(Y_old, X_in, args.ridge_lambda)
