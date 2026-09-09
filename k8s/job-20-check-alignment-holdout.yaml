@@ -1,0 +1,97 @@
+# Step 20: held-out R^2 diagnostic for the warm-start alignment
+# (vans_qa/full_scale/fit_warmstart_alignment.py --holdout_frac), run before
+# designing a different warm-start variant. job-18/job-19 (the warm-start
+# ablation trained on job-17's default in-sample fit) showed no measurable
+# benefit over job-13/job-15's random-init baselines -- this checks whether
+# the alignment itself carries real cross-modal signal at all (rev_old/
+# rev_new regress a 2048-dim input against ~1463 samples, more free
+# parameters than data points, a regime where in-sample R^2 can look great
+# regardless of whether the correlation is real).
+#
+# Uses a standalone CPU-only torch install instead of mounting either conda
+# PVC -- both ruixin-conda-vol and ruixin-conda-vol-vlm are held by the
+# still-running job-18/job-19 (ReadWriteOnce, one pod each), and this
+# diagnostic doesn't touch decord/transformers/GPU at all.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-check-alignment-holdout
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      containers:
+        - name: check-alignment-holdout
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              pip install --quiet --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              exec python3 vans_qa/full_scale/fit_warmstart_alignment.py \
+                --limit 1500 \
+                --holdout_frac 0.2
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+              ephemeral-storage: "3Gi"
+            limits:
+              cpu: "2.4"
+              memory: "9600Mi"
+              ephemeral-storage: "3600Mi"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-20-check-alignment-holdout.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-check-alignment-holdout -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-check-alignment-holdout -n williamli-scvl
+#
+# Diagnostic only -- does not write /data/raw_data/warmstart_alignment.pt.
