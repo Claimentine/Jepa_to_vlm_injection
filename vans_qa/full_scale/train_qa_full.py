@@ -619,7 +619,9 @@ def main():
                 log_f.flush()
                 if val_tally.acc > best_val_acc:
                     best_val_acc = val_tally.acc
-                    torch.save({"args": vars(args), "injector_state": injector.state_dict()},
+                    torch.save({"args": vars(args), "injector_state": injector.state_dict(),
+                                "step": step, "val_acc": val_tally.acc,
+                                "val_acc_by_difficulty": val_tally.acc_by_difficulty},
                                os.path.join(run_dir, "best.pt"))
 
             if args.save_every_steps and step % args.save_every_steps == 0:
@@ -635,18 +637,32 @@ def main():
                            os.path.join(run_dir, f"step_{step}.pt"))
                 print(f"[epoch {epoch} step {step}] saved checkpoint -> step_{step}.pt")
 
-    log_f.close()
+    # The final summary used to be stdout-only -- if the pod gets GC'd before
+    # anyone reads its logs (confirmed 2026-09-09: happened to job-13, whose
+    # own crash mid-validation meant this line never even printed), the run's
+    # headline result was gone for good even though every per-step number
+    # was already safely on disk. Persisting it as the log's last line fixes
+    # that regardless of whether the run finishes cleanly or dies first --
+    # written before close() so a crash after this point still keeps it.
     if step == 0:
         # best_val_acc is still its -1.0 init sentinel because validation
         # (gated on successful *training* steps hitting val_every_steps)
         # never ran once -- every train item raised an exception. Flag this
         # loudly instead of printing a bare -1.0000 that reads like a real
         # (if bad) score.
+        summary = {"done": True, "injection": args.injection, "best_val_acc": None,
+                   "steps_completed": 0, "items_succeeded": 0,
+                   "items_total": len(train_items) * args.epochs}
         print(f"[DONE] injection={args.injection}  best_val_acc(logprob)=N/A "
               f"(0/{len(train_items) * args.epochs} items succeeded -- see [WARN] lines above)")
     else:
+        summary = {"done": True, "injection": args.injection, "best_val_acc": best_val_acc,
+                   "steps_completed": step, "items_skipped": n_skipped}
         print(f"[DONE] injection={args.injection}  best_val_acc(logprob)={best_val_acc:.4f}  "
               f"steps_completed={step}  items_skipped={n_skipped}")
+    log_f.write(json.dumps(summary) + "\n")
+    log_f.flush()
+    log_f.close()
 
 
 if __name__ == "__main__":
