@@ -1,0 +1,152 @@
+# Step 18: same config as job-13-train-qa-jepa-crossattn.yaml (jepa x
+# cross_attn x middle4, temporal-hard split), but with
+# --warmstart_alignment -- the forward-direction half of the warm-start
+# cross-modal coupling ablation (idea 2 from the earlier research planning:
+# instead of both directions' cross-modal adapters starting from pure
+# random init, fit a closed-form alignment between pooled JEPA/VLM features
+# and use it to initialize them). job-13's already-completed run is this
+# ablation's random-init baseline -- --out_dir differs so this doesn't
+# clobber it. See vans_qa/full_scale/fit_warmstart_alignment.py's module
+# docstring for the full rationale and job-17 for how the alignment file
+# gets produced (must run and complete before this job).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-train-qa-jepa-crossattn-warmstart
+spec:
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+                      - hpc-nrp-g1.nmsu.edu
+      containers:
+        - name: train-qa-jepa-crossattn-warmstart
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/train_qa_full.py \
+                --split /data/raw_data/qa_split_temporal.json \
+                --injection jepa \
+                --injection_site cross_attn \
+                --layer_strategy middle4 \
+                --epochs 1 \
+                --val_every_steps 500 \
+                --max_val_items 100 \
+                --warmstart_alignment /data/raw_data/warmstart_alignment.pt \
+                --out_dir /data/raw_data/qa_full_runs_temporal_crossattn_warmstart
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "6"
+              memory: "24Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "7.2"
+              memory: "28800Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+  backoffLimit: 1 # tolerate one retry for a bad-node ("GPU is lost") admission
+                  # failure, seen in practice on this cluster
+
+# Apply with:
+#   kubectl apply -f job-18-train-qa-jepa-crossattn-warmstart.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-train-qa-jepa-crossattn-warmstart -n williamli-scvl
+# Clean up when done (Golden Rule #4):
+#   kubectl delete job ruixin-train-qa-jepa-crossattn-warmstart -n williamli-scvl
+#
+# Output: /data/raw_data/qa_full_runs_temporal_crossattn_warmstart/jepa/
+# {train_log.jsonl, best.pt, step_<N>.pt}. Compare against job-13's
+# qa_full_runs_temporal_crossattn/jepa/ (random-init baseline).

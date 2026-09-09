@@ -1,0 +1,91 @@
+# Step 17: fit the warm-start alignment (vans_qa/full_scale/fit_warmstart_alignment.py),
+# CPU-only closed-form ridge regression over job-12's already-extracted
+# vlm_guidance_cache_paired/ data -- no GPU, no new extraction. Output feeds
+# job-18/job-19's --warmstart_alignment flag.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-fit-warmstart-alignment
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      containers:
+        - name: fit-warmstart-alignment
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/fit_warmstart_alignment.py \
+                --out /data/raw_data/warmstart_alignment.pt
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+              ephemeral-storage: "2Gi"
+            limits:
+              cpu: "2.4"
+              memory: "9600Mi"
+              ephemeral-storage: "2400Mi"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-17-fit-warmstart-alignment.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-fit-warmstart-alignment -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-fit-warmstart-alignment -n williamli-scvl
+#
+# Output: /data/raw_data/warmstart_alignment.pt
