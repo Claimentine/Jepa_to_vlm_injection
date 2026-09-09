@@ -57,12 +57,33 @@ Output: a single .pt file consumed by train_qa_full.py's
 import argparse
 import glob
 import os
+import signal
 
 import numpy as np
 import torch
 
 BASE = os.environ.get("VANS_ROOT", "/data")
 WORK_BASE = os.environ.get("VANS_WORK_ROOT", "/data/vans_work")
+
+READ_TIMEOUT_S = 30  # a single stalled CephFS read otherwise blocks the whole run
+                      # indefinitely -- confirmed 2026-09-09: one file's read sat in
+                      # D-state (uninterruptible disk sleep) for 30+ minutes with the
+                      # file itself perfectly normal (52.5MB, right size, right mtime)
+                      # -- a storage-backend stall, not a bad file. SIGALRM can't
+                      # interrupt a D-state syscall directly, but numpy's read happens
+                      # in chunks (zip central directory, then each array's compressed
+                      # bytes), so the signal fires between chunks in practice; a truly
+                      # stuck single read still blocks past the alarm, in which case
+                      # the outer job's own watchdog-free timeout is the last resort
+                      # (kill and resubmit, as happened here).
+
+
+class _ReadTimeout(Exception):
+    pass
+
+
+def _raise_timeout(signum, frame):
+    raise _ReadTimeout()
 
 
 def pooled_stats(cache_dir, limit):
@@ -71,23 +92,30 @@ def pooled_stats(cache_dir, limit):
         files = files[:limit]
     X_in, X_tgt, Y_old, Y_new = [], [], [], []
     n_skipped = 0
-    for i, f in enumerate(files, start=1):
-        if i % 200 == 0:
-            print(f"[PROGRESS] {i}/{len(files)} files read", flush=True)
-        try:
-            d = np.load(f)
-            vj_in = d["vjepa_input_feats"].astype(np.float64)   # (T,N,1024)
-            vj_tgt = d["vjepa_target_feats"].astype(np.float64)
-            v_old = d["vlm_old"].astype(np.float64)             # (L,S,2048)
-            v_new = d["vlm_new"].astype(np.float64)
-            X_in.append(vj_in.mean(axis=(0, 1)))
-            X_tgt.append(vj_tgt.mean(axis=(0, 1)))
-            Y_old.append(v_old.mean(axis=(0, 1)))
-            Y_new.append(v_new.mean(axis=(0, 1)))
-        except Exception as e:
-            n_skipped += 1
-            if n_skipped <= 5:
-                print(f"[WARN] skip {f}: {e}", flush=True)
+    old_handler = signal.signal(signal.SIGALRM, _raise_timeout)
+    try:
+        for i, f in enumerate(files, start=1):
+            if i % 200 == 0:
+                print(f"[PROGRESS] {i}/{len(files)} files read ({n_skipped} skipped so far)", flush=True)
+            signal.alarm(READ_TIMEOUT_S)
+            try:
+                d = np.load(f)
+                vj_in = d["vjepa_input_feats"].astype(np.float64)   # (T,N,1024)
+                vj_tgt = d["vjepa_target_feats"].astype(np.float64)
+                v_old = d["vlm_old"].astype(np.float64)             # (L,S,2048)
+                v_new = d["vlm_new"].astype(np.float64)
+                X_in.append(vj_in.mean(axis=(0, 1)))
+                X_tgt.append(vj_tgt.mean(axis=(0, 1)))
+                Y_old.append(v_old.mean(axis=(0, 1)))
+                Y_new.append(v_new.mean(axis=(0, 1)))
+            except Exception as e:
+                n_skipped += 1
+                if n_skipped <= 5:
+                    print(f"[WARN] skip {f}: {e}", flush=True)
+            finally:
+                signal.alarm(0)
+    finally:
+        signal.signal(signal.SIGALRM, old_handler)
     print(f"[INFO] pooled {len(X_in)} pairs ({n_skipped} skipped) from {cache_dir}", flush=True)
     return (np.stack(X_in), np.stack(X_tgt), np.stack(Y_old), np.stack(Y_new))
 
