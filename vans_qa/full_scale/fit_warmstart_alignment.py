@@ -115,8 +115,11 @@ def r_squared(X, Y, W, b):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--cache_dir", default=os.path.join(WORK_BASE, "vlm_guidance_cache_paired"))
-    ap.add_argument("--limit", type=int, default=4000,
-                     help="cap #pairs used for the fit -- closed-form ridge doesn't need all ~11.8k")
+    ap.add_argument("--limit", type=int, default=1500,
+                     help="cap #pairs used for the fit -- closed-form ridge doesn't need all ~11.8k, "
+                          "and each file's vlm_old array is large enough that reading thousands of "
+                          "them from CephFS dominates runtime (confirmed 2026-09-09: a --limit 4000 "
+                          "run took 45+ min just reading, all I/O-bound)")
     ap.add_argument("--ridge_lambda", type=float, default=10.0)
     ap.add_argument("--predictor_embed_dim", type=int, default=384)
     ap.add_argument("--context_adapter_seed", type=int, default=0,

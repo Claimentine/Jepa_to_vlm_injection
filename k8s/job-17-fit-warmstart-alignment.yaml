@@ -23,6 +23,7 @@ spec:
               REPO=/code/Jepa_to_vlm_injection
               cd "$REPO"
               exec "$PY" vans_qa/full_scale/fit_warmstart_alignment.py \
+                --limit 1500 \
                 --out /data/raw_data/warmstart_alignment.pt
           env:
             - name: VANS_ROOT
