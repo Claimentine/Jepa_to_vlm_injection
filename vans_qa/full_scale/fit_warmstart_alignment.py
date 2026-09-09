@@ -179,11 +179,52 @@ def main():
                           "init (that one starts equally arbitrary/unlearned regardless of seed; any "
                           "reasonably-scaled random linear map serves the same purpose here)")
     ap.add_argument("--out", default=os.path.join(BASE, "raw_data/warmstart_alignment.pt"))
+    ap.add_argument("--holdout_frac", type=float, default=0.0,
+                     help="if >0, fit on a (1-holdout_frac) split and also report R^2 on the held-out "
+                          "remainder, before saving anything. The default (no holdout) in-sample R^2 "
+                          "this script normally reports can be badly optimistic here: rev_old/rev_new "
+                          "regress a 2048-dim input against ~1463 samples, i.e. more free parameters "
+                          "(2049) than data points, a regime where ridge can fit the training sample "
+                          "well regardless of whether the underlying cross-modal correlation is real. "
+                          "Held-out R^2 is the only honest check of that before trusting the alignment "
+                          "as a warm-start signal. Diagnostic only -- does not save --out.")
+    ap.add_argument("--holdout_seed", type=int, default=0)
     args = ap.parse_args()
 
     files = candidate_paths_from_split(args.qa_split, args.cache_dir)
     print(f"[INFO] {len(files)} candidate pids from {args.qa_split}", flush=True)
     X_in, X_tgt, Y_old, Y_new = pooled_stats(files, args.limit)
+
+    if args.holdout_frac > 0:
+        n = X_in.shape[0]
+        rng = np.random.default_rng(args.holdout_seed)
+        perm = rng.permutation(n)
+        n_test = max(1, int(n * args.holdout_frac))
+        test_idx, train_idx = perm[:n_test], perm[n_test:]
+        print(f"[INFO] holdout check: train={len(train_idx)} test={len(test_idx)} "
+              f"(seed={args.holdout_seed})", flush=True)
+
+        def _split(A):
+            return A[train_idx], A[test_idx]
+
+        X_in_tr, X_in_te = _split(X_in)
+        X_tgt_tr, X_tgt_te = _split(X_tgt)
+        Y_old_tr, Y_old_te = _split(Y_old)
+        Y_new_tr, Y_new_te = _split(Y_new)
+
+        W_fwd_h, b_fwd_h = fit_ridge(X_in_tr, Y_old_tr, args.ridge_lambda)
+        W_rev_old_h, b_rev_old_h = fit_ridge(Y_old_tr, X_in_tr, args.ridge_lambda)
+        W_rev_new_h, b_rev_new_h = fit_ridge(Y_new_tr, X_tgt_tr, args.ridge_lambda)
+
+        print(f"[HOLDOUT] fwd  (jepa_in  -> vlm_old) train_R^2={r_squared(X_in_tr, Y_old_tr, W_fwd_h, b_fwd_h):.4f} "
+              f"held_out_R^2={r_squared(X_in_te, Y_old_te, W_fwd_h, b_fwd_h):.4f}", flush=True)
+        print(f"[HOLDOUT] rev_old (vlm_old -> jepa_in ) train_R^2={r_squared(Y_old_tr, X_in_tr, W_rev_old_h, b_rev_old_h):.4f} "
+              f"held_out_R^2={r_squared(Y_old_te, X_in_te, W_rev_old_h, b_rev_old_h):.4f}", flush=True)
+        print(f"[HOLDOUT] rev_new (vlm_new -> jepa_tgt) train_R^2={r_squared(Y_new_tr, X_tgt_tr, W_rev_new_h, b_rev_new_h):.4f} "
+              f"held_out_R^2={r_squared(Y_new_te, X_tgt_te, W_rev_new_h, b_rev_new_h):.4f}", flush=True)
+        print("[HOLDOUT] diagnostic run only -- nothing saved. Rerun without --holdout_frac to "
+              "produce the actual warmstart_alignment.pt.", flush=True)
+        return
 
     W_fwd, b_fwd = fit_ridge(X_in, Y_old, args.ridge_lambda)
     W_rev_old, b_rev_old = fit_ridge(Y_old, X_in, args.ridge_lambda)
