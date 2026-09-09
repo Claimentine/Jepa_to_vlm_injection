@@ -1,0 +1,160 @@
+# Step 21 smoke test: vans_qa/full_scale/train_joint_coupled.py, the joint/
+# multi-task training script that replaces the abandoned warm-start-
+# initialization approach (job-17/18/19 -- see that script's module
+# docstring and common/cross_modal_bridge.py for the full rationale: the
+# closed-form alignment fit was pure overfitting noise for the reverse
+# direction, and job-18/job-19 showed no training benefit from it either
+# way). This is the first time this script has ever run -- validates
+# shapes/imports/the shared-bridge wiring on a handful of steps from both
+# directions before committing to a full run, same discipline as job-08/
+# job-14's smoke tests.
+#
+# GPU memory risk: the frozen Qwen3-VL-2B alone needs ~10.5GB (same floor
+# as train_qa_full.py's cross_attn jobs, already the reason small-memory
+# cards are excluded below). Adding CortexGuidedVideoPredictor (~30M
+# trainable params) and both directions' backward-pass activations in the
+# same process needs more headroom -- this smoke test is exactly how we
+# find out whether the existing exclusion list is enough before committing
+# a long job to it.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-smoke-joint-coupled
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+                      - k8s-haosu-15.sdsc.optiputer.net
+                      - hpc-nrp-g1.nmsu.edu
+      containers:
+        - name: smoke-joint-coupled
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              # cache_train.thinker_train unconditionally imports EgoDex's
+              # h5py-dependent dataloader (see job-14) even though this
+              # script never touches EgoDex.
+              "$PY" -m pip install --quiet h5py
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/train_joint_coupled.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --max_train_items 8 \
+                --val_every_steps 4 \
+                --save_every_steps 100000 \
+                --max_val_items 4 \
+                --out_dir /data/raw_data/joint_coupled_smoke
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "6"
+              memory: "28Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "7.2"
+              memory: "33600Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-21-smoke-joint-coupled.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-smoke-joint-coupled -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-smoke-joint-coupled -n williamli-scvl
+#
+# Output: /data/raw_data/joint_coupled_smoke/{train_log.jsonl,
+# best_forward.pt, best_reverse.pt, rev_test_metrics.json}
