@@ -22,7 +22,9 @@
 # silently failed to ever create a pod (FailedCreate events only visible via
 # `kubectl describe job`, not `kubectl get pod`/`get job` -- looked like an
 # infinite Pending with zero pods, not an obvious rejection). Keep any future
-# memory limit here (and in job-22's full run) under 32Gi.
+# memory limit here (and in job-22's full run) under 32Gi -- and note a
+# second, non-blocking admission-policy warning also showed up once under
+# 32Gi: this namespace additionally wants limit <= 1.2x request.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -112,7 +114,7 @@ spec:
               nvidia.com/gpu: "1"
             limits:
               cpu: "7.2"
-              memory: "30Gi"
+              memory: "28800Mi"
               ephemeral-storage: "2400Mi"
               nvidia.com/gpu: "1"
           volumeMounts:
