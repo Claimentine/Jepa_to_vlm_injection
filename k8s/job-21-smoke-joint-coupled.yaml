@@ -16,6 +16,13 @@
 # same process needs more headroom -- this smoke test is exactly how we
 # find out whether the existing exclusion list is enough before committing
 # a long job to it.
+#
+# 2026-09-09: this namespace enforces a 32Gi max memory limit per pod/
+# container -- the first submission requested 33600Mi and the job-controller
+# silently failed to ever create a pod (FailedCreate events only visible via
+# `kubectl describe job`, not `kubectl get pod`/`get job` -- looked like an
+# infinite Pending with zero pods, not an obvious rejection). Keep any future
+# memory limit here (and in job-22's full run) under 32Gi.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -100,12 +107,12 @@ spec:
           resources:
             requests:
               cpu: "6"
-              memory: "28Gi"
+              memory: "24Gi"
               ephemeral-storage: "2Gi"
               nvidia.com/gpu: "1"
             limits:
               cpu: "7.2"
-              memory: "33600Mi"
+              memory: "30Gi"
               ephemeral-storage: "2400Mi"
               nvidia.com/gpu: "1"
           volumeMounts:
