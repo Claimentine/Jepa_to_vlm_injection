@@ -217,6 +217,11 @@ def main():
     ap.add_argument("--max_train_items", type=int, default=None, help="smoke-test cap on the train split")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out_dir", default=os.path.join(BASE, "raw_data/latent_world_model_runs"))
+    ap.add_argument("--warmstart_alignment", default=None,
+                     help="path to a fit_warmstart_alignment.py output .pt file -- if given (and "
+                          "--guidance != none), initializes guidance_old_adapter/guidance_new_adapter "
+                          "from the fitted VLM->JEPA alignment (composed through CortexGuidedVideoPredictor's "
+                          "own context_adapter) instead of random init.")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -251,6 +256,26 @@ def main():
     predictor = build_predictor(device, args.guidance)
     n_params = sum(p.numel() for p in predictor.parameters())
     print(f"[INFO] guidance={args.guidance} predictor params: {n_params:,}", flush=True)
+
+    if args.warmstart_alignment and args.guidance != "none":
+        # See fit_warmstart_alignment.py's module docstring for the full
+        # rationale -- guidance_old_adapter/guidance_new_adapter only exist
+        # when use_vlm_merge=True, i.e. args.guidance != "none".
+        align = torch.load(args.warmstart_alignment, map_location=device, weights_only=False)
+        for attr, key in [
+            ("guidance_old_adapter", "rev_guidance_old_adapter_weight"),
+            ("guidance_new_adapter", "rev_guidance_new_adapter_weight"),
+        ]:
+            layer = getattr(predictor, attr)
+            expected_shape = tuple(layer.weight.shape)
+            loaded_shape = tuple(align[key].shape)
+            assert loaded_shape == expected_shape, (
+                f"warmstart alignment shape {loaded_shape} != {attr}.weight shape {expected_shape}"
+            )
+            with torch.no_grad():
+                layer.weight.copy_(align[key].to(device))
+        print(f"[INFO] warm-started guidance_old_adapter/guidance_new_adapter from "
+              f"{args.warmstart_alignment} (fit on {align['n_pairs']} pairs)", flush=True)
     opt = torch.optim.AdamW(predictor.parameters(), lr=args.lr)
 
     log_path = os.path.join(run_dir, "train_log.jsonl")

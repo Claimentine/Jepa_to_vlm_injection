@@ -395,6 +395,12 @@ def main():
     ap.add_argument("--max_train_items", type=int, default=None, help="smoke-test cap")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out_dir", default=os.path.join(BASE, "raw_data/qa_full_runs"))
+    ap.add_argument("--warmstart_alignment", default=None,
+                     help="path to a fit_warmstart_alignment.py output .pt file -- if given, "
+                          "initializes the JEPA->VLM soft-prompt projection "
+                          "(SoftPromptAdapterTemporal.mlp[0], reached via injector.adapter for "
+                          "--injection_site prefix or injector.conditioner.adapter for film/cross_attn) "
+                          "from the fitted alignment instead of random init.")
     args = ap.parse_args()
 
     n_tokens = 64
@@ -493,6 +499,26 @@ def main():
             seed=args.seed, mode=args.injection_site,
         ).to(device)
         hook = DecoderLayerInjectionHook(model, injector)
+
+    if args.warmstart_alignment:
+        # See fit_warmstart_alignment.py's module docstring for the full
+        # rationale. adapter.mlp[0] lives at injector.adapter (prefix mode)
+        # or injector.conditioner.adapter (film/cross_attn mode) -- same
+        # SoftPromptAdapterTemporal class either way.
+        conditioner = injector if args.injection_site == "prefix" else injector.conditioner
+        align = torch.load(args.warmstart_alignment, map_location=device, weights_only=False)
+        mlp0 = conditioner.adapter.mlp[0]
+        expected_shape = tuple(mlp0.weight.shape)
+        loaded_shape = tuple(align["fwd_soft_prompt_mlp0_weight"].shape)
+        assert loaded_shape == expected_shape, (
+            f"warmstart alignment shape {loaded_shape} != adapter.mlp[0] shape {expected_shape}"
+        )
+        with torch.no_grad():
+            mlp0.weight.copy_(align["fwd_soft_prompt_mlp0_weight"].to(device))
+            mlp0.bias.copy_(align["fwd_soft_prompt_mlp0_bias"].to(device))
+        print(f"[INFO] warm-started conditioner.adapter.mlp[0] from {args.warmstart_alignment} "
+              f"(fit on {align['n_pairs']} pairs)")
+
     if hasattr(injector, "gates") and args.gate_lr_multiplier != 1.0:
         # Separate param group so the gate can move faster than everything
         # else under AdamW's own per-parameter adaptive step size, without
