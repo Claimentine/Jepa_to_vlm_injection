@@ -12,6 +12,16 @@
 # job-19. n_steps_per_epoch = min(forward train items, reverse train items)
 # -- with --epochs 1 this naturally runs close to job-13's own step budget
 # (~6688), since the forward temporal split is the smaller of the two.
+#
+# 2026-09-10: uses ruixin-conda-vol-vlm, not ruixin-conda-vol -- job-13 (the
+# clean forward-baseline rerun this gets compared against) is concurrently
+# running on ruixin-conda-vol. First submission used the wrong PVC and sat
+# stuck on "Multi-Attach error ... already used by pod
+# ruixin-train-qa-jepa-crossattn-mzkzm" for 2+ hours; misread at the time as
+# a bad-node problem (the pod kept landing on different hcc-nrp-shor-*
+# hosts, each showing the same stuck-Init symptom) and "fixed" by excluding
+# two of those hostnames across every job template -- those exclusions are
+# harmless but were never the actual cause.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -138,7 +148,7 @@ spec:
           emptyDir: {}
         - name: conda-storage
           persistentVolumeClaim:
-            claimName: ruixin-conda-vol
+            claimName: ruixin-conda-vol-vlm
         - name: data-storage
           persistentVolumeClaim:
             claimName: jepa-vlm-injection-data-vol
