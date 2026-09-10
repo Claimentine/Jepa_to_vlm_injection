@@ -1,0 +1,161 @@
+# Step 23 smoke test: vans_qa/full_scale/extract_coin_longaxis.py (new
+# file) -- the COIN-native "long axis" data source investigated after
+# VANS's own short-step annotations and EgoDex both turned out not to
+# support genuine long-horizon pairs (VANS: median ~3-4 clip-index span;
+# EgoDex: no step-level QA/captions at all, only one whole-episode
+# description). COIN.json's own step annotations give a real per-video
+# span between first and last step (median 71s, p90 154s, confirmed
+# 2026-09-10) with no license needed for the annotations themselves (only
+# Tsinghua's own pre-packaged video mirror requires one -- see the new
+# script's module docstring), and a 60-video YouTube-availability sample
+# came back ~82% still live.
+#
+# This smoke test is the first time this script has ever run -- validates,
+# in order: (1) this pod's outbound network can actually reach GitHub (for
+# COIN.json) and YouTube (for yt-dlp) at all -- unconfirmed until now, every
+# other extraction job in this project only ever touched data already on
+# the cluster's own PVCs; (2) yt-dlp installs and downloads a real video;
+# (3) the two-window decode + V-JEPA2 encode + atomic-write path works end
+# to end. Same "smoke test before a full run" discipline as job-08/job-14.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-smoke-coin-longaxis
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+                      - k8s-haosu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5909.unl.edu
+                      - hcc-nrp-shor-c5925.unl.edu
+      containers:
+        - name: smoke-coin-longaxis
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet timm yt-dlp
+              # pip installs yt-dlp's console-script entry point next to the
+              # interpreter it was installed with -- extract_coin_longaxis.py
+              # shells out to "yt-dlp" as a bare CLI name (subprocess.run),
+              # so that directory needs to be on PATH.
+              export PATH="$(dirname "$PY"):$PATH"
+              which yt-dlp
+
+              echo "=== connectivity check: GitHub + YouTube ==="
+              curl -sI --max-time 15 https://raw.githubusercontent.com/coin-dataset/annotations/master/COIN.json | head -1
+              curl -sI --max-time 15 https://www.youtube.com | head -1
+
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/extract_coin_longaxis.py \
+                --limit 5 \
+                --min_span_seconds 30 \
+                --output_dir /data/raw_data/coin_longaxis_smoke \
+                --video_cache_dir /data/raw_data/coin_longaxis_smoke_videos
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: VJEPA2_CKPT
+              value: /data/checkpoints/vjepa2/vitl.pt
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              ephemeral-storage: "6Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "19200Mi"
+              ephemeral-storage: "7200Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-23-smoke-coin-longaxis.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-smoke-coin-longaxis -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-smoke-coin-longaxis -n williamli-scvl
+#
+# Output: /data/raw_data/coin_longaxis_smoke/<video_id>.npz (up to 5),
+# raw downloaded videos kept in coin_longaxis_smoke_videos/ for inspection.
