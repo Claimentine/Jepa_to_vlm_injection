@@ -62,6 +62,7 @@ spec:
                       - k8s-chase-ci-07.calit2.optiputer.net
                       - k8s-3090-01.usd.edu
                       - k8s-haosu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5909.unl.edu
       containers:
         - name: extract-vjepa-features
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
