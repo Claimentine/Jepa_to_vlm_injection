@@ -1,0 +1,156 @@
+# Step 22: full-scale run of vans_qa/full_scale/train_joint_coupled.py,
+# validated by job-21's smoke test (2026-09-09: completed cleanly end to
+# end on an NVIDIA A10, both val checkpoints and the final reverse test eval
+# all succeeded, no OOM, no shape errors). This is the joint/multi-task
+# treatment in the ablation the user asked for -- compare its forward
+# val_acc and reverse val_mse trajectories against a clean rerun of job-13
+# (job-13-train-qa-jepa-crossattn.yaml, forward baseline -- the original run
+# crashed mid-validation) and job-15 (reverse baseline, already complete).
+#
+# Same qa_split/layer_strategy/val schedule as job-13/job-18 for the forward
+# side; reverse side uses job-12's full extracted cache, same as job-15/
+# job-19. n_steps_per_epoch = min(forward train items, reverse train items)
+# -- with --epochs 1 this naturally runs close to job-13's own step budget
+# (~6688), since the forward temporal split is the smaller of the two.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-train-joint-coupled
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+                      - k8s-haosu-15.sdsc.optiputer.net
+                      - hpc-nrp-g1.nmsu.edu
+      containers:
+        - name: train-joint-coupled
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              # cache_train.thinker_train unconditionally imports EgoDex's
+              # h5py-dependent dataloader (see job-14) even though this
+              # script never touches EgoDex.
+              "$PY" -m pip install --quiet h5py
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/train_joint_coupled.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --epochs 1 \
+                --val_every_steps 500 \
+                --save_every_steps 1000 \
+                --max_val_items 100 \
+                --out_dir /data/raw_data/joint_coupled_runs
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "6"
+              memory: "24Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "7.2"
+              memory: "28800Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-22-train-joint-coupled.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-train-joint-coupled -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-train-joint-coupled -n williamli-scvl
+#
+# Output: /data/raw_data/joint_coupled_runs/{train_log.jsonl,
+# best_forward.pt, best_reverse.pt, step_<N>.pt, rev_test_metrics.json}
