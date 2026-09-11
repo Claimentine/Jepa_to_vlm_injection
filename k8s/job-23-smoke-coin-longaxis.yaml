@@ -86,7 +86,7 @@ spec:
                 --limit 5 \
                 --min_span_seconds 30 \
                 --output_dir /data/raw_data/coin_longaxis_smoke \
-                --video_cache_dir /data/raw_data/coin_longaxis_smoke_videos
+                --video_cache_dir /data/raw_data/coin_longaxis_smoke_videos_v2
           env:
             - name: VANS_ROOT
               value: /data
