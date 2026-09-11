@@ -122,7 +122,14 @@ def _download_worker(conn, video_id, out_path_str):
         result = subprocess.run(
             [
                 "yt-dlp", "--no-progress", "--quiet",
-                "-f", "mp4/best[ext=mp4]/best",
+                # Confirmed 2026-09-11: "best[ext=mp4]" can still resolve to an
+                # AV1-in-mp4 stream for videos where YouTube's default "best"
+                # tier is AV1 -- decord's own bundled ffmpeg build has no AV1
+                # decoder and fails with "cannot find video stream with wanted
+                # index: -1" on an otherwise perfectly valid, fully-downloaded
+                # file. avc1 (H.264) is what every other decord-based script in
+                # this project already relies on successfully.
+                "-f", "best[vcodec^=avc1][ext=mp4]/best[ext=mp4]/best",
                 "-o", out_path_str,
                 f"https://www.youtube.com/watch?v={video_id}",
             ],
@@ -177,7 +184,21 @@ def _extract_window_worker(conn, video_path_str, seg_start_s, seg_end_s, num_fra
         end_frame = min(total, int(seg_end_s * fps))
         if end_frame <= start_frame:
             end_frame = min(total, start_frame + num_frames)
-        indices = uniform_indices(start_frame, max(end_frame - start_frame, 1), num_frames)
+        try:
+            indices = uniform_indices(start_frame, max(end_frame - start_frame, 1), num_frames)
+        except Exception as e:
+            # uniform_indices' own error text doesn't include enough context
+            # to diagnose without re-deriving these by hand (confirmed
+            # 2026-09-11: had to ffprobe a failing file manually to even start
+            # guessing why) -- COIN's segment timestamps can disagree with a
+            # re-encoded/re-uploaded copy's actual frame count, so this is a
+            # real, expected failure mode worth a self-diagnosing message,
+            # not just a rarity to shrug off.
+            raise type(e)(
+                f"{e} (seg=[{seg_start_s},{seg_end_s}]s fps={fps:.3f} "
+                f"video_total_frames={total} start_frame={start_frame} end_frame={end_frame})"
+            ) from e
+
         frames = np.asarray(reader.get_batch(indices).asnumpy())
         frames = np.ascontiguousarray(frames[..., :3].astype(np.uint8, copy=False))
         try:
