@@ -141,7 +141,7 @@ spec:
           emptyDir: {}
         - name: conda-storage
           persistentVolumeClaim:
-            claimName: ruixin-conda-vol-vlm
+            claimName: ruixin-conda-vol
         - name: data-storage
           persistentVolumeClaim:
             claimName: jepa-vlm-injection-data-vol
