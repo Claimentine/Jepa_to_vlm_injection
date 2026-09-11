@@ -1,0 +1,163 @@
+# Step 24: first full-scale batch of vans_qa/full_scale/extract_coin_longaxis.py,
+# following job-23's successful smoke test (5/5 saved end to end after fixing
+# yt-dlp's JS-runtime requirement and the muxed-stream format selector -- see
+# job-23's own header comment and k8s/README.md for that history).
+#
+# Full candidate pool (min_span_seconds=30, min_steps=2, computed against the
+# complete COIN.json 2026-09-11): 10014 of 11827 videos qualify, comparable in
+# scale to the existing reverse-direction corpus (job-12/15/16's ~11777
+# pairs). Rather than submitting all 10014 in one job, this is a first batch
+# of --limit 2000 -- validates the extraction pipeline's stability over a much
+# longer run (network flakiness, YouTube rate-limiting, possible pod eviction
+# over many hours) before committing cluster time/storage to the rest. The
+# script already skips any video_id with a valid existing .npz output, so a
+# later job targeting the remaining ~8000 candidates (or a straight resubmit
+# with a higher --limit) will not re-download or re-encode this batch's work.
+#
+# Also added here (not in job-23, which didn't need it at n=5): a
+# height<=480 cap on yt-dlp's format selector. Uncapped "best" would pick
+# each video's highest available resolution (up to 1080p+) -- pure waste,
+# since V-JEPA2's own preprocessing downsamples far below 480p, and at
+# thousands-of-videos scale the extra bandwidth/storage/time is real.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-coin-longaxis-batch1
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+                      - k8s-haosu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5909.unl.edu
+                      - hcc-nrp-shor-c5925.unl.edu
+      containers:
+        - name: coin-longaxis-batch1
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet timm yt-dlp
+              export PATH="$(dirname "$PY"):$PATH"
+              which yt-dlp
+
+              echo "=== installing deno (yt-dlp JS runtime) ==="
+              cd /tmp
+              curl -sL https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip -o deno.zip
+              unzip -q deno.zip
+              ./deno --version
+
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/extract_coin_longaxis.py \
+                --limit 2000 \
+                --min_span_seconds 30 \
+                --output_dir /data/raw_data/coin_longaxis \
+                --video_cache_dir /data/raw_data/coin_longaxis_videos
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: VJEPA2_CKPT
+              value: /data/checkpoints/vjepa2/vitl.pt
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              ephemeral-storage: "6Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "19200Mi"
+              ephemeral-storage: "7200Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-24-coin-longaxis-batch1.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-coin-longaxis-batch1 -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-coin-longaxis-batch1 -n williamli-scvl
+#
+# Output: /data/raw_data/coin_longaxis/<video_id>.npz (up to 2000),
+# raw downloaded videos kept in coin_longaxis_videos/ (not auto-deleted --
+# matches job-23's convention of keeping cached source video for inspection
+# and to avoid re-downloading on a resubmit).

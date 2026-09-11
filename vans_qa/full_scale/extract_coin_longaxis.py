@@ -149,7 +149,13 @@ def _download_worker(conn, video_id, out_path_str):
                 # track since decord's bundled ffmpeg has no AV1 decoder
                 # (confirmed separately: "cannot find video stream with
                 # wanted index: -1" on an AV1-in-mp4 download).
-                "-f", "bestvideo[vcodec^=avc1]+bestaudio/best[vcodec^=avc1]/best",
+                # height<=480 caps download size/time -- V-JEPA2's own
+                # preprocessing downsamples frames far below 480p anyway, so
+                # fetching 1080p/4K here (yt-dlp's uncapped "best" default)
+                # would only cost bandwidth and disk for no accuracy gain,
+                # which matters at full-corpus (thousands of videos) scale.
+                "-f", "bestvideo[height<=480][vcodec^=avc1]+bestaudio/"
+                      "best[height<=480][vcodec^=avc1]/best[height<=480]/best",
                 "--merge-output-format", "mp4",
                 "-o", out_path_str,
                 f"https://www.youtube.com/watch?v={video_id}",
