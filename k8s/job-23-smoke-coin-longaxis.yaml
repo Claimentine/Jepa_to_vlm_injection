@@ -77,6 +77,20 @@ spec:
               export PATH="$(dirname "$PY"):$PATH"
               which yt-dlp
 
+              # Confirmed 2026-09-11: yt-dlp now requires a "supported" JS
+              # runtime to see YouTube's real format list at all -- neither
+              # of this image's node builds (existing v16, nor a freshly
+              # downloaded v20) satisfy yt-dlp's own JS Challenge Provider
+              # check ("(unsupported)"/"(unavailable)" regardless of
+              # version); only deno works. Downloaded fresh into /tmp since
+              # it isn't in the base image or on the PVC.
+              echo "=== installing deno (yt-dlp JS runtime) ==="
+              cd /tmp
+              curl -sL https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip -o deno.zip
+              unzip -q deno.zip
+              ./deno --version
+              cd "$REPO"
+
               echo "=== connectivity check: GitHub + YouTube ==="
               curl -sI --max-time 15 https://raw.githubusercontent.com/coin-dataset/annotations/master/COIN.json | head -1
               curl -sI --max-time 15 https://www.youtube.com | head -1
@@ -86,7 +100,7 @@ spec:
                 --limit 5 \
                 --min_span_seconds 30 \
                 --output_dir /data/raw_data/coin_longaxis_smoke \
-                --video_cache_dir /data/raw_data/coin_longaxis_smoke_videos_v2
+                --video_cache_dir /data/raw_data/coin_longaxis_smoke_videos_v3
           env:
             - name: VANS_ROOT
               value: /data

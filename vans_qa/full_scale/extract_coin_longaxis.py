@@ -117,7 +117,7 @@ def select_longaxis_pairs(database, min_span_seconds, min_steps, limit=None):
     return pairs
 
 
-YT_DLP_JS_RUNTIME = os.environ.get("YT_DLP_JS_RUNTIME", "node:/opt/conda/bin/node")
+YT_DLP_JS_RUNTIME = os.environ.get("YT_DLP_JS_RUNTIME", "deno:/tmp/deno")
 
 
 def _download_worker(conn, video_id, out_path_str):
@@ -129,19 +129,28 @@ def _download_worker(conn, video_id, out_path_str):
                 # "No supported JavaScript runtime could be found. Only deno
                 # is enabled by default" and then fails "Requested format is
                 # not available" on EVERY format selector including a bare
-                # "best" fallback -- YouTube extraction now depends on JS
-                # execution to see most of the real format list. node
-                # already exists in this project's base image at
-                # /opt/conda/bin/node, just not on PATH or told to yt-dlp.
+                # "best" fallback. node (this project's base image has v16 at
+                # /opt/conda/bin/node, and a freshly-downloaded v20 was also
+                # tried) is explicitly marked "(unsupported)" by yt-dlp's own
+                # JS Challenge Providers regardless of version -- only deno
+                # actually works (yt-dlp's own warning names it as the sole
+                # default-enabled runtime; confirmed via debug output showing
+                # "JS Challenge Providers: ... deno, ... (unavailable)" with
+                # no "(unsupported)" tag next to deno specifically).
                 "--js-runtimes", YT_DLP_JS_RUNTIME,
-                # Confirmed 2026-09-11: "best[ext=mp4]" can still resolve to an
-                # AV1-in-mp4 stream for videos where YouTube's default "best"
-                # tier is AV1 -- decord's own bundled ffmpeg build has no AV1
-                # decoder and fails with "cannot find video stream with wanted
-                # index: -1" on an otherwise perfectly valid, fully-downloaded
-                # file. avc1 (H.264) is what every other decord-based script in
-                # this project already relies on successfully.
-                "-f", "best[vcodec^=avc1][ext=mp4]/best[ext=mp4]/best",
+                # Confirmed 2026-09-11: modern YouTube no longer serves a
+                # single muxed (audio+video) stream in most format lists --
+                # "best[ext=mp4]" alone resolves to nothing ("Requested
+                # format is not available") because every mp4 entry is
+                # video-only or audio-only DASH. Need an explicit
+                # bestvideo+bestaudio merge (requires ffmpeg, already present
+                # in this image) with --merge-output-format mp4 to produce a
+                # single playable file. avc1 (H.264) preferred for the video
+                # track since decord's bundled ffmpeg has no AV1 decoder
+                # (confirmed separately: "cannot find video stream with
+                # wanted index: -1" on an AV1-in-mp4 download).
+                "-f", "bestvideo[vcodec^=avc1]+bestaudio/best[vcodec^=avc1]/best",
+                "--merge-output-format", "mp4",
                 "-o", out_path_str,
                 f"https://www.youtube.com/watch?v={video_id}",
             ],
