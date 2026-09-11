@@ -117,11 +117,23 @@ def select_longaxis_pairs(database, min_span_seconds, min_steps, limit=None):
     return pairs
 
 
+YT_DLP_JS_RUNTIME = os.environ.get("YT_DLP_JS_RUNTIME", "node:/opt/conda/bin/node")
+
+
 def _download_worker(conn, video_id, out_path_str):
     try:
         result = subprocess.run(
             [
                 "yt-dlp", "--no-progress", "--quiet",
+                # Confirmed 2026-09-11: without a JS runtime, yt-dlp warns
+                # "No supported JavaScript runtime could be found. Only deno
+                # is enabled by default" and then fails "Requested format is
+                # not available" on EVERY format selector including a bare
+                # "best" fallback -- YouTube extraction now depends on JS
+                # execution to see most of the real format list. node
+                # already exists in this project's base image at
+                # /opt/conda/bin/node, just not on PATH or told to yt-dlp.
+                "--js-runtimes", YT_DLP_JS_RUNTIME,
                 # Confirmed 2026-09-11: "best[ext=mp4]" can still resolve to an
                 # AV1-in-mp4 stream for videos where YouTube's default "best"
                 # tier is AV1 -- decord's own bundled ffmpeg build has no AV1
