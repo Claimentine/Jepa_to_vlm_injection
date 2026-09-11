@@ -184,16 +184,18 @@ def _extract_window_worker(conn, video_path_str, seg_start_s, seg_end_s, num_fra
         end_frame = min(total, int(seg_end_s * fps))
         if end_frame <= start_frame:
             end_frame = min(total, start_frame + num_frames)
+        # uniform_indices(start, end, num_frames) takes an ABSOLUTE end index,
+        # not a length -- confirmed 2026-09-11 the hard way: every non-AV1
+        # smoke-test failure was "empty source interval [start, length)"
+        # because passing (end_frame - start_frame) here gets read as an end
+        # index smaller than start whenever start_frame > 0. The one existing
+        # usage this project had (extract_vlm_guidance_paired.py's
+        # uniform_indices(0, total, n)) never exposed this: with start=0,
+        # "end" and "length" are numerically identical, so that call worked
+        # by coincidence regardless of which one it actually is.
         try:
-            indices = uniform_indices(start_frame, max(end_frame - start_frame, 1), num_frames)
+            indices = uniform_indices(start_frame, max(end_frame, start_frame + 1), num_frames)
         except Exception as e:
-            # uniform_indices' own error text doesn't include enough context
-            # to diagnose without re-deriving these by hand (confirmed
-            # 2026-09-11: had to ffprobe a failing file manually to even start
-            # guessing why) -- COIN's segment timestamps can disagree with a
-            # re-encoded/re-uploaded copy's actual frame count, so this is a
-            # real, expected failure mode worth a self-diagnosing message,
-            # not just a rarity to shrug off.
             raise type(e)(
                 f"{e} (seg=[{seg_start_s},{seg_end_s}]s fps={fps:.3f} "
                 f"video_total_frames={total} start_frame={start_frame} end_frame={end_frame})"
