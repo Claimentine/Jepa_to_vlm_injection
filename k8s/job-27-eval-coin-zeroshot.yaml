@@ -47,6 +47,9 @@ spec:
                       - k8s-haosu-15.sdsc.optiputer.net
                       - hcc-nrp-shor-c5909.unl.edu
                       - hcc-nrp-shor-c5925.unl.edu
+                      - nautilus-ext-gpu01.fullerton.edu # 2026-09-13: GPU is lost
+                      # (NVLink/device-plugin hardware error), confirmed on two
+                      # consecutive scheduling attempts for this job
       containers:
         - name: eval-coin-zeroshot
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
