@@ -1,0 +1,156 @@
+# Step 28: full-scale run of train_latent_world_model_mixed.py, validated by
+# job-26's smoke test and job-27's zero-shot baseline.
+#
+# The actual question this run answers (per the user's own framing, not the
+# original "does the model generalize to COIN's long horizon" framing job-27
+# addressed): does mixing COIN's long-axis self-supervised pairs into
+# training improve the model's performance on VANS's OWN short-axis test set
+# -- i.e. does exposure to genuinely long-horizon examples act as a useful
+# training signal/regularizer for the original short-horizon task, on top of
+# (not instead of) VANS's guided pairs?
+#
+# Comparison target: job-15's VANS-only baseline test_metrics.json
+# (pred_loss=7.4503, latent_dist=87.044, cosine_dist=0.4902, n=1763). This
+# run's own vans_test metric (in test_metrics.json, "vans" key) is the
+# directly comparable "after" number -- best.pt is checkpointed on
+# vans_val_mse specifically (not blended with coin_val), so the comparison
+# stays apples-to-apples with how job-15 selected its own best checkpoint.
+#
+# Same --epochs/--val_every_steps/--save_every_steps/--max_val_items as
+# job-15 (no --max_train_items cap this time -- full VANS + full COIN train
+# pools) so step-for-step trajectories are comparable.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-train-latent-world-model-mixed
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+                      - k8s-haosu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5909.unl.edu
+                      - hcc-nrp-shor-c5925.unl.edu
+                      - nautilus-ext-gpu01.fullerton.edu # 2026-09-13: GPU is lost
+      containers:
+        - name: train-latent-world-model-mixed
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              # See job-14: cache_train.thinker_train unconditionally imports
+              # EgoDex's h5py-dependent dataloader even though this script
+              # never touches EgoDex.
+              "$PY" -m pip install --quiet h5py
+
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/train_latent_world_model_mixed.py \
+                --epochs 1 \
+                --val_every_steps 500 \
+                --save_every_steps 1000 \
+                --max_val_items 200 \
+                --out_dir /data/raw_data/latent_world_model_runs_mixed_coin
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "19200Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-28-train-latent-world-model-mixed.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-train-latent-world-model-mixed -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-train-latent-world-model-mixed -n williamli-scvl
+#
+# Output: /data/raw_data/latent_world_model_runs_mixed_coin/
+# {train_log.jsonl, best.pt, step_<N>.pt, test_metrics.json}
