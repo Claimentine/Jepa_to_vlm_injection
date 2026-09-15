@@ -28,16 +28,17 @@ weights themselves still see gradient from COIN's rev_loss and the bridge's
 which is always a real VANS QA pair -- COIN never substitutes for the
 forward side, since it has no QA data at all).
 
-Step budget stays IDENTICAL to job-22's, avoiding the step-count confound
-train_latent_world_model_mixed.py's own comparison against job-15 ran into:
-n_steps_per_epoch = min(len(fwd_train), len(rev_train_combined)). fwd_train
-(~6688 temporal-split QA items) is smaller than even VANS's reverse pool
-alone (~8253), so adding COIN's ~2032 train items to the reverse pool does
-NOT change n_steps_per_epoch at all -- it's still bounded by the forward
-pool, same as job-22. This run and job-22 therefore make the exact same
-number of forward-direction gradient updates, so a real difference in
-forward val_acc is attributable to what's mixed into the reverse leg, not
-to more total training.
+Step budget: per the user's explicit call, this run uses EVERY item from
+both pools each epoch (n_steps_per_epoch = max(len(fwd_train),
+len(rev_train_combined)), with the shorter pool cycled + reshuffled on
+each wrap so nothing is silently dropped) -- not step-matched against
+job-22. This means job-22 and this run do NOT make the same number of
+forward-direction gradient updates (this run has more, since the combined
+reverse pool at ~10285 exceeds forward's ~6688), so the same step-count
+confound train_latent_world_model_mixed.py's comparison against job-15 ran
+into applies here too. Deliberate tradeoff: look at the trend from a full,
+uncapped run first; a step-matched controlled rerun is a cheap follow-up
+if the trend looks worth pinning down precisely.
 
 Reuses, unmodified, every tested building block: train_qa_full (fwd),
 train_latent_world_model_full (rev), CrossModalBridge/ForwardingAdapter,
@@ -186,22 +187,36 @@ def main():
     best_fwd_val_acc = -1.0
     best_rev_val_mse = float("inf")
 
-    n_steps_per_epoch = min(len(fwd_train), len(rev_train_combined))
-    if n_steps_per_epoch < 5:
+    # Per the user's own call: use every item from both pools each epoch
+    # (not the smaller-pool-bounded step count the module docstring's
+    # step-matched design originally used) -- see that COIN mixing
+    # comparison later if the trend here looks worth a cleaner ablation.
+    # The shorter pool is cycled with a fresh reshuffle on each wrap so nothing
+    # is silently dropped and no fixed repeat order biases training.
+    n_steps_per_epoch = max(len(fwd_train), len(rev_train_combined))
+    if min(len(fwd_train), len(rev_train_combined)) < 5:
         raise RuntimeError(
             f"too few paired train steps available (forward={len(fwd_train)}, "
             f"reverse_combined={len(rev_train_combined)})"
         )
     print(f"[INFO] n_steps_per_epoch={n_steps_per_epoch} "
-          f"(bounded by {'forward' if len(fwd_train) <= len(rev_train_combined) else 'reverse_combined'} pool -- "
-          f"should match job-22's own step budget if forward is still the bottleneck)", flush=True)
+          f"(forward={len(fwd_train)} reverse_combined={len(rev_train_combined)} -- "
+          f"the shorter pool cycles with reshuffling to cover every item of the longer one)", flush=True)
+
+    def cycle_to_length(items, length, cycle_rng):
+        out = []
+        while len(out) < length:
+            batch = list(items)
+            cycle_rng.shuffle(batch)
+            out.extend(batch)
+        return out[:length]
 
     for epoch in range(args.epochs):
-        rng.shuffle(fwd_train)
-        rng.shuffle(rev_train_combined)
+        fwd_epoch = cycle_to_length(fwd_train, n_steps_per_epoch, rng)
+        rev_epoch = cycle_to_length(rev_train_combined, n_steps_per_epoch, rng)
         for i in range(n_steps_per_epoch):
-            fwd_item = fwd_train[i]
-            rev_source, rev_id = rev_train_combined[i]
+            fwd_item = fwd_epoch[i]
+            rev_source, rev_id = rev_epoch[i]
 
             opt.zero_grad()
             total_loss = torch.zeros((), device=device)

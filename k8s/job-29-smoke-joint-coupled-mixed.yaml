@@ -10,13 +10,14 @@
 # alternates between VANS pairs (real vlm_old/vlm_new guidance) and COIN
 # long-axis pairs (extras=None -- see train_latent_world_model_mixed.py,
 # confirmed against cache_train/thinker_predictor.py that a
-# use_vlm_merge=True predictor handles ext=None as a clean no-op). Step
-# budget stays identical to job-22's (n_steps_per_epoch is still bounded by
-# the smaller forward pool, ~6688 items, since even VANS's reverse pool
-# alone at ~8253 already exceeds it -- adding COIN's ~2032 train items to
-# the reverse side doesn't change that), so a difference in forward val_acc
-# here vs job-22 is NOT confounded by more total training steps, unlike
-# train_latent_world_model_mixed.py's own comparison against job-15.
+# use_vlm_merge=True predictor handles ext=None as a clean no-op). Per the
+# user's own call, step budget uses EVERY item from both pools each epoch
+# (the shorter pool -- forward, ~6688 -- is cycled with reshuffling to cover
+# the longer combined reverse pool, ~10285), so this run makes more total
+# forward-direction gradient updates than job-22, not a step-matched
+# comparison. Deliberate tradeoff: look at the trend from a full run first;
+# a step-matched controlled rerun is a cheap follow-up if it looks worth
+# pinning down precisely.
 #
 # This smoke test is the first time this script has ever run -- validates,
 # with a small --max_train_items cap, the per-step VANS/COIN dispatch on
