@@ -1,0 +1,26 @@
+# Third conda-envs/ThinkJEPA-checkout volume, cloned from ruixin-conda-vol,
+# for the DDP/batching pilot (job-31+) -- by 2026-09-17 both existing conda
+# volumes (ruixin-conda-vol: COIN extraction continuation, ruixin-conda-vol-vlm:
+# job-30) are concurrently busy, and ruixin-conda-vol is genuinely
+# ReadWriteOnce (see pvc-conda-rbd-vlm.yaml's own header comment for the
+# 17-hour stuck-pod incident this exact pattern caused before). Same Ceph RBD
+# clone trick: fast (~15s), copy-on-write, not a real 50Gi copy.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ruixin-conda-vol-ddp
+spec:
+  storageClassName: rook-ceph-block
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  dataSource:
+    kind: PersistentVolumeClaim
+    name: ruixin-conda-vol
+
+# Apply with:
+#   kubectl apply -f pvc-conda-rbd-ddp.yaml -n williamli-scvl
+#
+# Reminder (Golden Rule #2): active-computation storage, not archival.

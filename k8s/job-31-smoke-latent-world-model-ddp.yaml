@@ -1,0 +1,177 @@
+# Step 31 smoke test: vans_qa/full_scale/train_latent_world_model_ddp.py
+# (new file) -- first attempt at multi-GPU (DDP) + real batching in this
+# project. Picked the reverse (VLM-guides-JEPA) direction to pilot on: no
+# live frozen VLM backbone, no forward-hook injection, just precomputed
+# .npz features through CortexGuidedVideoPredictor -- the least
+# architecture-sensitive of this project's training loops to batch and wrap
+# in DDP. The forward (JEPA->VLM QA) direction's hook-based per-example
+# condition injection is out of scope here; it needs its own batching work
+# on DecoderLayerInjectionHook before the same approach applies.
+#
+# Single-node only (`torchrun --standalone --nproc_per_node=2`, no external
+# rendezvous/Service needed) -- multi-node DDP was deliberately ruled out:
+# this cluster's node eviction / "GPU is lost" / long-scheduling-wait pattern
+# (hit repeatedly this project) makes a multi-pod rendezvous fragile for
+# little added benefit when single-node multi-GPU nodes are plentiful here
+# (many NVIDIA-A10 x8 and NVIDIA-L40S x4 nodes in this cluster's inventory).
+# nvidia.com/gpu: "2" in one container already forces the scheduler onto a
+# node with >=2 free GPUs -- no special node-pinning needed.
+#
+# Batching itself was confirmed safe by reading cache_train/thinker_predictor.py
+# directly (2026-09-17): CortexGuidedVideoPredictor's _normalize_guidance_stream
+# already accepts a real [B,L,S,D] guidance tensor and validates the batch
+# dim strictly (raises rather than silently broadcasting on a mismatch), and
+# forward_step() in the tested base script (train_latent_world_model_full.py,
+# imported unmodified) is already fully parameterized by B = in_feats.shape[0].
+# So the new script only had to add batch-stacking + DDP scaffolding, no
+# changes to the tested forward/predictor code path itself.
+#
+# Small --max_train_items/--batch_size/--val_every_steps here to validate,
+# before any real-scale run: 2-process DDP init, gradient all-reduce actually
+# firing, rank-0-only logging/checkpointing, and the val/test eval path on
+# the (unwrapped) raw predictor. Same "smoke test before a full run"
+# discipline as every other new script in this project.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-smoke-latent-world-model-ddp
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+                      - k8s-haosu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5909.unl.edu
+                      - hcc-nrp-shor-c5925.unl.edu
+                      - hpc-nrp-g1.nmsu.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A10
+      containers:
+        - name: smoke-latent-world-model-ddp
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet h5py
+              export PATH="$(dirname "$PY"):$PATH"
+
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              exec torchrun --standalone --nproc_per_node=2 \
+                vans_qa/full_scale/train_latent_world_model_ddp.py \
+                --guidance crossattn \
+                --batch_size 4 \
+                --max_train_items 80 \
+                --val_every_steps 4 \
+                --save_every_steps 8 \
+                --max_val_items 20 \
+                --out_dir /data/raw_data/latent_world_model_ddp_smoke
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "8"
+              memory: "24Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "2"
+            limits:
+              cpu: "9.6"
+              memory: "28800Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "2"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-31-smoke-latent-world-model-ddp.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-smoke-latent-world-model-ddp -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-smoke-latent-world-model-ddp -n williamli-scvl
