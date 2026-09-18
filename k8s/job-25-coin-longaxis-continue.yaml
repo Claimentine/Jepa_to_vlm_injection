@@ -60,6 +60,10 @@ spec:
                       - k8s-haosu-15.sdsc.optiputer.net
                       - hcc-nrp-shor-c5909.unl.edu
                       - hcc-nrp-shor-c5925.unl.edu
+                      - nautilusg02.sci.cwru.edu # 2026-09-17: pod sat frozen
+                      # for 2h on the very first "pip install" step (0:00 CPU
+                      # time, no RSS growth) -- looks like a networking stall
+                      # on this specific node, not a slow-but-progressing case
       containers:
         - name: coin-longaxis-continue
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
