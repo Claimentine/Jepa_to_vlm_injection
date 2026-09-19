@@ -61,9 +61,39 @@ def setup_ddp():
     return rank, world_size, local_rank
 
 
+def _pad_and_mask(streams):
+    """Stacks B [L,S_i,D] guidance streams (S_i genuinely varies per sample --
+    confirmed 2026-09-18 by inspecting real cached files: S ranges ~1195-1222
+    for vlm_old, ~22-82 for vlm_new, since it's the VLM's own token count for
+    that clip's prompt/response, not a fixed shape like the vjepa features
+    are) into a zero-padded [B,L,S_max,D] tensor plus a [B,L,S_max] boolean
+    mask. Mask convention confirmed against the actual consuming module
+    (cache_train/thinker_predictor.py's guidance_memory_readers are plain
+    nn.MultiheadAttention(batch_first=True) instances, called with
+    key_padding_mask=...) -- PyTorch's own convention there is True = ignore
+    this position, False = attend to it, so True marks the padding here."""
+    L, _, D = streams[0].shape
+    s_max = max(s.shape[1] for s in streams)
+    B = len(streams)
+    padded = np.zeros((B, L, s_max, D), dtype=np.float32)
+    mask = np.ones((B, L, s_max), dtype=bool)  # True = padding, until filled below
+    for i, s in enumerate(streams):
+        s_i = s.shape[1]
+        padded[i, :, :s_i, :] = s
+        mask[i, :, :s_i] = False  # real tokens are NOT padding
+    return padded, mask
+
+
 def load_batch(cache_dir, pids, device):
     """Same schema as base.load_pair, but stacks B pids along a real batch
-    axis instead of unsqueeze(0)-ing a single sample."""
+    axis instead of unsqueeze(0)-ing a single sample. vjepa_input_feats/
+    vjepa_target_feats are a fixed (16,256,1024) for every item (confirmed
+    against real cached files) so those just stack directly; vlm_old/vlm_new
+    are NOT a fixed shape across items (see _pad_and_mask) and need padding
+    + an explicit mask, or np.stack raises "all input arrays must have the
+    same shape" the moment a batch happens to mix two different sequence
+    lengths (confirmed 2026-09-18 -- job-31's first smoke test hit exactly
+    this)."""
     in_list, out_list, old_list, new_list = [], [], [], []
     for pid in pids:
         d = np.load(os.path.join(cache_dir, f"{pid}.npz"))
@@ -73,9 +103,13 @@ def load_batch(cache_dir, pids, device):
         new_list.append(d["vlm_new"].astype(np.float32))
     in_feats = torch.from_numpy(np.stack(in_list, axis=0)).to(device)   # (B,16,256,1024)
     out_feats = torch.from_numpy(np.stack(out_list, axis=0)).to(device)  # (B,16,256,1024)
+    old_padded, old_mask = _pad_and_mask(old_list)
+    new_padded, new_mask = _pad_and_mask(new_list)
     extras = {
-        "vlm_old": torch.from_numpy(np.stack(old_list, axis=0)).to(device),  # (B,L,S,D)
-        "vlm_new": torch.from_numpy(np.stack(new_list, axis=0)).to(device),  # (B,L,S,D)
+        "vlm_old": torch.from_numpy(old_padded).to(device),        # (B,L,S_max,D)
+        "vlm_new": torch.from_numpy(new_padded).to(device),        # (B,L,S_max,D)
+        "vlm_old_mask": torch.from_numpy(old_mask).to(device),     # (B,L,S_max)
+        "vlm_new_mask": torch.from_numpy(new_mask).to(device),     # (B,L,S_max)
     }
     return in_feats, out_feats, extras
 
