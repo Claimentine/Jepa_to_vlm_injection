@@ -74,6 +74,7 @@ spec:
                       - hcc-nrp-shor-c5925.unl.edu
                       - hpc-nrp-g1.nmsu.edu
                       - nautilus-ext-gpu01.fullerton.edu
+                      - k8s-chase-ci-02.calit2.optiputer.net # 2026-09-19: GPU is lost
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: 100
               preference:
