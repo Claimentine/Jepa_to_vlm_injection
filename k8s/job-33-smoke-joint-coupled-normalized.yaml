@@ -16,6 +16,17 @@
 # bookkeeping doesn't break anything (shapes, backward, checkpointing) before
 # committing to a full run. Same "smoke test before a full run" discipline
 # as every other new script in this project.
+#
+# Runs 2-GPU DDP via torchrun --standalone (per the user's request that new
+# training use DDP): manual gradient all-reduce, not
+# nn.parallel.DistributedDataParallel module-wrapping -- see the script's
+# own module docstring for why (the forward direction's hook-based
+# per-example injection doesn't go through a single wrapped forward() call
+# the way DDP's automatic bucketing assumes). Each rank loads its own full
+# copy of the frozen Qwen3-VL-2B (same ~20GB/GPU footprint job-21/22 already
+# validated fits on an A10 single-GPU -- DDP here is N-way item parallelism,
+# not increased per-GPU memory pressure, since each rank still processes one
+# item at a time locally).
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -73,13 +84,16 @@ spec:
               REPO=/code/Jepa_to_vlm_injection
 
               "$PY" -m pip install --quiet h5py
+              export PATH="$(dirname "$PY"):$PATH"
 
               mkdir -p "$VANS_WORK_ROOT"
               ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
               ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
 
               cd "$REPO"
-              exec "$PY" vans_qa/full_scale/train_joint_coupled_normalized.py \
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              exec torchrun --standalone --nproc_per_node=2 \
+                vans_qa/full_scale/train_joint_coupled_normalized.py \
                 --qa_split /data/raw_data/qa_split_temporal.json \
                 --epochs 1 \
                 --max_train_items 40 \
@@ -102,15 +116,15 @@ spec:
               value: decord
           resources:
             requests:
-              cpu: "6"
-              memory: "24Gi"
+              cpu: "10"
+              memory: "36Gi"
               ephemeral-storage: "2Gi"
-              nvidia.com/gpu: "1"
+              nvidia.com/gpu: "2"
             limits:
-              cpu: "7.2"
-              memory: "28800Mi"
+              cpu: "12"
+              memory: "43200Mi"
               ephemeral-storage: "2400Mi"
-              nvidia.com/gpu: "1"
+              nvidia.com/gpu: "2"
           volumeMounts:
             - name: git-repo-code
               mountPath: /code

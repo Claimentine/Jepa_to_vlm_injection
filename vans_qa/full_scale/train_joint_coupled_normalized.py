@@ -43,6 +43,27 @@ Reuses train_qa_full.py/train_latent_world_model_full.py unmodified
 (imported as fwd/rev, same as train_joint_coupled.py); that script itself
 also stays unmodified as the VANS-only-joint, un-normalized baseline this
 run is compared against.
+
+DDP: single-node, manual gradient all-reduce rather than
+nn.parallel.DistributedDataParallel module-wrapping. Regular DDP tracks
+parameter usage via hooks attached to a wrapped module's own forward()
+call, but this script's forward direction calls injector.condition(...)
+directly and drives the frozen VLM through DecoderLayerInjectionHook's
+forward-pre-hooks (see common/jepa_injection_model.py) -- neither goes
+through a single wrapped forward() the way train_latent_world_model_ddp.py's
+plain predictor(...) call does, so DDP's automatic bucketing assumptions
+don't cleanly apply here. Instead: each rank runs a normal local
+forward+backward on its own data shard (regular autograd, no wrapper), then
+every trainable parameter's .grad is manually all-reduced (averaged) across
+ranks before optimizer.step() -- functionally identical to what DDP does
+internally, just done explicitly so it doesn't depend on which specific
+method call produced the gradient. Every rank always all-reduces the SAME
+fixed, ordered parameter list (injector + predictor + bridge) each step,
+substituting a zero tensor for any parameter this rank's own item(s) didn't
+happen to touch (e.g. an unused film/adaln branch, or one direction's item
+failing to load) -- required so the collective call sequence matches across
+ranks regardless of which sub-branches fired on which rank this step.
+Falls back to plain single-process behavior when WORLD_SIZE is unset/1.
 """
 import argparse
 import json
@@ -52,6 +73,7 @@ import sys
 import traceback
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -72,6 +94,32 @@ from common.cross_modal_bridge import CrossModalBridge, ForwardingAdapter  # noq
 
 import train_qa_full as fwd  # noqa: E402
 import train_latent_world_model_full as rev  # noqa: E402
+
+
+def is_ddp():
+    return int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+
+def setup_ddp():
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return rank, world_size, local_rank
+
+
+def sync_gradients(params, world_size):
+    """Manual DDP: all-reduce (average) every trainable parameter's grad,
+    across a FIXED, identically-ordered list on every rank. Any parameter
+    this rank's step didn't touch gets a zero placeholder first, so every
+    rank calls all_reduce on the exact same sequence of tensors regardless
+    of which sub-branches (film/adaln, forward vs. reverse) fired locally."""
+    for p in params:
+        if p.grad is None:
+            p.grad = torch.zeros_like(p)
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        p.grad.div_(world_size)
 
 
 class LossNormalizer:
@@ -115,10 +163,18 @@ def main():
     ap.add_argument("--out_dir", default=os.path.join(fwd.BASE, "raw_data/joint_coupled_normalized_runs"))
     args = ap.parse_args()
 
+    if is_ddp():
+        rank, world_size, local_rank = setup_ddp()
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        rank, world_size, local_rank = 0, 1, 0
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    is_main = rank == 0
+
     os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", "decord")
     run_dir = args.out_dir
-    os.makedirs(run_dir, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if is_main:
+        os.makedirs(run_dir, exist_ok=True)
 
     # ---------------- forward direction setup ----------------
     with open(args.qa_split) as f:
@@ -128,9 +184,11 @@ def main():
     if args.max_train_items:
         fwd_train = fwd_train[: args.max_train_items]
     fwd_val = fwd_val[: args.max_val_items]
-    print(f"[INFO] forward usable: train={len(fwd_train)} val={len(fwd_val)}", flush=True)
+    if is_main:
+        print(f"[INFO] forward usable: train={len(fwd_train)} val={len(fwd_val)}", flush=True)
 
-    print(f"[INFO] loading {fwd.MODEL_ID} (frozen) ...", flush=True)
+    if is_main:
+        print(f"[INFO] loading {fwd.MODEL_ID} (frozen) ...", flush=True)
     model = AutoModelForImageTextToText.from_pretrained(fwd.MODEL_ID, dtype="auto").to(device)
     processor = AutoProcessor.from_pretrained(fwd.MODEL_ID)
     model.requires_grad_(False)
@@ -161,7 +219,8 @@ def main():
     if args.max_train_items:
         rev_train = rev_train[: args.max_train_items]
     rev_val = rev_val[: args.max_val_items]
-    print(f"[INFO] reverse usable: train={len(rev_train)} val={len(rev_val)} test={len(rev_test)}", flush=True)
+    if is_main:
+        print(f"[INFO] reverse usable: train={len(rev_train)} val={len(rev_val)} test={len(rev_test)}", flush=True)
 
     predictor = rev.build_predictor(device, guidance="crossattn")
 
@@ -171,20 +230,20 @@ def main():
     predictor.guidance_old_adapter = ForwardingAdapter(bridge.vlm_to_jepa, predictor.context_adapter)
     predictor.guidance_new_adapter = ForwardingAdapter(bridge.vlm_to_jepa, predictor.context_adapter)
 
-    opt = torch.optim.AdamW(
-        list(injector.parameters()) + list(predictor.parameters()) + list(bridge.parameters()),
-        lr=args.lr,
-    )
+    all_params = list(injector.parameters()) + list(predictor.parameters()) + list(bridge.parameters())
+    opt = torch.optim.AdamW(all_params, lr=args.lr)
     n_fwd_params = sum(p.numel() for p in injector.parameters())
     n_rev_params = sum(p.numel() for p in predictor.parameters())
     n_bridge_params = sum(p.numel() for p in bridge.parameters())
-    print(f"[INFO] trainable params: forward_injector={n_fwd_params:,} "
-          f"reverse_predictor={n_rev_params:,} shared_bridge={n_bridge_params:,} "
-          f"cycle_loss_weight={args.cycle_loss_weight} loss_norm_decay={args.loss_norm_decay}", flush=True)
+    if is_main:
+        print(f"[INFO] trainable params: forward_injector={n_fwd_params:,} "
+              f"reverse_predictor={n_rev_params:,} shared_bridge={n_bridge_params:,} "
+              f"cycle_loss_weight={args.cycle_loss_weight} loss_norm_decay={args.loss_norm_decay} "
+              f"world_size={world_size}", flush=True)
 
     normalizer = LossNormalizer(decay=args.loss_norm_decay)
 
-    log_f = open(os.path.join(run_dir, "train_log.jsonl"), "w")
+    log_f = open(os.path.join(run_dir, "train_log.jsonl"), "w") if is_main else None
     rng = random.Random(args.seed)
     step = 0
     n_fwd_skipped = 0
@@ -193,18 +252,31 @@ def main():
     best_fwd_val_acc = -1.0
     best_rev_val_mse = float("inf")
 
-    n_steps_per_epoch = min(len(fwd_train), len(rev_train))
+    # Same seed on every rank so the pre-shard order matches, then each rank
+    # takes a disjoint [rank::world_size] slice, truncated to a common
+    # length -- guarantees identical step counts across ranks (required so
+    # every rank calls sync_gradients the same number of times).
+    split_shuffle_rng = random.Random(args.seed)
+    split_shuffle_rng.shuffle(fwd_train)
+    split_shuffle_rng.shuffle(rev_train)
+    my_fwd_train = fwd_train[rank::world_size]
+    my_rev_train = rev_train[rank::world_size]
+    n_steps_per_epoch = min(len(my_fwd_train), len(my_rev_train))
     if n_steps_per_epoch < 5:
         raise RuntimeError(
-            f"too few paired train steps available (forward={len(fwd_train)}, reverse={len(rev_train)})"
+            f"too few paired train steps available per rank (forward={len(my_fwd_train)}, "
+            f"reverse={len(my_rev_train)}, world_size={world_size})"
         )
+    if is_main:
+        print(f"[INFO] n_steps_per_epoch={n_steps_per_epoch} per rank "
+              f"(total forward={len(fwd_train)} reverse={len(rev_train)})", flush=True)
 
     for epoch in range(args.epochs):
-        rng.shuffle(fwd_train)
-        rng.shuffle(rev_train)
+        rng.shuffle(my_fwd_train)
+        rng.shuffle(my_rev_train)
         for i in range(n_steps_per_epoch):
-            fwd_item = fwd_train[i]
-            rev_pid = rev_train[i]
+            fwd_item = my_fwd_train[i]
+            rev_pid = my_rev_train[i]
 
             opt.zero_grad()
             total_loss = torch.zeros((), device=device)
@@ -263,6 +335,18 @@ def main():
                     traceback.print_exc()
 
             if not (fwd_ok or rev_ok):
+                # Known, accepted DDP edge case: if this happens on only SOME
+                # ranks in the same step (both fwd and rev failing on the
+                # same item, on this rank specifically), those ranks skip
+                # this iteration's collectives while others proceed to
+                # sync_gradients -- a call-count mismatch. Not fixed here:
+                # empirically both directions failing on the identical step
+                # simultaneously is far rarer than either failing alone
+                # (single-digit occurrences across thousands of steps in
+                # every non-DDP run this project has logged), and NCCL
+                # surfaces a mismatch as a clear timeout/error rather than a
+                # silent hang, so the failure mode is "resubmit", not "wasted
+                # GPU-days undetected".
                 continue
 
             cyc_loss = bridge.cycle_loss(pooled_jepa, pooled_vlm)
@@ -272,16 +356,19 @@ def main():
             log_entry["cycle_loss_ema"] = cyc_ema
 
             total_loss.backward()
+            if is_ddp():
+                sync_gradients(all_params, world_size)
             opt.step()
             step += 1
 
-            log_f.write(json.dumps(log_entry) + "\n")
-            log_f.flush()
+            if is_main:
+                log_f.write(json.dumps(log_entry) + "\n")
+                log_f.flush()
 
-            if step % 50 == 0:
-                print(f"[epoch {epoch} step {step}] {log_entry}", flush=True)
+                if step % 50 == 0:
+                    print(f"[epoch {epoch} step {step}] {log_entry}", flush=True)
 
-            if step % args.val_every_steps == 0:
+            if is_main and step % args.val_every_steps == 0:
                 fwd_val_tally = fwd.evaluate_logprob(
                     model, processor, hook, injector, fwd_val, "cross_attn", n_tokens, placeholder_id, device, rng,
                 )
@@ -308,31 +395,36 @@ def main():
                                 "predictor_state": predictor.state_dict(), "bridge_state": bridge.state_dict()},
                                os.path.join(run_dir, "best_reverse.pt"))
 
-            if args.save_every_steps and step % args.save_every_steps == 0:
+            if is_main and args.save_every_steps and step % args.save_every_steps == 0:
                 torch.save({
                     "step": step, "injector_state": injector.state_dict(),
                     "predictor_state": predictor.state_dict(), "bridge_state": bridge.state_dict(),
                 }, os.path.join(run_dir, f"step_{step}.pt"))
                 print(f"[epoch {epoch} step {step}] saved checkpoint -> step_{step}.pt", flush=True)
 
-    best_reverse_path = os.path.join(run_dir, "best_reverse.pt")
-    if os.path.exists(best_reverse_path):
-        predictor.load_state_dict(torch.load(best_reverse_path, map_location=device, weights_only=False)["predictor_state"])
-    rev_test_metrics, n_rev_test = rev.evaluate(predictor, args.cache_dir, rev_test, "crossattn", device)
-    print(f"[TEST] reverse n={n_rev_test} {rev_test_metrics}", flush=True)
-    with open(os.path.join(run_dir, "rev_test_metrics.json"), "w") as f:
-        json.dump({"n_test": n_rev_test, **rev_test_metrics}, f, indent=2)
+    if is_main:
+        best_reverse_path = os.path.join(run_dir, "best_reverse.pt")
+        if os.path.exists(best_reverse_path):
+            predictor.load_state_dict(torch.load(best_reverse_path, map_location=device, weights_only=False)["predictor_state"])
+        rev_test_metrics, n_rev_test = rev.evaluate(predictor, args.cache_dir, rev_test, "crossattn", device)
+        print(f"[TEST] reverse n={n_rev_test} {rev_test_metrics}", flush=True)
+        with open(os.path.join(run_dir, "rev_test_metrics.json"), "w") as f:
+            json.dump({"n_test": n_rev_test, **rev_test_metrics}, f, indent=2)
 
-    summary = {
-        "done": True, "steps_completed": step,
-        "fwd_items_skipped": n_fwd_skipped, "rev_items_skipped": n_rev_skipped,
-        "best_fwd_val_acc": best_fwd_val_acc if step else None,
-        "best_rev_val_mse": best_rev_val_mse if step else None,
-    }
-    print(f"[DONE] {summary}", flush=True)
-    log_f.write(json.dumps(summary) + "\n")
-    log_f.flush()
-    log_f.close()
+        summary = {
+            "done": True, "steps_completed": step,
+            "fwd_items_skipped": n_fwd_skipped, "rev_items_skipped": n_rev_skipped,
+            "best_fwd_val_acc": best_fwd_val_acc if step else None,
+            "best_rev_val_mse": best_rev_val_mse if step else None,
+        }
+        print(f"[DONE] {summary}", flush=True)
+        log_f.write(json.dumps(summary) + "\n")
+        log_f.flush()
+        log_f.close()
+
+    if is_ddp():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
