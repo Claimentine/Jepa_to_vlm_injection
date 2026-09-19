@@ -103,7 +103,7 @@ spec:
               exec torchrun --standalone --nproc_per_node=2 \
                 vans_qa/full_scale/train_latent_world_model_ddp.py \
                 --guidance crossattn \
-                --batch_size 4 \
+                --batch_size 2 \
                 --max_train_items 80 \
                 --val_every_steps 4 \
                 --save_every_steps 8 \
