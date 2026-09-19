@@ -1,11 +1,10 @@
-# Step 32: evaluates job-30's best_forward.pt (VANS+COIN joint training's
-# forward checkpoint, step 3000, val_acc=0.75 on a 100-item snapshot) on the
-# FULL held-out test split (qa_split_temporal.json's "test" partition,
-# 2866 items -- ~29x the sample size any periodic in-training validation
-# number in this project has ever used). Every forward val_acc reported so
-# far (job-13, job-22, job-30, ...) came from noisy 100-item snapshots; this
-# gives a real, low-variance number for the checkpoint the user actually
-# cares about before drawing any conclusion from it.
+# Step 32: full 3-way forward-direction comparison on the FULL held-out test
+# split (qa_split_temporal.json's "test" partition, 2866 items -- ~29x the
+# 100-item sample any periodic in-training validation number in this project
+# has ever used): job-13 (independent baseline), job-22 (VANS-only joint
+# training), job-30 (VANS+COIN joint training). All three checkpoints are
+# evaluated in one process against the same loaded Qwen3-VL-2B (avoids
+# reloading it, and re-queuing for a GPU, three separate times).
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -68,9 +67,11 @@ spec:
 
               cd "$REPO"
               exec "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
-                --checkpoint /data/raw_data/joint_coupled_mixed_coin_runs/best_forward.pt \
+                --checkpoint "job13_independent=/data/raw_data/qa_full_runs_temporal_crossattn/jepa/best.pt" \
+                --checkpoint "job22_joint_vans_only=/data/raw_data/joint_coupled_runs/best_forward.pt" \
+                --checkpoint "job30_joint_vans_coin=/data/raw_data/joint_coupled_mixed_coin_runs/best_forward.pt" \
                 --split_part test \
-                --out_path /data/raw_data/job30_forward_fulltest_eval.json
+                --out_path /data/raw_data/forward_fulltest_comparison.json
           env:
             - name: VANS_ROOT
               value: /data

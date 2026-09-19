@@ -420,6 +420,20 @@ class DecoderLayerInjectionHook:
         self._current = None
 
     def remove(self):
+        """Unregisters every forward-pre-hook this instance added. Needed
+        when evaluating multiple checkpoints against the same frozen model
+        in one process (see eval_forward_checkpoint.py) -- a fresh
+        DecoderLayerInjectionHook per checkpoint is required (its pre_hook
+        closures call self.injector.apply(...), which bakes in a specific
+        injector's own trained weights), so without this the old hook's
+        handles would stay registered forever and stack on top of the new
+        one. Idempotent-ish: calling twice just no-ops the second time
+        (handle.remove() is itself idempotent)."""
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+
+    def remove(self):
         for handle in self._handles:
             handle.remove()
         self._handles.clear()

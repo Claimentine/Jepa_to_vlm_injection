@@ -30,6 +30,12 @@ present:
 
 Reuses train_qa_full.py's evaluate_logprob/build_option_block/etc.
 unmodified (imported, not copied).
+
+Accepts one or more checkpoints via repeated --checkpoint label=path
+(evaluated in one process, sharing the single loaded Qwen3-VL-2B -- avoids
+paying that load cost, and the GPU-scheduling wait to get a pod at all on
+this cluster, once per checkpoint) so a job-13 vs job-22 vs job-30 style
+comparison runs as a single job.
 """
 import argparse
 import json
@@ -57,15 +63,43 @@ from common.cross_modal_bridge import CrossModalBridge, ForwardingAdapter  # noq
 import train_qa_full as fwd  # noqa: E402
 
 
+def load_checkpoint_into_fresh_injector(checkpoint_path, hidden_size, layer_indices, seed, device):
+    injector = LayerWiseJEPAInjector(
+        hidden_size=hidden_size, layer_indices=layer_indices, condition_mode="jepa",
+        seed=seed, mode="cross_attn",
+    ).to(device)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if "bridge_state" in ckpt:
+        print(f"[INFO] {checkpoint_path}: has a shared CrossModalBridge -- "
+              "rewiring ForwardingAdapter before loading state dicts", flush=True)
+        bridge = CrossModalBridge(jepa_dim=1024, vlm_dim=2048).to(device)
+        injector.conditioner.adapter.mlp[0] = ForwardingAdapter(bridge.jepa_to_vlm)
+        bridge.load_state_dict(ckpt["bridge_state"])
+    injector.load_state_dict(ckpt["injector_state"])
+    injector.eval()
+    print(f"[INFO] loaded {checkpoint_path} (step={ckpt.get('step')}, "
+          f"checkpoint's own val_acc={ckpt.get('val_acc')})", flush=True)
+    return injector
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--checkpoint", required=True)
+    ap.add_argument("--checkpoint", action="append", required=True,
+                     help="label=path, repeatable -- e.g. --checkpoint job13=/data/.../best.pt "
+                          "--checkpoint job22=/data/.../best_forward.pt")
     ap.add_argument("--qa_split", default=os.path.join(fwd.BASE, "raw_data/qa_split_temporal.json"))
     ap.add_argument("--split_part", default="test", choices=["val", "test", "train"])
     ap.add_argument("--layer_strategy", default="middle4", choices=["middle4", "last4", "uniform4", "all"])
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out_path", default=None)
     args = ap.parse_args()
+
+    checkpoints = []
+    for spec in args.checkpoint:
+        label, _, path = spec.partition("=")
+        if not path:
+            raise ValueError(f"--checkpoint must be label=path, got {spec!r}")
+        checkpoints.append((label, path))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -83,39 +117,35 @@ def main():
     hidden_size = model.config.text_config.hidden_size
     n_tokens = 64
     placeholder_id = processor.tokenizer.pad_token_id
-
     layer_indices = select_layer_indices(len(resolve_decoder_layers(model)), args.layer_strategy)
-    injector = LayerWiseJEPAInjector(
-        hidden_size=hidden_size, layer_indices=layer_indices, condition_mode="jepa",
-        seed=args.seed, mode="cross_attn",
-    ).to(device)
-    hook = DecoderLayerInjectionHook(model, injector)
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    if "bridge_state" in ckpt:
-        print("[INFO] checkpoint has a shared CrossModalBridge -- rewiring "
-              "ForwardingAdapter before loading state dicts", flush=True)
-        bridge = CrossModalBridge(jepa_dim=1024, vlm_dim=2048).to(device)
-        injector.conditioner.adapter.mlp[0] = ForwardingAdapter(bridge.jepa_to_vlm)
-        bridge.load_state_dict(ckpt["bridge_state"])
-    injector.load_state_dict(ckpt["injector_state"])
-    injector.eval()
-    print(f"[INFO] loaded {args.checkpoint} (step={ckpt.get('step')}, "
-          f"checkpoint's own val_acc={ckpt.get('val_acc')})", flush=True)
+    results = {}
+    for label, checkpoint_path in checkpoints:
+        injector = load_checkpoint_into_fresh_injector(checkpoint_path, hidden_size, layer_indices, args.seed, device)
+        # A fresh hook per checkpoint (its pre_hook closures bake in this
+        # specific injector's own trained weights via self.injector.apply) --
+        # must remove() it before the next checkpoint's hook is created, or
+        # the old one's forward-pre-hooks stay registered on the same frozen
+        # decoder layers and stack on top of the new one.
+        hook = DecoderLayerInjectionHook(model, injector)
+        try:
+            rng = random.Random(args.seed)
+            tally = fwd.evaluate_logprob(
+                model, processor, hook, injector, items, "cross_attn", n_tokens, placeholder_id, device, rng,
+            )
+        finally:
+            hook.remove()
+        print(f"[RESULT] {label} {args.split_part} n={tally.n_total} val_acc(logprob)={tally.summary_str()}", flush=True)
+        results[label] = {
+            "checkpoint": checkpoint_path, "split_part": args.split_part,
+            "n_total": tally.n_total, "acc": tally.acc,
+            "acc_by_difficulty": tally.acc_by_difficulty,
+        }
 
-    rng = random.Random(args.seed)
-    tally = fwd.evaluate_logprob(
-        model, processor, hook, injector, items, "cross_attn", n_tokens, placeholder_id, device, rng,
-    )
-    print(f"[RESULT] {args.split_part} n={tally.n_total} val_acc(logprob)={tally.summary_str()}", flush=True)
-
+    print(f"[SUMMARY] {json.dumps(results, indent=2)}", flush=True)
     if args.out_path:
         with open(args.out_path, "w") as f:
-            json.dump({
-                "checkpoint": args.checkpoint, "split_part": args.split_part,
-                "n_total": tally.n_total, "acc": tally.acc,
-                "acc_by_difficulty": tally.acc_by_difficulty,
-            }, f, indent=2)
+            json.dump(results, f, indent=2)
 
 
 if __name__ == "__main__":
