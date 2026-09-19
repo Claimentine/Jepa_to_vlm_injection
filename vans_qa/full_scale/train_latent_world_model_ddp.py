@@ -172,7 +172,16 @@ def main():
 
     predictor = base.build_predictor(device, args.guidance)
     if is_ddp():
-        predictor = DDP(predictor, device_ids=[local_rank])
+        # CortexGuidedVideoPredictor registers film/adaln-mode submodules
+        # even when a single fixed guidance_mode (here: crossattn) is used
+        # for the whole run -- those params never receive a gradient, which
+        # DDP's default strict all-reduce treats as a hard error ("Expected
+        # to have finished reduction..."). find_unused_parameters=True tells
+        # DDP to walk the autograd graph each step and skip params that
+        # weren't touched, instead of assuming every registered param
+        # participates. Confirmed needed 2026-09-19 (job-31's first DDP
+        # smoke test crashed on this).
+        predictor = DDP(predictor, device_ids=[local_rank], find_unused_parameters=True)
     raw_predictor = predictor.module if is_ddp() else predictor
 
     if is_main:
