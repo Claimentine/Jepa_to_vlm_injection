@@ -117,12 +117,17 @@ spec:
           resources:
             requests:
               cpu: "10"
-              memory: "36Gi"
+              memory: "27Gi"
               ephemeral-storage: "2Gi"
               nvidia.com/gpu: "2"
             limits:
               cpu: "12"
-              memory: "43200Mi"
+              memory: "31500Mi"  # namespace hard cap is 32Gi/pod -- confirmed
+                                  # 2026-09-19 the hard way, a 43200Mi limit
+                                  # silently never created a single pod for
+                                  # 105 minutes ("maximum memory usage per Pod
+                                  # is 32Gi", visible only via `kubectl
+                                  # describe job`, not `get pods`/`get job`)
               ephemeral-storage: "2400Mi"
               nvidia.com/gpu: "2"
           volumeMounts:
