@@ -64,8 +64,20 @@ happen to touch (e.g. an unused film/adaln branch, or one direction's item
 failing to load) -- required so the collective call sequence matches across
 ranks regardless of which sub-branches fired on which rank this step.
 Falls back to plain single-process behavior when WORLD_SIZE is unset/1.
+
+Validation/checkpointing are rank-0-only (real VLM inference over
+--max_val_items items -- redundant and slow to duplicate on every rank).
+Confirmed 2026-09-20 the hard way (job-33's first DDP smoke test) that
+without an explicit dist.barrier() right after that block, non-main ranks
+race ahead to the next step's backward()+sync_gradients() while rank 0 is
+still validating, and hang on an all_reduce rank 0 hasn't reached yet --
+NCCL's watchdog then kills the whole job with a collective-timeout error
+after its default 10 minutes. Fixed with a barrier every rank hits right
+after the val/checkpoint block, plus a longer (30 min) process-group
+timeout for headroom on a full-scale run's larger validation set.
 """
 import argparse
+import datetime
 import json
 import os
 import random
@@ -101,7 +113,15 @@ def is_ddp():
 
 
 def setup_ddp():
-    dist.init_process_group(backend="nccl")
+    # Default NCCL collective timeout (10 min) was too tight: rank 0's
+    # validation pass (real VLM inference over --max_val_items items) is
+    # rank-0-only, unguarded work that other ranks don't wait for except at
+    # the explicit dist.barrier() this script now adds right after it --
+    # confirmed 2026-09-20 that job-33's first DDP smoke test's validation
+    # alone exceeded 10 minutes. 30 minutes gives real headroom for a
+    # full-scale run's larger --max_val_items without needing to reason
+    # precisely about how long validation takes.
+    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(minutes=30))
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -401,6 +421,26 @@ def main():
                     "predictor_state": predictor.state_dict(), "bridge_state": bridge.state_dict(),
                 }, os.path.join(run_dir, f"step_{step}.pt"))
                 print(f"[epoch {epoch} step {step}] saved checkpoint -> step_{step}.pt", flush=True)
+
+            # `step` is incremented identically on every rank (all ranks run
+            # the same n_steps_per_epoch in lockstep -- see the known,
+            # accepted continue-on-total-failure edge case above), so every
+            # rank evaluates step % args.val_every_steps identically -- but
+            # only rank 0 actually RUNS the validation/checkpoint block above
+            # (real VLM inference over --max_val_items items, genuinely slow,
+            # confirmed 2026-09-20 to exceed NCCL's default 10-minute
+            # collective timeout on job-33's first DDP smoke test). Without
+            # this barrier, non-main ranks race ahead to the NEXT step's
+            # backward()+sync_gradients() while rank 0 is still validating,
+            # and hang on an all_reduce rank 0 hasn't reached yet ->
+            # "Watchdog caught collective operation timeout". Every rank
+            # must wait here so nobody starts the next step's collectives
+            # before rank 0 is done.
+            did_rank0_only_work = (step % args.val_every_steps == 0) or (
+                args.save_every_steps and step % args.save_every_steps == 0
+            )
+            if is_ddp() and did_rank0_only_work:
+                dist.barrier()
 
     if is_main:
         best_reverse_path = os.path.join(run_dir, "best_reverse.pt")
