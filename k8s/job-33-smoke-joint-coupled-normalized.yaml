@@ -71,6 +71,12 @@ spec:
                       - hpc-nrp-g1.nmsu.edu
                       - nautilus-ext-gpu01.fullerton.edu
                       - k8s-chase-ci-02.calit2.optiputer.net
+                      - ry-gpu-15.sdsc.optiputer.net # 2026-09-22: kubelet-level
+                      # malfunction (CSI drivers not registered, "no healthy
+                      # devices" for nvidia.com/gpu) -- had worked fine for this
+                      # same job's earlier successful run, so likely a transient
+                      # node outage rather than permanently bad hardware, but
+                      # excluding until confirmed recovered
       containers:
         - name: smoke-joint-coupled-normalized
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
