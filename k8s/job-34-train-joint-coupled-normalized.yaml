@@ -1,0 +1,175 @@
+# Step 34: full-scale run of train_joint_coupled_normalized.py, validated by
+# job-33's smoke test (2026-09-22: completed cleanly end to end over
+# 2 GPUs via DDP -- 20/20 steps, 0 skipped items either direction, real
+# checkpoints, final rev_test eval on the full n=1763 split all succeeded).
+#
+# Directly comparable to job-22 (train_joint_coupled.py, VANS-only,
+# un-normalized): same --qa_split/--epochs/--val_every_steps/
+# --save_every_steps/--max_val_items, no --max_train_items cap, no COIN
+# data. The only variable that differs is EMA-based per-loss normalization
+# before summing fwd_loss + rev_loss + cycle_loss_weight * cycle_loss.
+#
+# job-22's own full-test-set result (job-32, n=2854): best_fwd_val_acc=0.72
+# (100-item snapshot), confirmed 0.6811 on the full test split -- clearly
+# below job-13's independent-training baseline (0.7477). If loss
+# normalization is the fix, this run's forward accuracy should recover
+# toward 0.7477; if it's still degraded, the shared-bottleneck architecture
+# itself is the more likely constraint (see the script's own module
+# docstring for the full diagnosis).
+#
+# Runs 2-GPU DDP via torchrun --standalone (manual gradient all-reduce, not
+# nn.parallel.DistributedDataParallel module-wrapping -- see the script's
+# own docstring for why). Pod memory limit stays under this namespace's
+# hard 32Gi/pod cap (confirmed the hard way on job-33's first submission).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-train-joint-coupled-normalized
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+                      - k8s-haosu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5909.unl.edu
+                      - hcc-nrp-shor-c5925.unl.edu
+                      - hpc-nrp-g1.nmsu.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - k8s-chase-ci-02.calit2.optiputer.net
+                      - ry-gpu-15.sdsc.optiputer.net
+      containers:
+        - name: train-joint-coupled-normalized
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet h5py
+              export PATH="$(dirname "$PY"):$PATH"
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              exec torchrun --standalone --nproc_per_node=2 \
+                vans_qa/full_scale/train_joint_coupled_normalized.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --epochs 1 \
+                --val_every_steps 500 \
+                --save_every_steps 1000 \
+                --max_val_items 100 \
+                --out_dir /data/raw_data/joint_coupled_normalized_runs
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "10"
+              memory: "27Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "2"
+            limits:
+              cpu: "12"
+              memory: "31500Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "2"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-34-train-joint-coupled-normalized.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-train-joint-coupled-normalized -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-train-joint-coupled-normalized -n williamli-scvl
+#
+# Output: /data/raw_data/joint_coupled_normalized_runs/{train_log.jsonl,
+# best_forward.pt, best_reverse.pt, step_<N>.pt, rev_test_metrics.json}
+#
+# Compare best_fwd_val_acc / forward val trajectory against job-22's own
+# train_log.jsonl (best_fwd_val_acc=0.72, full-test 0.6811) and job-13's
+# independent-training baseline (best_val_acc=0.80, full-test 0.7477).
