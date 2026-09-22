@@ -73,8 +73,15 @@ race ahead to the next step's backward()+sync_gradients() while rank 0 is
 still validating, and hang on an all_reduce rank 0 hasn't reached yet --
 NCCL's watchdog then kills the whole job with a collective-timeout error
 after its default 10 minutes. Fixed with a barrier every rank hits right
-after the val/checkpoint block, plus a longer (30 min) process-group
-timeout for headroom on a full-scale run's larger validation set.
+after the val/checkpoint block. A 30-minute process-group timeout covered
+that, but not the FINAL rev_test evaluation after the training loop ends
+(confirmed 2026-09-22, job-33's second DDP smoke test) -- that pass is
+also rank-0-only but uncapped by any --max_*_items flag, running over the
+full reverse test split (~1700+ items for this project's VANS cache), so
+it can itself take longer than periodic validation. The trailing
+dist.barrier() before dist.destroy_process_group() already synchronizes
+ranks there correctly, it just needed more timeout headroom -- bumped to
+3 hours.
 """
 import argparse
 import datetime
@@ -113,15 +120,19 @@ def is_ddp():
 
 
 def setup_ddp():
-    # Default NCCL collective timeout (10 min) was too tight: rank 0's
-    # validation pass (real VLM inference over --max_val_items items) is
-    # rank-0-only, unguarded work that other ranks don't wait for except at
-    # the explicit dist.barrier() this script now adds right after it --
-    # confirmed 2026-09-20 that job-33's first DDP smoke test's validation
-    # alone exceeded 10 minutes. 30 minutes gives real headroom for a
-    # full-scale run's larger --max_val_items without needing to reason
-    # precisely about how long validation takes.
-    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(minutes=30))
+    # Default NCCL collective timeout (10 min) was too tight: rank 0 does a
+    # chunk of unguarded, rank-0-only real inference (periodic validation
+    # over --max_val_items, AND -- confirmed 2026-09-22, job-33's second DDP
+    # smoke test -- the FINAL rev_test evaluation after the training loop
+    # ends, which is NOT capped by any --max_*_items flag and runs over the
+    # full reverse test split, on the order of ~1700+ items for this
+    # project's VANS cache). Other ranks only catch up at the explicit
+    # dist.barrier() calls this script adds (mid-loop after val/checkpoint,
+    # and at the very end) -- 30 minutes was enough for periodic validation
+    # but not quite enough for that final full-test-set pass. 3 hours gives
+    # real headroom for a full-scale run without needing to reason precisely
+    # about how long the uncapped final eval takes.
+    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=3))
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ["LOCAL_RANK"])
