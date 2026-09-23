@@ -160,10 +160,17 @@ class LossNormalizer:
     first step of each loss doesn't produce a huge/undefined normalized
     spike from a near-zero denominator."""
 
-    def __init__(self, decay=0.98, eps=1e-4):
+    def __init__(self, decay=0.98, eps=1e-4, disabled=False):
         self.decay = decay
         self.eps = eps
         self.ema = {}
+        # disabled=True: still tracks the EMA (for logging/comparison), but
+        # returns the raw loss unchanged -- lets this same DDP-enabled
+        # script reproduce job-22's exact math (raw fwd_loss + raw rev_loss
+        # + cycle_loss_weight * raw cyc_loss) for a clean, single-variable
+        # cycle_loss_weight ablation, without needing to separately port DDP
+        # into train_joint_coupled.py.
+        self.disabled = disabled
 
     def normalize(self, name, raw_loss_tensor):
         raw_value = float(raw_loss_tensor.item())
@@ -171,6 +178,8 @@ class LossNormalizer:
             self.ema[name] = raw_value
         else:
             self.ema[name] = self.decay * self.ema[name] + (1 - self.decay) * raw_value
+        if self.disabled:
+            return raw_loss_tensor, self.ema[name]
         return raw_loss_tensor / (self.ema[name] + self.eps), self.ema[name]
 
 
@@ -186,6 +195,10 @@ def main():
     ap.add_argument("--loss_norm_decay", type=float, default=0.98,
                      help="EMA decay for the per-loss magnitude normalizer -- higher means "
                           "slower-adapting/more stable, lower reacts faster to loss-scale drift")
+    ap.add_argument("--disable_norm", action="store_true",
+                     help="bypass EMA normalization, summing raw losses like train_joint_coupled.py "
+                          "(job-22) does -- for a clean, single-variable --cycle_loss_weight ablation "
+                          "against job-22, isolated from the normalization change")
     ap.add_argument("--val_every_steps", type=int, default=500)
     ap.add_argument("--save_every_steps", type=int, default=1000)
     ap.add_argument("--max_val_items", type=int, default=100)
@@ -269,10 +282,11 @@ def main():
     if is_main:
         print(f"[INFO] trainable params: forward_injector={n_fwd_params:,} "
               f"reverse_predictor={n_rev_params:,} shared_bridge={n_bridge_params:,} "
-              f"cycle_loss_weight={args.cycle_loss_weight} loss_norm_decay={args.loss_norm_decay} "
+              f"cycle_loss_weight={args.cycle_loss_weight} disable_norm={args.disable_norm} "
+              f"loss_norm_decay={args.loss_norm_decay} "
               f"world_size={world_size}", flush=True)
 
-    normalizer = LossNormalizer(decay=args.loss_norm_decay)
+    normalizer = LossNormalizer(decay=args.loss_norm_decay, disabled=args.disable_norm)
 
     log_f = open(os.path.join(run_dir, "train_log.jsonl"), "w") if is_main else None
     rng = random.Random(args.seed)
