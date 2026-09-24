@@ -165,6 +165,49 @@ job-05 overwrites `best.pt` for that `--injection` value from scratch
   (never commit the token itself to this repo) plus an env var wired into
   whichever Job needs it.
 
+## GPU node affinity policy (2026-09-23 onward)
+
+Every job template up through job-37 used a **blacklist**: `nodeAffinity.
+requiredDuringSchedulingIgnoredDuringExecution` with `nvidia.com/gpu.product
+NotIn [...]` excluding known-bad/slow cards (old Pascal/Volta/2080Ti tiers,
+plus specific cards discovered to be pathologically slow for this workload
+like TITAN RTX -- see job-30's own header comment, ~4x slower than an A10).
+This meant the scheduler could land a job on ANYTHING not explicitly
+excluded -- RTX 3090s, L40S, A10, whatever had free capacity, with real
+variance in speed and memory headroom (e.g. job-33/36 landing on 2x RTX
+3090 with only 24GB/card, noticeably tighter than the A10's 22-24GB this
+project has mostly targeted).
+
+Per the user's explicit call (2026-09-23): **new job templates going
+forward require A100 specifically** (not just prefer it) -- a hard
+**allowlist**, `nvidia.com/gpu.product In [...]`, replacing the NotIn
+blacklist pattern. Confirmed label values actually present in this
+cluster's node inventory (`kubectl get nodes -o jsonpath=...nvidia.com/gpu.product`):
+
+```yaml
+- key: nvidia.com/gpu.product
+  operator: In
+  values:
+    - NVIDIA-A100-PCIE-40GB
+    - NVIDIA-A100-SXM4-80GB
+    - NVIDIA-A100-80GB-PCIe
+```
+
+Deliberately excludes `NVIDIA-A100-80GB-PCIe-MIG-1g.10gb` -- a 1g.10gb MIG
+slice is a *fraction* of an A100 (10GB), smaller than the A10s this project
+has been using, not a real A100's memory/compute.
+
+Tradeoff to keep in mind: an allowlist is a much smaller candidate pool
+than a blacklist (dozens of A100 nodes across the federation vs. hundreds
+of everything-except-a-dozen-bad-ones), so expect longer scheduling queues
+than this project has seen even for its 2-GPU DDP requests (which already
+took hours at times -- see job-31/33/34's own scheduling history). Worth
+it for the reduced memory pressure (A100's 40GB/80GB vs. the 22-32GB this
+project has been fitting DDP ranks into, sometimes uncomfortably close to
+the namespace's own 32Gi/pod cgroup cap -- see job-33's memory-limit
+incident) and for consistent, predictable step timing instead of whatever
+card happens to be free.
+
 ## Reminders from the lab onboarding guide
 
 - **No protected data** on Nautilus, ever (HIPAA/FERPA/PID/etc.) -- not
