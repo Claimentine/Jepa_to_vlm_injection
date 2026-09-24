@@ -1,0 +1,130 @@
+# Step 41: out-of-domain generalization eval on TempCompass (see job-40's
+# header for what it is and why). Evaluates job-13 (independent baseline),
+# job-22 (joint, un-normalized), job-34 (joint, loss-normalized), and job-36
+# (joint, cycle_loss_weight=0 isolation) forward checkpoints against the
+# SAME TempCompass multi-choice split, all in one process (same pattern as
+# job-32/37).
+#
+# Every prior number for these checkpoints (job-32, job-37) was measured on
+# qa_split_temporal.json -- COIN data, the injector's own training domain.
+# This is the first check of whether any of these checkpoints' behavior
+# (baseline vs the three joint-training variants) generalizes to a video
+# domain and QA style neither the injector nor the bridge has ever seen.
+#
+# Requires job-40 to have completed first (needs
+# /data/raw_data/qa_split_tempcompass.json and
+# /data/vans_work_tempcompass/vjepa_cache_full/*.npz already populated --
+# does NOT redo the clips/vjepa_cache_full symlink trick job-32/37 use for
+# COIN data, since TempCompass's clips/cache are real directories job-40
+# already wrote directly, not a shared read-only backup mount).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-eval-tempcompass
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A100-PCIE-40GB
+                      - NVIDIA-A100-SXM4-80GB
+                      - NVIDIA-A100-80GB-PCIe
+      containers:
+        - name: eval-tempcompass
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_tempcompass.json \
+                --split_part test \
+                --checkpoint "job13_independent=/data/raw_data/qa_full_runs_temporal_crossattn/jepa/best.pt" \
+                --checkpoint "job22_joint_vans_only=/data/raw_data/joint_coupled_runs/best_forward.pt" \
+                --checkpoint "job34_joint_normalized=/data/raw_data/joint_coupled_normalized_runs/best_forward.pt" \
+                --checkpoint "job36_joint_cycle0=/data/raw_data/joint_coupled_cycle0_runs/best_forward.pt" \
+                --out_path /data/raw_data/tempcompass_forward_comparison.json
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work_tempcompass
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "19200Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-41-eval-tempcompass.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-eval-tempcompass -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-eval-tempcompass -n williamli-scvl

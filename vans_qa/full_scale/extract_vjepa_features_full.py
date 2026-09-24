@@ -117,10 +117,15 @@ def clip_to_model_input(frames, adapter):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--qa_split", default=os.path.join(BASE, "raw_data/qa_split_full.json"),
+                     help="which split JSON to pull in_clip/out_clip from -- defaults to this "
+                          "project's own qa_split_full.json (unchanged behavior); pass a different "
+                          "path (e.g. a converted external-benchmark split) to extract features for "
+                          "a different clip set into the same vjepa_cache_full/ cache")
     args = ap.parse_args()
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    split = json.load(open(os.path.join(BASE, "raw_data/qa_split_full.json")))
+    split = json.load(open(args.qa_split))
     clips = set()
     for part in split.values():
         for item in part:

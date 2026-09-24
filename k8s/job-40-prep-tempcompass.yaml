@@ -1,0 +1,207 @@
+# Step 40: out-of-domain generalization data prep -- downloads TempCompass
+# (Liu et al., ACL 2024 Findings: 410 videos, 500 clips, 7,540 QA pairs
+# testing video-LLM temporal perception across action/direction/speed/order/
+# attribute_change), converts its multi-choice QA into this project's
+# --qa_split schema, and extracts V-JEPA2 features for its clips.
+#
+# Why: every forward-direction number so far (job-13/22/34/36) is measured
+# on qa_split_temporal.json, itself derived from COIN -- the SAME domain the
+# injector was trained on. This is a genuine out-of-domain benchmark, not
+# more COIN, to test whether the JEPA injection method's gains (or losses,
+# in the joint-training ablations) generalize at all.
+#
+# Data: videos from huggingface.co/datasets/lmms-lab/TempCompass
+# (tempcompass_videos.zip, 418MB, confirmed via its own central directory to
+# contain videos/<video_id>.mp4 and videos/<video_id>_reverse.mp4), QA from
+# its multi-choice/test-00000-of-00001.parquet (columns: video_id, question,
+# answer, dim -- question embeds "A. opt1\nB. opt2\n..." inline, answer is
+# the full matched option text). vans_qa/full_scale/build_tempcompass_qa_split.py
+# converts this into {"train": [], "val": [], "test": [...]} with in_clip/
+# question/correct_caption/distractor_caption/difficulty(=dim) fields
+# train_qa_full.py's has_features/evaluate_logprob/build_option_block
+# already expect -- see that script's own docstring for exactly how
+# (pairwise-expanded over each wrong option, since this project's harness
+# hardcodes single correct + single distractor, no native N-way scoring).
+#
+# Uses a SEPARATE work root (/data/vans_work_tempcompass, not
+# /data/vans_work) so this never touches the COIN clips/cache backing every
+# other job -- see job-03's own note on why clips/ and vjepa_cache_full/
+# share one physical dir for COIN; that convention is deliberately NOT
+# reused here to avoid any risk of cross-contaminating it.
+#
+# Download step is CPU-only (separate init container), same reasoning as
+# job-03's init-fetch-checkpoint: don't burn GPU fair-share time waiting on
+# a network download. Reuses the V-JEPA2 checkpoint job-03 already fetched
+# to /data/checkpoints/vjepa2/vitl.pt -- no need to redownload it.
+#
+# First data-prep job under the new A100-allowlist node affinity policy.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-prep-tempcompass
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A100-PCIE-40GB
+                      - NVIDIA-A100-SXM4-80GB
+                      - NVIDIA-A100-80GB-PCIe
+      containers:
+        - name: prep-tempcompass
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/thinkjepa/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet pyarrow
+
+              mkdir -p "$VANS_WORK_ROOT/clips"
+              mkdir -p "$(dirname "$VJEPA2_CKPT")"
+
+              cd "$REPO"
+              "$PY" vans_qa/full_scale/build_tempcompass_qa_split.py \
+                --parquet /data/raw_data/tempcompass_multi_choice.parquet \
+                --clips_root "$VANS_WORK_ROOT/clips" \
+                --out_path /data/raw_data/qa_split_tempcompass.json
+
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              exec "$PY" vans_qa/full_scale/extract_vjepa_features_full.py \
+                --qa_split /data/raw_data/qa_split_tempcompass.json
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work_tempcompass
+            - name: VJEPA2_CKPT
+              value: /data/checkpoints/vjepa2/vitl.pt
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "6"
+              memory: "16Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "7.2"
+              memory: "19200Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+        - name: init-fetch-tempcompass
+          # CPU-only, deliberately separate from the GPU container -- same
+          # reasoning as job-03's init-fetch-checkpoint (don't burn GPU
+          # fair-share time on a network download). Downloads straight onto
+          # the data PVC, not the container's ephemeral-storage, since the
+          # zip is 418MB -- comfortably over a typical ephemeral-storage
+          # limit if it landed in /tmp instead.
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              TARGET=/data/vans_work_tempcompass/clips/tempcompass
+              mkdir -p "$TARGET"
+              mkdir -p /data/raw_data
+
+              n_existing=$(find "$TARGET/videos" -name '*.mp4' 2>/dev/null | wc -l)
+              if [ "$n_existing" -gt 400 ]; then
+                echo "[skip] tempcompass videos already extracted ($n_existing mp4 files)"
+              else
+                echo "[fetch] downloading tempcompass_videos.zip (~418MB) ..."
+                curl -sL -o /data/vans_work_tempcompass/tempcompass_videos.zip \
+                  "https://huggingface.co/datasets/lmms-lab/TempCompass/resolve/main/tempcompass_videos.zip"
+                python3 -c "
+              import zipfile
+              with zipfile.ZipFile('/data/vans_work_tempcompass/tempcompass_videos.zip') as z:
+                  z.extractall('$TARGET')
+              "
+                rm -f /data/vans_work_tempcompass/tempcompass_videos.zip
+                echo "[done] extracted $(find "$TARGET/videos" -name '*.mp4' | wc -l) mp4 files"
+              fi
+
+              if [ -f /data/raw_data/tempcompass_multi_choice.parquet ]; then
+                echo "[skip] multi-choice parquet already present"
+              else
+                curl -sL -o /data/raw_data/tempcompass_multi_choice.parquet \
+                  "https://huggingface.co/datasets/lmms-lab/TempCompass/resolve/main/multi-choice/test-00000-of-00001.parquet"
+                echo "[done] fetched multi-choice parquet"
+              fi
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1.2"
+              memory: "2400Mi"
+              ephemeral-storage: "1200Mi"
+          volumeMounts:
+            - name: data-storage
+              mountPath: /data
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-40-prep-tempcompass.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-prep-tempcompass -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-prep-tempcompass -n williamli-scvl
+#
+# Output: /data/raw_data/qa_split_tempcompass.json (converted QA split),
+# /data/vans_work_tempcompass/vjepa_cache_full/*.npz (cached V-JEPA2 features)
