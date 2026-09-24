@@ -1,0 +1,145 @@
+# Step 39 smoke test: the bridge-capacity ablation. Tests whether
+# CrossModalBridge's single nn.Linear per head is an information bottleneck,
+# not a gradient-coupling problem -- job-36 already isolated gradient
+# coupling by setting cycle_loss_weight=0 (jepa_to_vlm/vlm_to_jepa fully
+# independent) and forward accuracy was STILL degraded (100-item snapshot
+# 0.6, below even job-22's 0.72), which argues against cross-task gradient
+# conflict as the driver. What's untested is whether each head simply lacks
+# the capacity to carry enough cross-modal information on its own, single-
+# linear-layer terms.
+#
+# --bridge_hidden_dim 4096 (new flag on train_joint_coupled_normalized.py)
+# swaps each head from a single nn.Linear to a 2-layer MLP
+# (Linear -> GELU -> Linear) with a 4096-wide hidden layer -- roughly 6x the
+# original bridge's ~4.2M params (~25.2M) -- while every other setting stays
+# identical to job-36 (--disable_norm --cycle_loss_weight 0), so this run is
+# a clean, single-variable comparison against job-36: same isolated-gradient
+# setting, only the bridge's own capacity changes.
+#
+# Smoke test (small --max_train_items cap) before a full run, same
+# discipline as job-08/14/31/33/35 -- this is genuinely new code
+# (CrossModalBridge's Sequential-MLP branch, eval_forward_checkpoint.py's
+# hidden_dim auto-detection from bridge_state) and hasn't run once yet.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-smoke-bridge-capacity
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A100-PCIE-40GB
+                      - NVIDIA-A100-SXM4-80GB
+                      - NVIDIA-A100-80GB-PCIe
+      containers:
+        - name: smoke-bridge-capacity
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet h5py
+              export PATH="$(dirname "$PY"):$PATH"
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              exec torchrun --standalone --nproc_per_node=2 \
+                vans_qa/full_scale/train_joint_coupled_normalized.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --disable_norm \
+                --cycle_loss_weight 0 \
+                --bridge_hidden_dim 4096 \
+                --epochs 1 \
+                --max_train_items 40 \
+                --val_every_steps 10 \
+                --save_every_steps 20 \
+                --max_val_items 20 \
+                --out_dir /data/raw_data/joint_coupled_bridge_mlp_smoke
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "10"
+              memory: "27Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "2"
+            limits:
+              cpu: "12"
+              memory: "31500Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "2"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-39-smoke-bridge-capacity.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-smoke-bridge-capacity -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-smoke-bridge-capacity -n williamli-scvl

@@ -70,11 +70,19 @@ def load_checkpoint_into_fresh_injector(checkpoint_path, hidden_size, layer_indi
     ).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if "bridge_state" in ckpt:
-        print(f"[INFO] {checkpoint_path}: has a shared CrossModalBridge -- "
+        # jepa_to_vlm.weight (single Linear) vs jepa_to_vlm.0.weight (2-layer
+        # MLP, --bridge_hidden_dim run) tells us which architecture to build;
+        # the MLP's hidden width is just that layer's own out_features.
+        bridge_state = ckpt["bridge_state"]
+        if "jepa_to_vlm.weight" in bridge_state:
+            hidden_dim = None
+        else:
+            hidden_dim = bridge_state["jepa_to_vlm.0.weight"].shape[0]
+        print(f"[INFO] {checkpoint_path}: has a shared CrossModalBridge (hidden_dim={hidden_dim}) -- "
               "rewiring ForwardingAdapter before loading state dicts", flush=True)
-        bridge = CrossModalBridge(jepa_dim=1024, vlm_dim=2048).to(device)
+        bridge = CrossModalBridge(jepa_dim=1024, vlm_dim=2048, hidden_dim=hidden_dim).to(device)
         injector.conditioner.adapter.mlp[0] = ForwardingAdapter(bridge.jepa_to_vlm)
-        bridge.load_state_dict(ckpt["bridge_state"])
+        bridge.load_state_dict(bridge_state)
     injector.load_state_dict(ckpt["injector_state"])
     injector.eval()
     print(f"[INFO] loaded {checkpoint_path} (step={ckpt.get('step')}, "

@@ -199,6 +199,12 @@ def main():
                      help="bypass EMA normalization, summing raw losses like train_joint_coupled.py "
                           "(job-22) does -- for a clean, single-variable --cycle_loss_weight ablation "
                           "against job-22, isolated from the normalization change")
+    ap.add_argument("--bridge_hidden_dim", type=int, default=None,
+                     help="if set, CrossModalBridge's two heads become a 2-layer MLP "
+                          "(Linear -> GELU -> Linear) with this hidden width instead of a single "
+                          "Linear -- tests whether a single-linear-layer bottleneck (not gradient "
+                          "coupling -- job-36's --cycle_loss_weight 0 already isolated that "
+                          "variable) is what limits the bridge, independent of loss normalization")
     ap.add_argument("--val_every_steps", type=int, default=500)
     ap.add_argument("--save_every_steps", type=int, default=1000)
     ap.add_argument("--max_val_items", type=int, default=100)
@@ -268,8 +274,9 @@ def main():
 
     predictor = rev.build_predictor(device, guidance="crossattn")
 
-    # ---------------- shared bridge, wired into both (unchanged from job-22) ----------------
-    bridge = CrossModalBridge(jepa_dim=1024, vlm_dim=2048).to(device)
+    # ---------------- shared bridge, wired into both (unchanged from job-22, except
+    # --bridge_hidden_dim which swaps each head from a single Linear to a 2-layer MLP) ----------------
+    bridge = CrossModalBridge(jepa_dim=1024, vlm_dim=2048, hidden_dim=args.bridge_hidden_dim).to(device)
     injector.conditioner.adapter.mlp[0] = ForwardingAdapter(bridge.jepa_to_vlm)
     predictor.guidance_old_adapter = ForwardingAdapter(bridge.vlm_to_jepa, predictor.context_adapter)
     predictor.guidance_new_adapter = ForwardingAdapter(bridge.vlm_to_jepa, predictor.context_adapter)

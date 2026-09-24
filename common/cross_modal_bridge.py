@@ -34,10 +34,25 @@ import torch.nn as nn
 
 
 class CrossModalBridge(nn.Module):
-    def __init__(self, jepa_dim=1024, vlm_dim=2048):
+    def __init__(self, jepa_dim=1024, vlm_dim=2048, hidden_dim=None):
+        """hidden_dim=None (default): each head is a single nn.Linear, exactly
+        the original architecture (job-22/job-34/job-36's checkpoints all
+        load against this). hidden_dim=N: each head becomes a 2-layer MLP
+        (Linear -> GELU -> Linear) with an N-wide hidden layer, to test
+        whether a single-linear-layer bottleneck (not gradient coupling --
+        job-36 already isolated that variable) is what limits how much
+        cross-modal information the bridge can carry for either direction.
+        """
         super().__init__()
-        self.jepa_to_vlm = nn.Linear(jepa_dim, vlm_dim)
-        self.vlm_to_jepa = nn.Linear(vlm_dim, jepa_dim)
+        self.hidden_dim = hidden_dim
+        if hidden_dim is None:
+            self.jepa_to_vlm = nn.Linear(jepa_dim, vlm_dim)
+            self.vlm_to_jepa = nn.Linear(vlm_dim, jepa_dim)
+        else:
+            self.jepa_to_vlm = nn.Sequential(
+                nn.Linear(jepa_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, vlm_dim))
+            self.vlm_to_jepa = nn.Sequential(
+                nn.Linear(vlm_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, jepa_dim))
 
     def cycle_loss(self, pooled_jepa=None, pooled_vlm=None):
         """Bidirectional cycle-consistency: round-tripping a pooled vector
