@@ -20,6 +20,14 @@
 # discipline as job-08/14/31/33/35 -- this is genuinely new code
 # (CrossModalBridge's Sequential-MLP branch, eval_forward_checkpoint.py's
 # hidden_dim auto-detection from bridge_state) and hasn't run once yet.
+#
+# Relaxed back to the pre-2026-09-23 NotIn-blacklist node affinity
+# (2026-09-24, user's explicit call): the A100-only allowlist left this
+# smoke test (and job-40) Pending for 7+ hours straight with 0 allocatable
+# A100 GPUs anywhere in the federated cluster (confirmed by direct node
+# inventory query, not just a slow scheduler). Scoped to verification jobs
+# only (smoke tests / data prep) -- full-scale training runs still use the
+# A100 allowlist per the standing policy.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -34,11 +42,37 @@ spec:
             nodeSelectorTerms:
               - matchExpressions:
                   - key: nvidia.com/gpu.product
-                    operator: In
+                    operator: NotIn
                     values:
-                      - NVIDIA-A100-PCIE-40GB
-                      - NVIDIA-A100-SXM4-80GB
-                      - NVIDIA-A100-80GB-PCIe
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+                      - k8s-haosu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5909.unl.edu
+                      - hcc-nrp-shor-c5925.unl.edu
+                      - hpc-nrp-g1.nmsu.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - k8s-chase-ci-02.calit2.optiputer.net
+                      - ry-gpu-15.sdsc.optiputer.net
       containers:
         - name: smoke-bridge-capacity
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
