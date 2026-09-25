@@ -8,10 +8,10 @@
 # the capacity to carry enough cross-modal information on its own, single-
 # linear-layer terms.
 #
-# --bridge_hidden_dim 4096 (new flag on train_joint_coupled_normalized.py)
+# --bridge_hidden_dim 2048 (new flag on train_joint_coupled_normalized.py)
 # swaps each head from a single nn.Linear to a 2-layer MLP
-# (Linear -> GELU -> Linear) with a 4096-wide hidden layer -- roughly 6x the
-# original bridge's ~4.2M params (~25.2M) -- while every other setting stays
+# (Linear -> GELU -> Linear) with a 2048-wide hidden layer -- roughly 3x the
+# original bridge's ~4.2M params (~12.6M) -- while every other setting stays
 # identical to job-36 (--disable_norm --cycle_loss_weight 0), so this run is
 # a clean, single-variable comparison against job-36: same isolated-gradient
 # setting, only the bridge's own capacity changes.
@@ -20,6 +20,19 @@
 # discipline as job-08/14/31/33/35 -- this is genuinely new code
 # (CrossModalBridge's Sequential-MLP branch, eval_forward_checkpoint.py's
 # hidden_dim auto-detection from bridge_state) and hasn't run once yet.
+#
+# 2026-09-25: first attempt used --bridge_hidden_dim 4096 and OOM'd on
+# EVERY reverse-direction item (rev_items_skipped=20/20 -- "GPU 1 has a
+# total capacity of 22.06 GiB of which 128.75 MiB is free... this process
+# has 16.29 GiB memory in use", confirmed both GPUs). job-33/34/36 (single-
+# Linear bridge, same 2-GPU-per-pod topology) ran this same reverse
+# direction fine, so the extra ~21M params' activations (not the params
+# themselves) were what tipped an already-tight margin over. Backed off to
+# 2048 (~half the extra param count) and added
+# PYTORCH_ALLOC_CONF=expandable_segments:True (the error message's own
+# suggestion, to reduce allocator fragmentation) -- if 2048 still OOMs, the
+# next step down is 1536 or investigating whether the reverse direction's
+# own per-item memory footprint has no headroom left at all on 22GB cards.
 #
 # Relaxed back to the pre-2026-09-23 NotIn-blacklist node affinity
 # (2026-09-24, user's explicit call): the A100-only allowlist left this
@@ -99,7 +112,7 @@ spec:
                 --qa_split /data/raw_data/qa_split_temporal.json \
                 --disable_norm \
                 --cycle_loss_weight 0 \
-                --bridge_hidden_dim 4096 \
+                --bridge_hidden_dim 2048 \
                 --epochs 1 \
                 --max_train_items 40 \
                 --val_every_steps 10 \
@@ -119,6 +132,8 @@ spec:
               value: "1"
             - name: FORCE_QWENVL_VIDEO_READER
               value: decord
+            - name: PYTORCH_ALLOC_CONF
+              value: expandable_segments:True
           resources:
             requests:
               cpu: "10"
