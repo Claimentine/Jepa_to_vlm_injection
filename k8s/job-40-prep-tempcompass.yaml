@@ -176,10 +176,12 @@ spec:
             - |
               set -euo pipefail
               TARGET=/data/vans_work_tempcompass/clips/tempcompass
-              mkdir -p "$TARGET"
+              mkdir -p "$TARGET/videos"
               mkdir -p /data/raw_data
 
-              n_existing=$(find "$TARGET/videos" -name '*.mp4' 2>/dev/null | wc -l)
+              # find against an empty (but existing) dir still exits 0, so this
+              # doesn't trip on pipefail the way a not-yet-created dir would.
+              n_existing=$(find "$TARGET/videos" -name '*.mp4' | wc -l)
               if [ "$n_existing" -gt 400 ]; then
                 echo "[skip] tempcompass videos already extracted ($n_existing mp4 files)"
               else
