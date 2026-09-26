@@ -1,0 +1,151 @@
+# Step 43 smoke test: validates evaluate_logprob's new look-ahead-1 decode
+# pipeline (job-41's GPU-utilization fix, ~15% average -> should be
+# substantially higher with decode overlapped against GPU compute) before
+# trusting it on job-41's full multi-thousand-item TempCompass rerun.
+#
+# --limit 60 against job-13's own checkpoint on qa_split_temporal.json's
+# test split (COIN data, not TempCompass -- this is purely a mechanism
+# check, so using the already-cached, already-validated COIN split avoids
+# entangling it with anything TempCompass-specific). job-32/37 both
+# confirmed job13_independent's full-test accuracy at 0.7476/0.7477 -- a
+# 60-item subset won't reproduce that exact number (small-sample noise),
+# but a wildly different number (e.g. near 0.5, chance level) would signal
+# the pipeline change broke correctness (e.g. an off-by-one in which
+# item's decode/rng draw pairs with which item's GPU compute).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-smoke-decode-pipeline
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+                      - k8s-haosu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5909.unl.edu
+                      - hcc-nrp-shor-c5925.unl.edu
+                      - hpc-nrp-g1.nmsu.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - k8s-chase-ci-02.calit2.optiputer.net
+                      - ry-gpu-15.sdsc.optiputer.net
+      containers:
+        - name: smoke-decode-pipeline
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --checkpoint "job13_independent=/data/raw_data/qa_full_runs_temporal_crossattn/jepa/best.pt" \
+                --split_part test \
+                --limit 60
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "19200Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-43-smoke-decode-pipeline.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-smoke-decode-pipeline -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-smoke-decode-pipeline -n williamli-scvl
