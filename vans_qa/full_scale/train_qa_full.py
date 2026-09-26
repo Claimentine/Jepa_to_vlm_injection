@@ -9,6 +9,7 @@ bundle.
 Run extract_vjepa_features_full.py and extract_vlm_guidance_full.py first.
 """
 import argparse
+import collections
 import glob
 import json
 import multiprocessing as mp
@@ -380,7 +381,8 @@ def _start_item_decode(item, rng):
         return False, e
 
 
-def evaluate_logprob(model, processor, hook, injector, items, injection_site, n_tokens, placeholder_id, device, rng):
+def evaluate_logprob(model, processor, hook, injector, items, injection_site, n_tokens, placeholder_id, device, rng,
+                      prefetch_depth=4):
     model.eval()
     # Without this, JepaPoolerTemporal's internal attention dropout (p=0.1)
     # stays active during periodic in-training validation, adding noise to
@@ -388,16 +390,33 @@ def evaluate_logprob(model, processor, hook, injector, items, injection_site, n_
     injector.eval()
     tally = AccTally()
     seen_exc_types = set()
-    # Look-ahead-1 pipeline: item i+1's decode (spawned as its own process --
-    # see _decode_video_worker's docstring) is kicked off before item i's GPU
-    # forward pass runs, so the CPU/ffmpeg-bound wait overlaps with GPU
-    # compute instead of happening serially in between every item. See
-    # start_decode()'s docstring for the measurement that motivated this.
-    pending = None
+    # Concurrent decode queue, depth `prefetch_depth`: a look-ahead-1 version
+    # of this (kick off item i+1's decode during item i's GPU compute) was
+    # tried first and measured no improvement -- live nvidia-smi sampling on
+    # a real eval run stayed at ~15% average utilization either way, because
+    # each item's GPU compute (~1s, two forward passes) is far shorter than
+    # its decode (each _decode_video_worker call spawns a fresh Python
+    # interpreter that reimports torch/cv2/decord/qwen_vl_utils, likely
+    # 10s+ per item), so overlapping only ONE decode with ONE compute hides
+    # only a small fraction of the wait. Keeping `prefetch_depth` decodes
+    # in flight at once (real OS-level parallelism -- each is spawned as its
+    # own process, not a thread) lets the CPU-bound decode workers run
+    # concurrently, sized to the pod's own CPU request (default 4, matching
+    # this project's eval job templates' `cpu: "4"`).
+    next_to_start = 0
+    queue = collections.deque()
+
+    def _top_up():
+        nonlocal next_to_start
+        while next_to_start < len(items) and len(queue) < prefetch_depth:
+            queue.append(_start_item_decode(items[next_to_start], rng))
+            next_to_start += 1
+
+    _top_up()
     with torch.no_grad():
-        for idx, item in enumerate(items):
-            cur_ok, cur_payload = pending if pending is not None else _start_item_decode(item, rng)
-            pending = _start_item_decode(items[idx + 1], rng) if idx + 1 < len(items) else None
+        for item in items:
+            cur_ok, cur_payload = queue.popleft()
+            _top_up()
             try:
                 if not cur_ok:
                     raise cur_payload
