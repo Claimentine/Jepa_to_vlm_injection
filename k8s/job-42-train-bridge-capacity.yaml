@@ -1,0 +1,169 @@
+# Step 42: full-scale run of the bridge-capacity ablation, validated by
+# job-39's smoke test (2026-09-25: --bridge_hidden_dim 2048 confirmed
+# correctly wired, 20/20 steps clean over 2-GPU DDP, rev_items_skipped=0
+# after backing off from 4096 which OOM'd on every single reverse item).
+#
+# Tests whether CrossModalBridge's single nn.Linear per head is an
+# information bottleneck, not a gradient-coupling problem -- job-36 already
+# isolated gradient coupling (cycle_loss_weight=0, jepa_to_vlm/vlm_to_jepa
+# fully independent) and forward accuracy was STILL degraded (100-item
+# snapshot 0.6, below even job-22's 0.72), arguing against cross-task
+# gradient conflict as the driver. This run keeps job-36's exact
+# --disable_norm --cycle_loss_weight 0 setting (same isolated-gradient
+# config) and changes ONLY the bridge's own capacity: --bridge_hidden_dim
+# 2048 swaps each head from a single Linear to a 2-layer MLP
+# (Linear -> GELU -> Linear), ~12.6M bridge params vs the original ~4.2M.
+#
+# Same --qa_split/--epochs/--val_every_steps/--save_every_steps/
+# --max_val_items as job-22/34/36, no --max_train_items cap, no COIN data.
+# PYTORCH_ALLOC_CONF=expandable_segments:True kept from job-39's OOM fix --
+# this run sits on the same tight per-GPU memory margin.
+#
+# job-36's full-test-set result (job-38 was cancelled before running, so
+# only the 100-item snapshot exists: best_fwd_val_acc=0.6, below job-22's
+# 0.72 and job-34's 0.78). If bridge capacity is the real bottleneck, this
+# run's forward accuracy should recover above job-36's snapshot while
+# keeping the same zero-coupling setting; if not, capacity is ruled out
+# alongside gradient coupling (job-36) and loss magnitude (job-34).
+#
+# Runs 2-GPU DDP via torchrun --standalone. Uses ruixin-conda-vol-ddp so
+# this can run concurrently with other jobs on ruixin-conda-vol(-vlm)
+# without PVC contention.
+#
+# Full-scale training run: A100 allowlist per the standing policy (unlike
+# job-39/40/41, which were relaxed back to the NotIn-blacklist as
+# verification-only jobs after the A100 pool showed 0 allocatable GPUs for
+# 7+ hours straight).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-train-bridge-capacity
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A100-PCIE-40GB
+                      - NVIDIA-A100-SXM4-80GB
+                      - NVIDIA-A100-80GB-PCIe
+      containers:
+        - name: train-bridge-capacity
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet h5py
+              export PATH="$(dirname "$PY"):$PATH"
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              exec torchrun --standalone --nproc_per_node=2 \
+                vans_qa/full_scale/train_joint_coupled_normalized.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --disable_norm \
+                --cycle_loss_weight 0 \
+                --bridge_hidden_dim 2048 \
+                --epochs 1 \
+                --val_every_steps 500 \
+                --save_every_steps 1000 \
+                --max_val_items 100 \
+                --out_dir /data/raw_data/joint_coupled_bridge_mlp_runs
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+            - name: PYTORCH_ALLOC_CONF
+              value: expandable_segments:True
+          resources:
+            requests:
+              cpu: "10"
+              memory: "27Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "2"
+            limits:
+              cpu: "12"
+              memory: "31500Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "2"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-42-train-bridge-capacity.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-train-bridge-capacity -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-train-bridge-capacity -n williamli-scvl
+#
+# Output: /data/raw_data/joint_coupled_bridge_mlp_runs/{train_log.jsonl,
+# best_forward.pt, best_reverse.pt, step_<N>.pt, rev_test_metrics.json}
+#
+# Compare best_fwd_val_acc / forward val trajectory against job-36's
+# (best_fwd_val_acc=0.6 snapshot, no full-test yet), job-34's normalized run
+# (0.78 snapshot, 0.6720 full-test), job-22's (0.72 snapshot, 0.6830
+# full-test), and job-13's independent-training baseline (0.80 snapshot,
+# 0.7477 full-test).
