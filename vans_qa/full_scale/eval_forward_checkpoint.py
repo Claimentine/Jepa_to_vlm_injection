@@ -100,6 +100,10 @@ def main():
     ap.add_argument("--layer_strategy", default="middle4", choices=["middle4", "last4", "uniform4", "all"])
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out_path", default=None)
+    ap.add_argument("--limit", type=int, default=None,
+                     help="cap on the number of items evaluated per checkpoint -- for a quick "
+                          "smoke check (e.g. validating a change to evaluate_logprob's decode "
+                          "pipeline) before committing to a full multi-thousand-item run")
     args = ap.parse_args()
 
     checkpoints = []
@@ -116,6 +120,9 @@ def main():
     items = [it for it in split[args.split_part] if fwd.has_features(it)]
     print(f"[INFO] {args.split_part} split: {len(items)} usable items "
           f"(of {len(split[args.split_part])} total)", flush=True)
+    if args.limit:
+        items = items[: args.limit]
+        print(f"[INFO] --limit {args.limit}: evaluating {len(items)} items", flush=True)
 
     print(f"[INFO] loading {fwd.MODEL_ID} (frozen) ...", flush=True)
     model = AutoModelForImageTextToText.from_pretrained(fwd.MODEL_ID, dtype="auto").to(device)

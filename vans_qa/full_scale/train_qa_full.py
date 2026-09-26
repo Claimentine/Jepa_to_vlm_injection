@@ -201,28 +201,67 @@ def _decode_video_worker(conn, abs_path, requested_frames, prompt_text):
         conn.close()
 
 
-def build_inputs(processor, in_clip_path, prompt_text, max_frames=32):
-    abs_path = os.path.abspath(in_clip_path)
+class DecodeHandle:
+    """A video decode started via start_decode() but not yet waited on --
+    see start_decode()'s own docstring for why splitting build_inputs() into
+    start/finish halves exists at all (prefetch pipelining)."""
+    __slots__ = ("proc", "parent_conn", "abs_path", "prompt_text")
 
+    def __init__(self, proc, parent_conn, abs_path, prompt_text):
+        self.proc = proc
+        self.parent_conn = parent_conn
+        self.abs_path = abs_path
+        self.prompt_text = prompt_text
+
+
+def start_decode(in_clip_path, prompt_text, max_frames=32):
+    """Spawns _decode_video_worker (see its own docstring for why it's a
+    separate process) and returns immediately without waiting for it --
+    call finish_decode() on the returned handle when the result is actually
+    needed. Splitting the spawn from the wait lets a caller start the NEXT
+    item's decode (CPU/ffmpeg-bound, and per this project's own analysis
+    likely dominated by spawn's fresh-interpreter + reimport cost even more
+    than the decode itself) while the GPU still has the CURRENT item's
+    forward pass in flight, instead of paying for decode serially in between
+    every GPU call -- confirmed via live nvidia-smi sampling on a
+    TempCompass eval run that the old fully-serial build_inputs() call left
+    the GPU at ~15% average utilization (sub-second bursts to 90%+, long
+    idle stretches in between). evaluate_logprob() is the one caller that
+    actually pipelines this way; every other build_inputs() call site in
+    this codebase stays synchronous (start_decode immediately followed by
+    finish_decode), unaffected.
+    """
+    abs_path = os.path.abspath(in_clip_path)
     parent_conn, child_conn = _MP_CTX.Pipe(duplex=False)
     proc = _MP_CTX.Process(target=_decode_video_worker, args=(child_conn, abs_path, max_frames, prompt_text))
     proc.start()
     child_conn.close()  # parent's copy of the write end; child still holds its own
-    if parent_conn.poll(DECODE_TIMEOUT_S):
-        status, payload = parent_conn.recv()
+    return DecodeHandle(proc, parent_conn, abs_path, prompt_text)
+
+
+def finish_decode(handle):
+    """Blocks until the decode started by start_decode() finishes (or times
+    out), and returns the raw (nframes, images, videos, video_metadatas,
+    video_kwargs) tuple -- pass this to build_inputs_from_decoded() to get
+    the actual model inputs."""
+    if handle.parent_conn.poll(DECODE_TIMEOUT_S):
+        status, payload = handle.parent_conn.recv()
     else:
         status, payload = "timeout", None
-    parent_conn.close()
-    proc.join(5)
-    if proc.is_alive():
-        proc.terminate()
-        proc.join()
+    handle.parent_conn.close()
+    handle.proc.join(5)
+    if handle.proc.is_alive():
+        handle.proc.terminate()
+        handle.proc.join()
     if status == "timeout":
-        raise TimeoutError(f"video decode exceeded {DECODE_TIMEOUT_S}s on {in_clip_path}")
+        raise TimeoutError(f"video decode exceeded {DECODE_TIMEOUT_S}s on {handle.abs_path}")
     if status == "err":
         raise payload
-    nframes, images, videos, video_metadatas, video_kwargs = _from_ipc_safe(payload)
+    return _from_ipc_safe(payload)
 
+
+def build_inputs_from_decoded(processor, abs_path, prompt_text, decoded):
+    nframes, images, videos, video_metadatas, video_kwargs = decoded
     # Rebuilt here (not sent back through the pipe) since it's cheap and pure
     # text -- no need to serialize it across the process boundary twice.
     video_content = {
@@ -236,6 +275,12 @@ def build_inputs(processor, in_clip_path, prompt_text, max_frames=32):
         return_tensors="pt", do_resize=False, **(video_kwargs or {}),
     )
     return inputs
+
+
+def build_inputs(processor, in_clip_path, prompt_text, max_frames=32):
+    handle = start_decode(in_clip_path, prompt_text, max_frames)
+    decoded = finish_decode(handle)
+    return build_inputs_from_decoded(processor, handle.abs_path, prompt_text, decoded)
 
 
 def append_answer_tokens(tokenizer, input_ids, attention_mask, letter):
@@ -318,6 +363,23 @@ class AccTally:
         return s
 
 
+def _start_item_decode(item, rng):
+    """Prepares one item's prompt/option text and kicks off its video decode
+    without waiting -- see start_decode()'s docstring for why. Errors here
+    (e.g. malformed question/caption fields) are captured rather than
+    raised, so a failure preparing item i+1 (kicked off during item i's
+    turn) is correctly attributed to item i+1 once its own turn comes,
+    instead of surfacing under whichever item happened to be current when
+    the lookahead call ran."""
+    try:
+        option_lines, correct_letter = build_option_block(item, rng)
+        prompt_text = build_prompt_text(item["question"], option_lines)
+        handle = start_decode(item["in_clip"], prompt_text)
+        return True, (option_lines, correct_letter, prompt_text, handle)
+    except Exception as e:
+        return False, e
+
+
 def evaluate_logprob(model, processor, hook, injector, items, injection_site, n_tokens, placeholder_id, device, rng):
     model.eval()
     # Without this, JepaPoolerTemporal's internal attention dropout (p=0.1)
@@ -326,13 +388,23 @@ def evaluate_logprob(model, processor, hook, injector, items, injection_site, n_
     injector.eval()
     tally = AccTally()
     seen_exc_types = set()
+    # Look-ahead-1 pipeline: item i+1's decode (spawned as its own process --
+    # see _decode_video_worker's docstring) is kicked off before item i's GPU
+    # forward pass runs, so the CPU/ffmpeg-bound wait overlaps with GPU
+    # compute instead of happening serially in between every item. See
+    # start_decode()'s docstring for the measurement that motivated this.
+    pending = None
     with torch.no_grad():
-        for item in items:
+        for idx, item in enumerate(items):
+            cur_ok, cur_payload = pending if pending is not None else _start_item_decode(item, rng)
+            pending = _start_item_decode(items[idx + 1], rng) if idx + 1 < len(items) else None
             try:
+                if not cur_ok:
+                    raise cur_payload
+                option_lines, correct_letter, prompt_text, handle = cur_payload
                 feats_np = load_vjepa_in_feats(item["in_clip"])
-                option_lines, correct_letter = build_option_block(item, rng)
-                prompt_text = build_prompt_text(item["question"], option_lines)
-                inputs = build_inputs(processor, item["in_clip"], prompt_text)
+                decoded = finish_decode(handle)
+                inputs = build_inputs_from_decoded(processor, handle.abs_path, prompt_text, decoded)
                 model_inputs = prepare_model_inputs(inputs, injection_site, n_tokens, placeholder_id)
                 model_inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in model_inputs.items()}
 
