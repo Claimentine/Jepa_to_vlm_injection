@@ -79,6 +79,10 @@ spec:
                       - nautilus-ext-gpu01.fullerton.edu
                       - k8s-chase-ci-02.calit2.optiputer.net
                       - ry-gpu-15.sdsc.optiputer.net
+                      # Excluded 2026-09-26: both retry attempts landed here
+                      # and failed with "No devices were found" (GPU device
+                      # plugin broken on this node).
+                      - hcc-nrp-shor-c5809.unl.edu
       containers:
         - name: train-bridge-capacity
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
