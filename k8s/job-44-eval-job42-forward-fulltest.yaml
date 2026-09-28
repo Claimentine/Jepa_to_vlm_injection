@@ -1,8 +1,7 @@
-# Step 44: full-test-set eval for job-42's bridge-capacity checkpoint, plus
-# job-36's checkpoint (job-38 was cancelled before ever running, so job-36's
-# real full-test number was never obtained -- getting it here alongside
-# job-42 completes the whole ablation chain in one job) and job-13/22/34 for
-# a complete 5-way comparison table.
+# Step 44: full-test-set eval for job-42's bridge-capacity checkpoint ONLY --
+# job-13/22/34/36 have already been evaluated on the full test set multiple
+# times (job-32/37/41), so skipping them here to save time (one checkpoint
+# vs five means ~1/5th the wall-clock for this run).
 #
 # Why this matters: job-42's own 100-item training snapshot
 # (best_fwd_val_acc=0.83) is a big jump over job-36's snapshot (0.6) with
@@ -77,10 +76,6 @@ spec:
 
               cd "$REPO"
               exec "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
-                --checkpoint "job13_independent=/data/raw_data/qa_full_runs_temporal_crossattn/jepa/best.pt" \
-                --checkpoint "job22_joint_vans_only=/data/raw_data/joint_coupled_runs/best_forward.pt" \
-                --checkpoint "job34_joint_normalized=/data/raw_data/joint_coupled_normalized_runs/best_forward.pt" \
-                --checkpoint "job36_joint_cycle0=/data/raw_data/joint_coupled_cycle0_runs/best_forward.pt" \
                 --checkpoint "job42_bridge_mlp2048=/data/raw_data/joint_coupled_bridge_mlp_runs/best_forward.pt" \
                 --split_part test \
                 --out_path /data/raw_data/forward_fulltest_comparison_job42.json
