@@ -1,0 +1,151 @@
+# Step 45: out-of-domain generalization eval (TempCompass, see job-40's
+# header for what it is) for job-42's bridge-capacity checkpoint ONLY --
+# job-13/22/34/36 already have TempCompass numbers from job-41, so skipping
+# them here to save time (one checkpoint vs four means ~1/4 the wall-clock).
+#
+# job-42 (bridge_hidden_dim=2048, cycle_loss_weight=0 isolated-gradient
+# setting) scored much higher than job-36 (single-Linear bridge, same
+# isolated-gradient setting) on COIN's own 100-item snapshot (0.83 vs 0.6).
+# job-41's TempCompass results already showed the in-domain/out-of-domain
+# pattern can diverge sharply for these checkpoints (job-22: 0.6830 COIN vs
+# 0.5665 TempCompass -- worse OOD; job-34: 0.6720 COIN vs 0.7031 TempCompass
+# -- BETTER OOD), so job-42's true domain-generalization behavior needs its
+# own number, not an assumption from its COIN result.
+#
+# Requires job-40 to have completed first (TempCompass data/features
+# already on the PVC from job-41's earlier run -- no re-extraction needed).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-eval-job42-tempcompass
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+                      - k8s-haosu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5909.unl.edu
+                      - hcc-nrp-shor-c5925.unl.edu
+                      - hpc-nrp-g1.nmsu.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - k8s-chase-ci-02.calit2.optiputer.net
+                      - ry-gpu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5809.unl.edu
+      containers:
+        - name: eval-job42-tempcompass
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_tempcompass.json \
+                --split_part test \
+                --checkpoint "job42_bridge_mlp2048=/data/raw_data/joint_coupled_bridge_mlp_runs/best_forward.pt" \
+                --out_path /data/raw_data/tempcompass_forward_comparison_job42.json
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work_tempcompass
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "19200Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-45-eval-job42-tempcompass.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-eval-job42-tempcompass -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-eval-job42-tempcompass -n williamli-scvl
