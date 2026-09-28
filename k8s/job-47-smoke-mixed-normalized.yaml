@@ -1,11 +1,14 @@
 # Step 47 smoke test: train_joint_coupled_mixed_normalized.py, which ports
 # job-30's COIN long-axis reverse-direction mixing into job-34's DDP +
-# EMA-loss-normalization infrastructure. Every flag left at job-34's own
-# defaults (normalization on, cycle_loss_weight=0.1, bridge_hidden_dim
-# unset -- original single-Linear bridge) except the reverse pool now
-# combines VANS + COIN pairs instead of VANS alone -- see the script's own
-# docstring for why (job-30's null result may reflect its broken
-# un-normalized baseline, not COIN data being unhelpful).
+# EMA-loss-normalization infrastructure. Per the user's explicit call
+# (2026-09-27): combines COIN mixing with job-42's bridge capacity
+# (--bridge_hidden_dim 2048) WITH normalization kept on (cycle_loss_weight
+# stays at job-34's default 0.1, --disable_norm NOT passed) -- job-42 alone
+# (bridge capacity, but un-normalized/isolated-gradient like job-36) showed
+# a large snapshot-to-full-test gap (0.83->0.6629), and normalization is the
+# one change in this whole ablation chain that's actually improved full-test
+# numbers so far, so this stacks bridge capacity on top of the proven fix
+# rather than repeating job-42's un-normalized recipe.
 #
 # Smoke test (small --max_train_items cap) before a full run, same
 # discipline as job-08/14/31/33/35/39 -- this is genuinely new code
@@ -84,6 +87,7 @@ spec:
                 vans_qa/full_scale/train_joint_coupled_mixed_normalized.py \
                 --qa_split /data/raw_data/qa_split_temporal.json \
                 --coin_cache_dir /data/raw_data/coin_longaxis \
+                --bridge_hidden_dim 2048 \
                 --epochs 1 \
                 --max_train_items 40 \
                 --val_every_steps 10 \
@@ -103,6 +107,8 @@ spec:
               value: "1"
             - name: FORCE_QWENVL_VIDEO_READER
               value: decord
+            - name: PYTORCH_ALLOC_CONF
+              value: expandable_segments:True
           resources:
             requests:
               cpu: "10"
