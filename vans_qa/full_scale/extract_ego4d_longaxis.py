@@ -393,7 +393,16 @@ def main():
                 skipped_count += 1
                 print(f"[SKIP {i}/{len(pairs)}] valid {output_path}", flush=True)
                 continue
-            video_path = video_cache_root / "full_scale" / f"{video_uid}.mp4"
+            # Confirmed 2026-09-29 via a live single-video download: the ego4d
+            # CLI nests an extra version directory ("v2" for the current
+            # dataset version) between -o's output dir and the dataset name --
+            # actual path is <output_dir>/v2/full_scale/<uid>.mp4, not
+            # <output_dir>/full_scale/<uid>.mp4 as the CLI's own --help text
+            # example ("output_dir/full_scale/") implies. job-50's first full
+            # run got 0/546 saved from this exact mismatch (every download
+            # "succeeded" per the CLI's exit code, but the file was never
+            # found at the wrong assumed path).
+            video_path = video_cache_root / "v2" / "full_scale" / f"{video_uid}.mp4"
             try:
                 if not video_path.exists():
                     download_video(video_uid, video_cache_root)
