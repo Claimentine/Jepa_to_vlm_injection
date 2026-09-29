@@ -1,0 +1,191 @@
+# Step 53: full-scale run of extract_ego4d_longaxis.py's narration.json
+# path -- validated by job-51's smoke test (2026-09-29: --limit 20,
+# 20/20 saved, 0 failed). Covers narration.json's full 9,611 videos,
+# comparable in scale to VANS's own reverse pool (~8253 items) -- unlike
+# job-50's goalstep-only run (583 videos, too small a fraction of the
+# combined reverse pool to move the needle either way).
+#
+# Per the user's explicit call (2026-09-29): proceed at full scale now,
+# expand the PVC if storage runs low, clean up redundant data (e.g.
+# past_imgs/target_imgs, raw MVBench videos) only after everything is
+# downloaded -- not optimized preemptively. PVC headroom at submit time:
+# 595GB free of 2TiB (71% used); narration.json full scale estimated at
+# ~221GB (9611 videos x ~23MB/npz, from job-51's own 20-file sample).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-ego4d-narration-full
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+                      - k8s-haosu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5909.unl.edu
+                      - hcc-nrp-shor-c5925.unl.edu
+                      - hpc-nrp-g1.nmsu.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - k8s-chase-ci-02.calit2.optiputer.net
+                      - ry-gpu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5809.unl.edu
+                      - hcc-chase-shor-c4715.unl.edu
+      containers:
+        - name: ego4d-narration-full
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet ego4d
+              export PATH="$(dirname "$PY"):$PATH"
+
+              mkdir -p ~/.aws
+              cat > ~/.aws/credentials <<CREDS
+              [default]
+              aws_access_key_id = ${AWS_ACCESS_KEY_ID}
+              aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}
+              CREDS
+              cat > ~/.aws/config <<CFG
+              [default]
+              region = us-west-1
+              CFG
+
+              mkdir -p /data/raw_data/ego4d_annotations
+              echo "=== fetching narration.json (reuses cache if already pulled) ==="
+              "$PY" -m ego4d.cli.cli -o /data/raw_data/ego4d_annotations \
+                --datasets annotations --annotations narration -y \
+                >/tmp/ego4d_annotations_dl.log 2>&1
+              tail -5 /tmp/ego4d_annotations_dl.log
+              NARRATION=$(find /data/raw_data/ego4d_annotations -iname "narration.json" | head -1)
+              echo "narration file: $NARRATION"
+
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/extract_ego4d_longaxis.py \
+                --annotation_source narration \
+                --narration_json "$NARRATION" \
+                --window_seconds 8.0 \
+                --min_span_seconds 30 \
+                --output_dir /data/raw_data/ego4d_longaxis_narration \
+                --video_cache_dir /data/vans_work/ego4d_raw_videos_narration
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: VJEPA2_CKPT
+              value: /data/checkpoints/vjepa2/vitl.pt
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: aws_access_key_id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: aws_secret_access_key
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              ephemeral-storage: "15Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "19200Mi"
+              ephemeral-storage: "18Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-53-ego4d-narration-full.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-ego4d-narration-full -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-ego4d-narration-full -n williamli-scvl
+#
+# Output: /data/raw_data/ego4d_longaxis_narration/<video_uid>.npz
+# (up to 9611, fewer after min_span_seconds/min_steps filtering and any
+# download/decode failures)
+#
+# If PVC storage runs low mid-run:
+#   kubectl patch pvc jepa-vlm-injection-data-vol -n williamli-scvl \
+#     -p '{"spec":{"resources":{"requests":{"storage":"<new size>"}}}}'
+#   (rook-cephfs storage class supports online expansion)
