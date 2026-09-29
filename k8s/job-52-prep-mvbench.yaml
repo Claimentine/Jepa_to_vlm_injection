@@ -1,0 +1,200 @@
+# Step 52: out-of-domain generalization data prep for MVBench (see
+# vans_qa/full_scale/build_mvbench_qa_split.py's own docstring for what it
+# is and why) -- same purpose as job-40 (TempCompass), a second, broader-
+# coverage out-of-domain benchmark (4,000 QA items across 20 temporal-
+# reasoning categories, sourced from 11 different video datasets).
+#
+# Downloads MVBench's 20 category JSON files + 11 video zips (~17.3GB
+# total; the NTU RGB+D reference list is skipped -- those ~320 items need
+# separate manual access per MVBench's own dataset card, and
+# build_mvbench_qa_split.py already skips any item whose video file isn't
+# found), extracts all zips into one flat video directory, builds the QA
+# split, then extracts V-JEPA2 features for whichever clips the split
+# actually references.
+#
+# Uses a SEPARATE work root (/data/vans_work_mvbench, not /data/vans_work),
+# same reasoning as job-40: never touch the COIN clips/cache backing every
+# other job.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-prep-mvbench
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+                      - k8s-haosu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5909.unl.edu
+                      - hcc-nrp-shor-c5925.unl.edu
+                      - hpc-nrp-g1.nmsu.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - k8s-chase-ci-02.calit2.optiputer.net
+                      - ry-gpu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5809.unl.edu
+                      - hcc-chase-shor-c4715.unl.edu
+      containers:
+        - name: prep-mvbench
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/thinkjepa/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              mkdir -p "$VANS_WORK_ROOT/clips/mvbench/video"
+              mkdir -p /data/raw_data/mvbench_json
+
+              echo "=== fetching 20 category JSON files ==="
+              for name in action_antonym action_count action_localization action_prediction \
+                          action_sequence character_order counterfactual_inference \
+                          egocentric_navigation episodic_reasoning fine_grained_action \
+                          fine_grained_pose moving_attribute moving_count moving_direction \
+                          object_existence object_interaction object_shuffle scene_transition \
+                          state_change unexpected_action; do
+                out="/data/raw_data/mvbench_json/${name}.json"
+                if [ -f "$out" ]; then
+                  echo "[skip] $name.json already present"
+                else
+                  curl -sL -o "$out" \
+                    "https://huggingface.co/datasets/OpenGVLab/MVBench/resolve/main/json/${name}.json"
+                fi
+              done
+              echo "[done] $(ls /data/raw_data/mvbench_json | wc -l) json files"
+
+              echo "=== fetching + extracting 11 video zips (~17.3GB total) ==="
+              VIDEO_DIR="$VANS_WORK_ROOT/clips/mvbench/video"
+              for zipname in FunQA_test.zip Moments_in_Time_Raw.zip clevrer.zip data0613.zip \
+                             perception.zip scene_qa.zip ssv2_video.zip sta.zip star.zip \
+                             tvqa.zip vlnqa.zip; do
+                marker="$VIDEO_DIR/.extracted_${zipname}"
+                if [ -f "$marker" ]; then
+                  echo "[skip] $zipname already extracted"
+                  continue
+                fi
+                echo "[fetch] $zipname ..."
+                curl -sL -o "/tmp/${zipname}" \
+                  "https://huggingface.co/datasets/OpenGVLab/MVBench/resolve/main/video/${zipname}"
+                python3 -c "
+              import zipfile
+              with zipfile.ZipFile('/tmp/${zipname}') as z:
+                  z.extractall('$VIDEO_DIR')
+              "
+                rm -f "/tmp/${zipname}"
+                touch "$marker"
+                echo "[done] extracted $zipname"
+              done
+              echo "[info] total video files: $(find "$VIDEO_DIR" -type f | wc -l)"
+
+              cd "$REPO"
+              "$PY" vans_qa/full_scale/build_mvbench_qa_split.py \
+                --json_dir /data/raw_data/mvbench_json \
+                --video_root "$VIDEO_DIR" \
+                --out_path /data/raw_data/qa_split_mvbench.json
+
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              exec "$PY" vans_qa/full_scale/extract_vjepa_features_full.py \
+                --qa_split /data/raw_data/qa_split_mvbench.json
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work_mvbench
+            - name: VJEPA2_CKPT
+              value: /data/checkpoints/vjepa2/vitl.pt
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "6"
+              memory: "16Gi"
+              ephemeral-storage: "15Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "7.2"
+              memory: "19200Mi"
+              ephemeral-storage: "18Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-52-prep-mvbench.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-prep-mvbench -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-prep-mvbench -n williamli-scvl
+#
+# Output: /data/raw_data/qa_split_mvbench.json, /data/vans_work_mvbench/vjepa_cache_full/*.npz
