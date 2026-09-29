@@ -1,0 +1,197 @@
+# Step 50: full-scale run of vans_qa/full_scale/extract_ego4d_longaxis.py --
+# builds Ego4D GoalStep-derived (past, future) V-JEPA2 feature pairs, a
+# third reverse-direction long-axis data source alongside VANS and COIN
+# (extract_coin_longaxis.py). Per the user's explicit call: full 583-video
+# GoalStep pool in one go, no smoke test first (script closely mirrors
+# extract_coin_longaxis.py's already-validated pipeline -- only the
+# annotation source and download mechanism differ; window extraction,
+# V-JEPA2 encoding, and the output npz schema are unchanged).
+#
+# AWS credentials come from the ego4d-aws-credentials Secret (created via
+# `kubectl create secret generic ego4d-aws-credentials ...` directly against
+# the cluster, NEVER written into this file -- this repo's k8s/ directory is
+# pushed to a public GitHub remote on every commit). Namespace is shared
+# with other users (williamli-scvl); per the user's explicit 2026-09-28
+# call, the in-cluster exposure risk of a Secret in this namespace is
+# accepted (still strictly safer than a literal key in a committed YAML,
+# which would also leak publicly on GitHub).
+#
+# Downloads goalstep_train.json fresh via the ego4d CLI first (not
+# persisted anywhere from the earlier exploration -- that was a throwaway
+# diagnostic pod), then runs the full extraction with no --limit.
+#
+# Output dir /data/raw_data/ego4d_longaxis -- deliberately parallel to
+# /data/raw_data/coin_longaxis's own naming, so a future
+# train_joint_coupled_mixed_normalized.py-style script can add a third
+# "ego4d" source the same way "coin" was added alongside "vans".
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-ego4d-longaxis-full
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+                      - k8s-haosu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5909.unl.edu
+                      - hcc-nrp-shor-c5925.unl.edu
+                      - hpc-nrp-g1.nmsu.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - k8s-chase-ci-02.calit2.optiputer.net
+                      - ry-gpu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5809.unl.edu
+                      - hcc-chase-shor-c4715.unl.edu
+      containers:
+        - name: ego4d-longaxis-full
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet ego4d
+              export PATH="$(dirname "$PY"):$PATH"
+
+              mkdir -p ~/.aws
+              cat > ~/.aws/credentials <<CREDS
+              [default]
+              aws_access_key_id = ${AWS_ACCESS_KEY_ID}
+              aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}
+              CREDS
+              cat > ~/.aws/config <<CFG
+              [default]
+              region = us-west-1
+              CFG
+
+              mkdir -p /data/raw_data/ego4d_annotations
+              echo "=== fetching goalstep_train.json ==="
+              "$PY" -m ego4d.cli.cli -o /data/raw_data/ego4d_annotations \
+                --datasets annotations --annotations narration -y \
+                >/tmp/ego4d_annotations_dl.log 2>&1
+              tail -5 /tmp/ego4d_annotations_dl.log
+              find /data/raw_data/ego4d_annotations -iname "goalstep_train.json"
+
+              cd "$REPO"
+              GOALSTEP=$(find /data/raw_data/ego4d_annotations -iname "goalstep_train.json" | head -1)
+              exec "$PY" vans_qa/full_scale/extract_ego4d_longaxis.py \
+                --goalstep_json "$GOALSTEP" \
+                --min_span_seconds 30 \
+                --output_dir /data/raw_data/ego4d_longaxis \
+                --video_cache_dir /data/vans_work/ego4d_raw_videos
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: VJEPA2_CKPT
+              value: /data/checkpoints/vjepa2/vitl.pt
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: aws_access_key_id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: aws_secret_access_key
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              ephemeral-storage: "15Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "19200Mi"
+              ephemeral-storage: "18Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-50-ego4d-longaxis-full.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-ego4d-longaxis-full -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-ego4d-longaxis-full -n williamli-scvl
+#
+# Output: /data/raw_data/ego4d_longaxis/<video_uid>.npz (up to 583, fewer
+# after min_span_seconds/min_steps filtering and any download/decode
+# failures)
