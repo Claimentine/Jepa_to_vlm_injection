@@ -7,13 +7,34 @@ spans). Mirrors extract_coin_longaxis.py closely; see that script for the
 fuller rationale behind this general approach (real V-JEPA2 self-supervised
 pairs, no VLM guidance, output schema deliberately has no vlm_old/vlm_new).
 
-Why GoalStep, not narration.json: GoalStep's schema (per-video list of
-`segments`, each with `start_time`/`end_time`/`step_description`) is
-structurally the same shape as COIN.json's per-video step annotations --
-select_longaxis_pairs() below is copied over almost unchanged (first/last
-top-level step segment as past/future, span = last.end - first.start).
-narration.json instead gives point timestamps with no inherent window, and
-would need an arbitrary window-width choice invented from scratch.
+Two annotation sources, chosen via --annotation_source:
+
+  goalstep (default): GoalStep's schema (per-video list of `segments`, each
+    with `start_time`/`end_time`/`step_description`) is structurally the
+    same shape as COIN.json's per-video step annotations --
+    select_longaxis_pairs_goalstep() is copied over almost unchanged from
+    extract_coin_longaxis.py's own select_longaxis_pairs() (first/last
+    top-level step segment as past/future, span = last.end - first.start).
+    Only 583 videos total (job-50's full run), and mixed into a reverse
+    pool already dominated by VANS (~8253 items) this would only ever
+    supply a few percent of any given training step's draws -- too dilute
+    to move the needle either way regardless of whether Ego4D data is
+    genuinely useful.
+
+  narration: narration.json covers 9,611 videos -- comparable in scale to
+    VANS's own reverse pool, giving real statistical weight if job-50's
+    small goalstep-only run comes back inconclusive. Its narrations are
+    POINT timestamps (dense per-video "#C C walks into the kitchen"-style
+    captions), not [start,end] segments, so there's no inherent window the
+    way GoalStep/COIN's own step boundaries provide one directly.
+    select_longaxis_pairs_narration() picks the first and last narrated
+    timestamp per video as the past/future ANCHORS (mirroring GoalStep's
+    own "first/last annotated point = widest span this video supports"
+    choice, for consistency), then builds a fixed-width window
+    (--window_seconds, centered on each anchor, clamped to video bounds)
+    around each -- unlike GoalStep/COIN, this project has no prior
+    precedent for a narration-point window width, so this parameter is a
+    genuinely new judgment call, not a carried-over convention.
 
 Why Ego4D CLI, not yt-dlp: Ego4D videos are NOT on YouTube -- they're
 licensed footage served from a private S3 bucket
@@ -79,11 +100,13 @@ def load_goalstep_annotations(goalstep_json_path):
     return data["videos"]
 
 
-def select_longaxis_pairs(videos, min_span_seconds, min_steps, limit=None):
+def select_longaxis_pairs_goalstep(videos, min_span_seconds, min_steps, limit=None):
     """One (past_step, future_step) candidate per video: the first and last
     TOP-LEVEL step segment by start time (not recursing into GoalStep's own
     nested sub-segments) -- the widest span this video's step annotations
-    support, matching extract_coin_longaxis.py's own selection logic.
+    support, matching extract_coin_longaxis.py's own selection logic. Each
+    pair already carries real [start,end] segments, so past_segment/
+    future_segment are used as-is by extract_window_frames().
     """
     pairs = []
     for video in videos:
@@ -104,6 +127,54 @@ def select_longaxis_pairs(videos, min_span_seconds, min_steps, limit=None):
             "future_segment": [future_step["start_time"], future_step["end_time"]],
             "future_label": future_step.get("step_description") or future_step.get("step_category"),
             "n_steps": len(segs_sorted),
+        })
+    pairs.sort(key=lambda p: p["video_uid"])
+    if limit:
+        pairs = pairs[:limit]
+    return pairs
+
+
+def load_narration_annotations(narration_json_path):
+    with open(narration_json_path) as f:
+        return json.load(f)
+
+
+def select_longaxis_pairs_narration(narration_data, min_span_seconds, min_steps, window_seconds, limit=None):
+    """One (past_narration, future_narration) candidate per video: the
+    first and last narrated timestamp (across narration_pass_1, falling
+    back to narration_pass_2 if pass_1 is missing/too sparse for this
+    video) -- mirrors GoalStep/COIN's own "first/last annotated point =
+    widest span this video supports" choice, for consistency, even though
+    narrations are point events rather than pre-existing [start,end] spans.
+    Builds a --window_seconds-wide window centered on each anchor
+    (clamped to [0, span between the two anchors] so the past/future
+    windows never overlap each other even when window_seconds is large
+    relative to span_seconds) so past_segment/future_segment come out in
+    the same [start,end] shape select_longaxis_pairs_goalstep() produces --
+    everything downstream of pair selection is annotation-source-agnostic.
+    """
+    pairs = []
+    for video_uid, entry in narration_data.items():
+        narrations = ((entry.get("narration_pass_1") or {}).get("narrations")
+                      or (entry.get("narration_pass_2") or {}).get("narrations") or [])
+        if len(narrations) < min_steps:
+            continue
+        narr_sorted = sorted(narrations, key=lambda n: n["timestamp_sec"])
+        past_n, future_n = narr_sorted[0], narr_sorted[-1]
+        span = future_n["timestamp_sec"] - past_n["timestamp_sec"]
+        if span < min_span_seconds:
+            continue
+        half_w = min(window_seconds / 2.0, span / 2.0)
+        past_t, future_t = past_n["timestamp_sec"], future_n["timestamp_sec"]
+        pairs.append({
+            "video_uid": video_uid,
+            "goal_category": None,
+            "span_seconds": span,
+            "past_segment": [max(0.0, past_t - half_w), past_t + half_w],
+            "past_label": past_n["narration_text"],
+            "future_segment": [future_t - half_w, future_t + half_w],
+            "future_label": future_n["narration_text"],
+            "n_steps": len(narr_sorted),
         })
     pairs.sort(key=lambda p: p["video_uid"])
     if limit:
@@ -255,7 +326,14 @@ def atomic_write_npz(output_path, payload):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--goalstep_json", required=True, help="path to goalstep_train.json")
+    ap.add_argument("--annotation_source", choices=["goalstep", "narration"], default="goalstep")
+    ap.add_argument("--goalstep_json", default=None, help="path to goalstep_train.json (--annotation_source goalstep)")
+    ap.add_argument("--narration_json", default=None, help="path to narration.json (--annotation_source narration)")
+    ap.add_argument("--window_seconds", type=float, default=8.0,
+                     help="narration source only: width of the extraction window centered on each "
+                          "chosen narration timestamp (narrations are point events, unlike "
+                          "GoalStep/COIN's own [start,end] step segments) -- no prior convention "
+                          "in this project to match, chosen as a plausible short-clip width")
     ap.add_argument("--output_dir", default=os.path.join(WORK_BASE, "ego4d_longaxis_cache"))
     ap.add_argument("--video_cache_dir", default=os.path.join(WORK_BASE, "ego4d_raw_videos"),
                      help="downloaded whole videos are kept here (not deleted) so a re-run "
@@ -266,6 +344,10 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="cap number of pairs (smoke test)")
     ap.add_argument("--save_dtype", choices=["fp16", "fp32"], default="fp16")
     args = ap.parse_args()
+    if args.annotation_source == "goalstep" and not args.goalstep_json:
+        ap.error("--goalstep_json is required for --annotation_source goalstep")
+    if args.annotation_source == "narration" and not args.narration_json:
+        ap.error("--narration_json is required for --annotation_source narration")
 
     write_aws_credentials()
 
@@ -281,11 +363,20 @@ def main():
     video_cache_root = Path(args.video_cache_dir)
     video_cache_root.mkdir(parents=True, exist_ok=True)
 
-    videos = load_goalstep_annotations(args.goalstep_json)
-    pairs = select_longaxis_pairs(videos, args.min_span_seconds, args.min_steps, args.limit)
-    print(f"[INFO] {len(pairs)} candidate long-axis pairs "
-          f"(min_span_seconds={args.min_span_seconds}, min_steps={args.min_steps}) "
-          f"out of {len(videos)} GoalStep videos", flush=True)
+    if args.annotation_source == "goalstep":
+        videos = load_goalstep_annotations(args.goalstep_json)
+        pairs = select_longaxis_pairs_goalstep(videos, args.min_span_seconds, args.min_steps, args.limit)
+        print(f"[INFO] {len(pairs)} candidate long-axis pairs "
+              f"(min_span_seconds={args.min_span_seconds}, min_steps={args.min_steps}) "
+              f"out of {len(videos)} GoalStep videos", flush=True)
+    else:
+        narration_data = load_narration_annotations(args.narration_json)
+        pairs = select_longaxis_pairs_narration(
+            narration_data, args.min_span_seconds, args.min_steps, args.window_seconds, args.limit,
+        )
+        print(f"[INFO] {len(pairs)} candidate long-axis pairs "
+              f"(min_span_seconds={args.min_span_seconds}, min_steps={args.min_steps}, "
+              f"window_seconds={args.window_seconds}) out of {len(narration_data)} narrated videos", flush=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] loading V-JEPA2 checkpoint {args.vjepa_checkpoint} ...", flush=True)
@@ -323,6 +414,7 @@ def main():
 
                 payload = {
                     "schema_name": np.asarray("ego4d_longaxis_v1_no_guidance"),
+                    "annotation_source": np.asarray(args.annotation_source),
                     "video_uid": np.asarray(video_uid),
                     "goal_category": np.asarray(pair["goal_category"] or ""),
                     "span_seconds": np.asarray(pair["span_seconds"], dtype=np.float64),
