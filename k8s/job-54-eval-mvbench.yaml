@@ -52,6 +52,7 @@ spec:
                       - hpc-nrp-g1.nmsu.edu
                       - nautilus-ext-gpu01.fullerton.edu
                       - k8s-chase-ci-02.calit2.optiputer.net
+                      - ry-gpu-09.sdsc.optiputer.net
                       - ry-gpu-15.sdsc.optiputer.net
                       - hcc-nrp-shor-c5809.unl.edu
                       - hcc-chase-shor-c4715.unl.edu
