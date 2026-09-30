@@ -104,6 +104,11 @@ def main():
                      help="cap on the number of items evaluated per checkpoint -- for a quick "
                           "smoke check (e.g. validating a change to evaluate_logprob's decode "
                           "pipeline) before committing to a full multi-thousand-item run")
+    ap.add_argument("--precompute_cache_dir", default=None,
+                     help="directory of build_eval_input_cache.py output -- if given, "
+                          "evaluate_logprob loads each item's already-decoded-and-processed "
+                          "model inputs from here instead of doing that CPU-bound work live, "
+                          "falling back to live building on any per-item cache miss")
     args = ap.parse_args()
 
     checkpoints = []
@@ -147,6 +152,7 @@ def main():
             rng = random.Random(args.seed)
             tally = fwd.evaluate_logprob(
                 model, processor, hook, injector, items, "cross_attn", n_tokens, placeholder_id, device, rng,
+                precompute_cache_dir=args.precompute_cache_dir,
             )
         finally:
             hook.remove()

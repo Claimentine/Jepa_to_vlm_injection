@@ -278,6 +278,41 @@ def build_inputs_from_decoded(processor, abs_path, prompt_text, decoded):
     return inputs
 
 
+def precomputed_input_path(cache_dir, pid):
+    return os.path.join(cache_dir, f"{pid}.pt")
+
+
+def save_precomputed_inputs(cache_dir, pid, inputs, correct_letter):
+    """Persists one item's already-decoded-and-processed model inputs (the
+    output of build_inputs/build_inputs_from_decoded) plus its correct_letter
+    -- see build_eval_input_cache.py's own docstring for why this exists
+    (splitting the CPU-bound decode+processor work from the GPU-bound
+    compute into separate jobs/processes). Atomic write (temp file + rename)
+    so a killed prebuild pod never leaves a half-written cache entry that a
+    later load would trust."""
+    os.makedirs(cache_dir, exist_ok=True)
+    out_path = precomputed_input_path(cache_dir, pid)
+    tmp_path = out_path + f".tmp{os.getpid()}"
+    torch.save({"inputs": dict(inputs), "correct_letter": correct_letter}, tmp_path)
+    os.replace(tmp_path, out_path)
+
+
+def load_precomputed_inputs(cache_dir, pid):
+    """Returns (inputs, correct_letter) if a valid cache entry exists for
+    this pid, else None -- callers fall back to live decode+build on a
+    miss, so a partially-built cache (e.g. a prebuild job still running, or
+    one shard that hasn't reached this item yet) degrades to the original
+    behavior rather than failing."""
+    path = precomputed_input_path(cache_dir, pid)
+    if not os.path.exists(path):
+        return None
+    try:
+        data = torch.load(path, map_location="cpu", weights_only=False)
+        return data["inputs"], data["correct_letter"]
+    except Exception:
+        return None
+
+
 def build_inputs(processor, in_clip_path, prompt_text, max_frames=32):
     handle = start_decode(in_clip_path, prompt_text, max_frames)
     decoded = finish_decode(handle)
@@ -364,14 +399,28 @@ class AccTally:
         return s
 
 
-def _start_item_decode(item, rng):
+def _start_item_decode(item, rng, precompute_cache_dir=None):
     """Prepares one item's prompt/option text and kicks off its video decode
     without waiting -- see start_decode()'s docstring for why. Errors here
     (e.g. malformed question/caption fields) are captured rather than
     raised, so a failure preparing item i+1 (kicked off during item i's
     turn) is correctly attributed to item i+1 once its own turn comes,
     instead of surfacing under whichever item happened to be current when
-    the lookahead call ran."""
+    the lookahead call ran.
+
+    If precompute_cache_dir is given and this item's pid already has a
+    valid cache entry (see build_eval_input_cache.py), returns it directly
+    with no decode kicked off at all -- correct_letter comes baked into the
+    cache (fixed at prebuild time), so this item doesn't consume rng the
+    way a live-decoded item does. That's fine: each item's correctness
+    check is self-contained, and a run mixing cached/uncached items just
+    means rng only advances for the uncached ones, in their own list order.
+    """
+    if precompute_cache_dir is not None:
+        cached = load_precomputed_inputs(precompute_cache_dir, item.get("pid"))
+        if cached is not None:
+            inputs, correct_letter = cached
+            return True, ("cached", correct_letter, inputs)
     try:
         option_lines, correct_letter = build_option_block(item, rng)
         prompt_text = build_prompt_text(item["question"], option_lines)
@@ -382,7 +431,7 @@ def _start_item_decode(item, rng):
 
 
 def evaluate_logprob(model, processor, hook, injector, items, injection_site, n_tokens, placeholder_id, device, rng,
-                      prefetch_depth=4):
+                      prefetch_depth=4, precompute_cache_dir=None):
     model.eval()
     # Without this, JepaPoolerTemporal's internal attention dropout (p=0.1)
     # stays active during periodic in-training validation, adding noise to
@@ -409,7 +458,7 @@ def evaluate_logprob(model, processor, hook, injector, items, injection_site, n_
     def _top_up():
         nonlocal next_to_start
         while next_to_start < len(items) and len(queue) < prefetch_depth:
-            queue.append(_start_item_decode(items[next_to_start], rng))
+            queue.append(_start_item_decode(items[next_to_start], rng, precompute_cache_dir))
             next_to_start += 1
 
     _top_up()
@@ -420,10 +469,13 @@ def evaluate_logprob(model, processor, hook, injector, items, injection_site, n_
             try:
                 if not cur_ok:
                     raise cur_payload
-                option_lines, correct_letter, prompt_text, handle = cur_payload
                 feats_np = load_vjepa_in_feats(item["in_clip"])
-                decoded = finish_decode(handle)
-                inputs = build_inputs_from_decoded(processor, handle.abs_path, prompt_text, decoded)
+                if cur_payload[0] == "cached":
+                    _, correct_letter, inputs = cur_payload
+                else:
+                    option_lines, correct_letter, prompt_text, handle = cur_payload
+                    decoded = finish_decode(handle)
+                    inputs = build_inputs_from_decoded(processor, handle.abs_path, prompt_text, decoded)
                 model_inputs = prepare_model_inputs(inputs, injection_site, n_tokens, placeholder_id)
                 model_inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in model_inputs.items()}
 
