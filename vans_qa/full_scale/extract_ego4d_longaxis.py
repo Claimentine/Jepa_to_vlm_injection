@@ -120,6 +120,7 @@ def select_longaxis_pairs_goalstep(videos, min_span_seconds, min_steps, limit=No
             continue
         pairs.append({
             "video_uid": video["video_uid"],
+            "pair_idx": 0,
             "goal_category": video.get("goal_category"),
             "span_seconds": span,
             "past_segment": [past_step["start_time"], past_step["end_time"]],
@@ -168,6 +169,7 @@ def select_longaxis_pairs_narration(narration_data, min_span_seconds, min_steps,
         past_t, future_t = past_n["timestamp_sec"], future_n["timestamp_sec"]
         pairs.append({
             "video_uid": video_uid,
+            "pair_idx": 0,
             "goal_category": None,
             "span_seconds": span,
             "past_segment": [max(0.0, past_t - half_w), past_t + half_w],
@@ -177,6 +179,67 @@ def select_longaxis_pairs_narration(narration_data, min_span_seconds, min_steps,
             "n_steps": len(narr_sorted),
         })
     pairs.sort(key=lambda p: p["video_uid"])
+    if limit:
+        pairs = pairs[:limit]
+    return pairs
+
+
+def select_shortaxis_pairs_narration(narration_data, min_gap_seconds, max_gap_seconds,
+                                      pairs_per_video, window_seconds, min_steps, limit=None):
+    """Multiple (past_narration, future_narration) candidates per video:
+    consecutive narration pairs (i, i+1) whose gap falls in
+    [min_gap_seconds, max_gap_seconds], up to --pairs_per_video of them per
+    video, spread evenly across that video's narration timeline (not just
+    the first K) for temporal diversity within one video.
+
+    Why: select_longaxis_pairs_narration's first/last-narration choice can
+    span a whole long video (some over an hour), and decord has to seek
+    from the nearest keyframe all the way to a window that far in --
+    confirmed via job-53's own logs (many `window decode exceeded 60s`
+    timeouts) that this seek, not the download, is the real bottleneck.
+    Consecutive narrations sit close together in the SAME video, so both
+    windows decode fast, and reusing one already-downloaded video for
+    several pairs instead of just one raises yield-per-download too. This
+    is a real return to something closer to VANS's own "short-horizon
+    guided pairs" character (see extract_coin_longaxis.py's own docstring
+    for why long-axis was pursued as a DIFFERENT, wider-horizon addition
+    to that) -- the domain (egocentric Ego4D vs VANS's third-person video)
+    is still the novel variable this data source adds, not the horizon
+    length specifically.
+    """
+    pairs = []
+    for video_uid, entry in narration_data.items():
+        narrations = ((entry.get("narration_pass_1") or {}).get("narrations")
+                      or (entry.get("narration_pass_2") or {}).get("narrations") or [])
+        if len(narrations) < min_steps:
+            continue
+        narr_sorted = sorted(narrations, key=lambda n: n["timestamp_sec"])
+        candidates = []
+        for i in range(len(narr_sorted) - 1):
+            past_n, future_n = narr_sorted[i], narr_sorted[i + 1]
+            gap = future_n["timestamp_sec"] - past_n["timestamp_sec"]
+            if min_gap_seconds <= gap <= max_gap_seconds:
+                candidates.append((past_n, future_n, gap))
+        if not candidates:
+            continue
+        if len(candidates) > pairs_per_video:
+            step = len(candidates) / pairs_per_video
+            candidates = [candidates[int(i * step)] for i in range(pairs_per_video)]
+        for pair_idx, (past_n, future_n, gap) in enumerate(candidates):
+            half_w = min(window_seconds / 2.0, gap / 2.0)
+            past_t, future_t = past_n["timestamp_sec"], future_n["timestamp_sec"]
+            pairs.append({
+                "video_uid": video_uid,
+                "pair_idx": pair_idx,
+                "goal_category": None,
+                "span_seconds": gap,
+                "past_segment": [max(0.0, past_t - half_w), past_t + half_w],
+                "past_label": past_n["narration_text"],
+                "future_segment": [future_t - half_w, future_t + half_w],
+                "future_label": future_n["narration_text"],
+                "n_steps": len(narr_sorted),
+            })
+    pairs.sort(key=lambda p: (p["video_uid"], p["pair_idx"]))
     if limit:
         pairs = pairs[:limit]
     return pairs
@@ -334,12 +397,24 @@ def main():
                           "chosen narration timestamp (narrations are point events, unlike "
                           "GoalStep/COIN's own [start,end] step segments) -- no prior convention "
                           "in this project to match, chosen as a plausible short-clip width")
+    ap.add_argument("--pair_mode", choices=["longaxis", "shortaxis"], default="longaxis",
+                     help="narration source only: 'longaxis' (default) takes one (first, last "
+                          "narration) pair per video, spanning as much of the video as its "
+                          "annotations allow. 'shortaxis' instead takes up to --pairs_per_video "
+                          "CONSECUTIVE narration pairs per video, each within "
+                          "[--min_gap_seconds, --max_gap_seconds] -- confirmed via job-53's own "
+                          "logs that longaxis's far-apart windows in long videos are what's "
+                          "actually slow (decord seeking from the nearest keyframe all the way "
+                          "to a window near the end of an hour-long video), not the download.")
+    ap.add_argument("--min_gap_seconds", type=float, default=10.0, help="shortaxis mode only")
+    ap.add_argument("--max_gap_seconds", type=float, default=60.0, help="shortaxis mode only")
+    ap.add_argument("--pairs_per_video", type=int, default=3, help="shortaxis mode only")
     ap.add_argument("--output_dir", default=os.path.join(WORK_BASE, "ego4d_longaxis_cache"))
     ap.add_argument("--video_cache_dir", default=os.path.join(WORK_BASE, "ego4d_raw_videos"),
                      help="downloaded whole videos are kept here (not deleted) so a re-run "
                           "or a --limit increase doesn't re-download an already-fetched video")
     ap.add_argument("--vjepa_checkpoint", default=os.environ.get("VJEPA2_CKPT", "/data/checkpoints/vjepa2/vitl.pt"))
-    ap.add_argument("--min_span_seconds", type=float, default=30.0)
+    ap.add_argument("--min_span_seconds", type=float, default=30.0, help="longaxis mode only")
     ap.add_argument("--min_steps", type=int, default=2)
     ap.add_argument("--limit", type=int, default=None, help="cap number of pairs (smoke test)")
     ap.add_argument("--save_dtype", choices=["fp16", "fp32"], default="fp16")
@@ -348,6 +423,8 @@ def main():
         ap.error("--goalstep_json is required for --annotation_source goalstep")
     if args.annotation_source == "narration" and not args.narration_json:
         ap.error("--narration_json is required for --annotation_source narration")
+    if args.pair_mode == "shortaxis" and args.annotation_source != "narration":
+        ap.error("--pair_mode shortaxis is only implemented for --annotation_source narration")
 
     write_aws_credentials()
 
@@ -369,7 +446,7 @@ def main():
         print(f"[INFO] {len(pairs)} candidate long-axis pairs "
               f"(min_span_seconds={args.min_span_seconds}, min_steps={args.min_steps}) "
               f"out of {len(videos)} GoalStep videos", flush=True)
-    else:
+    elif args.pair_mode == "longaxis":
         narration_data = load_narration_annotations(args.narration_json)
         pairs = select_longaxis_pairs_narration(
             narration_data, args.min_span_seconds, args.min_steps, args.window_seconds, args.limit,
@@ -377,6 +454,16 @@ def main():
         print(f"[INFO] {len(pairs)} candidate long-axis pairs "
               f"(min_span_seconds={args.min_span_seconds}, min_steps={args.min_steps}, "
               f"window_seconds={args.window_seconds}) out of {len(narration_data)} narrated videos", flush=True)
+    else:
+        narration_data = load_narration_annotations(args.narration_json)
+        pairs = select_shortaxis_pairs_narration(
+            narration_data, args.min_gap_seconds, args.max_gap_seconds, args.pairs_per_video,
+            args.window_seconds, args.min_steps, args.limit,
+        )
+        print(f"[INFO] {len(pairs)} candidate short-axis pairs "
+              f"(min_gap_seconds={args.min_gap_seconds}, max_gap_seconds={args.max_gap_seconds}, "
+              f"pairs_per_video={args.pairs_per_video}, window_seconds={args.window_seconds}) "
+              f"out of {len(narration_data)} narrated videos", flush=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] loading V-JEPA2 checkpoint {args.vjepa_checkpoint} ...", flush=True)
@@ -385,13 +472,23 @@ def main():
 
     saved_count = skipped_count = failed_count = 0
     seen_exc_types = set()
+    n = len(pairs)
     with torch.no_grad():
         for i, pair in enumerate(pairs, start=1):
             video_uid = pair["video_uid"]
-            output_path = output_root / f"{video_uid}.npz"
+            pair_idx = pair.get("pair_idx", 0)
+            # shortaxis mode can produce several pairs per video_uid (see
+            # select_shortaxis_pairs_narration); longaxis/goalstep always
+            # have pair_idx=0. Only delete the downloaded video once this
+            # is the LAST pair for this video_uid in the (video_uid,
+            # pair_idx)-sorted list -- pairs list production groups
+            # same-video pairs together, so checking the next entry's
+            # video_uid is enough.
+            is_last_pair_for_video = (i == n) or (pairs[i]["video_uid"] != video_uid)
+            output_path = output_root / f"{video_uid}_{pair_idx}.npz"
             if is_valid_output(output_path):
                 skipped_count += 1
-                print(f"[SKIP {i}/{len(pairs)}] valid {output_path}", flush=True)
+                print(f"[SKIP {i}/{n}] valid {output_path}", flush=True)
                 continue
             # Confirmed 2026-09-29 via a live single-video download: the ego4d
             # CLI nests an extra version directory ("v2" for the current
@@ -424,7 +521,9 @@ def main():
                 payload = {
                     "schema_name": np.asarray("ego4d_longaxis_v1_no_guidance"),
                     "annotation_source": np.asarray(args.annotation_source),
+                    "pair_mode": np.asarray(getattr(args, "pair_mode", "longaxis")),
                     "video_uid": np.asarray(video_uid),
+                    "pair_idx": np.asarray(pair_idx, dtype=np.int32),
                     "goal_category": np.asarray(pair["goal_category"] or ""),
                     "span_seconds": np.asarray(pair["span_seconds"], dtype=np.float64),
                     "n_steps": np.asarray(pair["n_steps"], dtype=np.int32),
@@ -441,26 +540,29 @@ def main():
                 }
                 atomic_write_npz(output_path, payload)
                 saved_count += 1
-                print(f"[SAVED {i}/{len(pairs)}] {output_path} span={pair['span_seconds']:.0f}s", flush=True)
-                # Full-scale Ego4D videos can be large (tens of minutes) --
-                # unlike COIN's short whole-video downloads, keeping every
-                # downloaded video around indefinitely could exhaust disk at
-                # 583-video scale. Delete after this video's pair is safely
-                # saved (re-running would just re-download it, same as a
-                # cache miss).
-                try:
-                    video_path.unlink()
-                except FileNotFoundError:
-                    pass
+                print(f"[SAVED {i}/{n}] {output_path} span={pair['span_seconds']:.0f}s", flush=True)
             except Exception as exc:
                 failed_count += 1
                 exc_name = type(exc).__name__
-                print(f"[FAIL {i}/{len(pairs)}] video_uid={video_uid}: {exc_name}: {exc}", file=sys.stderr, flush=True)
+                print(f"[FAIL {i}/{n}] video_uid={video_uid} pair_idx={pair_idx}: {exc_name}: {exc}",
+                      file=sys.stderr, flush=True)
                 if exc_name not in seen_exc_types:
                     seen_exc_types.add(exc_name)
                     traceback.print_exc()
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
+            # Full-scale Ego4D videos can be large (tens of minutes) --
+            # unlike COIN's short whole-video downloads, keeping every
+            # downloaded video around indefinitely could exhaust disk at
+            # this scale. Delete only once every pair for this video_uid
+            # has had its turn (shortaxis mode reuses one download across
+            # several pairs) -- re-running would just re-download it, same
+            # as a cache miss, whether that turn succeeded or failed.
+            if is_last_pair_for_video:
+                try:
+                    video_path.unlink()
+                except FileNotFoundError:
+                    pass
 
     print(f"[DONE] saved={saved_count} skipped_valid={skipped_count} failed={failed_count} "
           f"output={output_root}", flush=True)
