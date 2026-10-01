@@ -100,13 +100,24 @@ def load_goalstep_annotations(goalstep_json_path):
     return data["videos"]
 
 
-def select_longaxis_pairs_goalstep(videos, min_span_seconds, min_steps, limit=None):
+def select_longaxis_pairs_goalstep(videos, min_span_seconds, min_steps, max_span_seconds=None, limit=None):
     """One (past_step, future_step) candidate per video: the first and last
     TOP-LEVEL step segment by start time (not recursing into GoalStep's own
     nested sub-segments) -- the widest span this video's step annotations
     support, matching extract_coin_longaxis.py's own selection logic. Each
     pair already carries real [start,end] segments, so past_segment/
     future_segment are used as-is by extract_window_frames().
+
+    max_span_seconds: a real job-50 example (goal_category=
+    COOKING:COOKING_GENERAL, span=1798.8s/~30min, n_steps=27 -- "Move cereal
+    packs into box" -> "Clean kitchen") surfaced that first/last-step span
+    can run far longer than COIN's own long-axis distribution (median 71s,
+    p90 154s, max 733s) ever does -- at 30 minutes apart, past and future
+    windows share almost no visual continuity for V-JEPA2's future-latent
+    predictor to actually learn from, just two disconnected moments in the
+    same kitchen. Capped (default 720s, just above COIN's own observed max)
+    so GoalStep's long-axis difficulty stays in the same regime as the
+    already-validated COIN source instead of injecting extreme outliers.
     """
     pairs = []
     for video in videos:
@@ -117,6 +128,8 @@ def select_longaxis_pairs_goalstep(videos, min_span_seconds, min_steps, limit=No
         past_step, future_step = segs_sorted[0], segs_sorted[-1]
         span = future_step["end_time"] - past_step["start_time"]
         if span < min_span_seconds:
+            continue
+        if max_span_seconds is not None and span > max_span_seconds:
             continue
         pairs.append({
             "video_uid": video["video_uid"],
@@ -140,7 +153,8 @@ def load_narration_annotations(narration_json_path):
         return json.load(f)
 
 
-def select_longaxis_pairs_narration(narration_data, min_span_seconds, min_steps, window_seconds, limit=None):
+def select_longaxis_pairs_narration(narration_data, min_span_seconds, min_steps, window_seconds,
+                                     max_span_seconds=None, limit=None):
     """One (past_narration, future_narration) candidate per video: the
     first and last narrated timestamp (across narration_pass_1, falling
     back to narration_pass_2 if pass_1 is missing/too sparse for this
@@ -153,6 +167,11 @@ def select_longaxis_pairs_narration(narration_data, min_span_seconds, min_steps,
     relative to span_seconds) so past_segment/future_segment come out in
     the same [start,end] shape select_longaxis_pairs_goalstep() produces --
     everything downstream of pair selection is annotation-source-agnostic.
+
+    max_span_seconds: same cap and same rationale as
+    select_longaxis_pairs_goalstep()'s own -- Ego4D videos can run over an
+    hour, so first/last-narration span is just as prone to the "30 minutes
+    apart, no real visual continuity" problem GoalStep's long-axis showed.
     """
     pairs = []
     for video_uid, entry in narration_data.items():
@@ -164,6 +183,8 @@ def select_longaxis_pairs_narration(narration_data, min_span_seconds, min_steps,
         past_n, future_n = narr_sorted[0], narr_sorted[-1]
         span = future_n["timestamp_sec"] - past_n["timestamp_sec"]
         if span < min_span_seconds:
+            continue
+        if max_span_seconds is not None and span > max_span_seconds:
             continue
         half_w = min(window_seconds / 2.0, span / 2.0)
         past_t, future_t = past_n["timestamp_sec"], future_n["timestamp_sec"]
@@ -415,6 +436,13 @@ def main():
                           "or a --limit increase doesn't re-download an already-fetched video")
     ap.add_argument("--vjepa_checkpoint", default=os.environ.get("VJEPA2_CKPT", "/data/checkpoints/vjepa2/vitl.pt"))
     ap.add_argument("--min_span_seconds", type=float, default=30.0, help="longaxis mode only")
+    ap.add_argument("--max_span_seconds", type=float, default=720.0,
+                     help="longaxis mode only -- caps first/last span so it stays in the same "
+                          "regime as COIN's own long-axis distribution (median 71s, p90 154s, "
+                          "max 733s observed); without this, GoalStep/narration first-last spans "
+                          "can run past 30 minutes with almost no visual continuity between past "
+                          "and future windows for V-JEPA2's predictor to learn from. Pass a "
+                          "negative value to disable the cap.")
     ap.add_argument("--min_steps", type=int, default=2)
     ap.add_argument("--limit", type=int, default=None, help="cap number of pairs (smoke test)")
     ap.add_argument("--save_dtype", choices=["fp16", "fp32"], default="fp16")
@@ -440,20 +468,22 @@ def main():
     video_cache_root = Path(args.video_cache_dir)
     video_cache_root.mkdir(parents=True, exist_ok=True)
 
+    max_span = args.max_span_seconds if args.max_span_seconds is not None and args.max_span_seconds >= 0 else None
     if args.annotation_source == "goalstep":
         videos = load_goalstep_annotations(args.goalstep_json)
-        pairs = select_longaxis_pairs_goalstep(videos, args.min_span_seconds, args.min_steps, args.limit)
+        pairs = select_longaxis_pairs_goalstep(videos, args.min_span_seconds, args.min_steps, max_span, args.limit)
         print(f"[INFO] {len(pairs)} candidate long-axis pairs "
-              f"(min_span_seconds={args.min_span_seconds}, min_steps={args.min_steps}) "
-              f"out of {len(videos)} GoalStep videos", flush=True)
+              f"(min_span_seconds={args.min_span_seconds}, max_span_seconds={max_span}, "
+              f"min_steps={args.min_steps}) out of {len(videos)} GoalStep videos", flush=True)
     elif args.pair_mode == "longaxis":
         narration_data = load_narration_annotations(args.narration_json)
         pairs = select_longaxis_pairs_narration(
-            narration_data, args.min_span_seconds, args.min_steps, args.window_seconds, args.limit,
+            narration_data, args.min_span_seconds, args.min_steps, args.window_seconds, max_span, args.limit,
         )
         print(f"[INFO] {len(pairs)} candidate long-axis pairs "
-              f"(min_span_seconds={args.min_span_seconds}, min_steps={args.min_steps}, "
-              f"window_seconds={args.window_seconds}) out of {len(narration_data)} narrated videos", flush=True)
+              f"(min_span_seconds={args.min_span_seconds}, max_span_seconds={max_span}, "
+              f"min_steps={args.min_steps}, window_seconds={args.window_seconds}) "
+              f"out of {len(narration_data)} narrated videos", flush=True)
     else:
         narration_data = load_narration_annotations(args.narration_json)
         pairs = select_shortaxis_pairs_narration(
