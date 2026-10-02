@@ -1,0 +1,182 @@
+# Step 56: full-scale run of EMA loss normalization + cycle_loss_weight=0 +
+# bridge_hidden_dim=2048 together -- validated by job-55's smoke test.
+#
+# This cell of the ablation grid was never run. The two changes that each
+# independently helped have different mechanisms:
+#   job-22 (raw-sum, cycle=0.1)      -> job-34 (EMA-normalized, cycle=0.1):
+#       TempCompass 56.65% -> 70.31% (+13.7pp) -- fixes rev_loss's raw
+#       magnitude (~7) dominating fwd_loss's (~0.6) in the shared bridge's
+#       gradient.
+#   job-36 (raw-sum, cycle=0, small bridge) -> job-42 (raw-sum, cycle=0,
+#       bridge_hidden_dim=2048): TempCompass 63.96% -> 75.71% (+11.8pp,
+#       current best) -- fixes a representational bottleneck in the
+#       single-Linear bridge head.
+# job-42 itself still uses --disable_norm (raw-sum), inherited unchanged
+# from job-36's isolated-gradient setup -- normalization and bridge
+# capacity have never been combined. This run is job-42's exact command
+# with --disable_norm removed (so fwd/rev/cyc all pass through
+# LossNormalizer.normalize() before summing, same as job-34), keeping
+# --cycle_loss_weight 0 and --bridge_hidden_dim 2048 unchanged.
+#
+# Also sets up a cleaner retry of job-48: job-48 (bridge capacity + COIN
+# mixing) showed a concerning downward trend and was stopped early, but it
+# used job-34's normalized+cycle=0.1 setting, not job-42's raw-sum+cycle=0
+# setting -- so job-48's failure was never isolated from the
+# normalization-on confound. If this run is healthy, the natural follow-up
+# is redoing job-48 with THIS recipe (normalized + cycle=0 + bigger bridge)
+# plus COIN mixing, instead of job-34's.
+#
+# Same --qa_split/--epochs/--val_every_steps/--save_every_steps/
+# --max_val_items as job-22/34/36/42, no --max_train_items cap, no COIN
+# data (VANS-only, so this is a clean single-variable comparison against
+# job-42 specifically).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-train-norm-plus-bridge
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+                      - k8s-haosu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5909.unl.edu
+                      - hcc-nrp-shor-c5925.unl.edu
+                      - hpc-nrp-g1.nmsu.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - k8s-chase-ci-02.calit2.optiputer.net
+                      - ry-gpu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5809.unl.edu
+      containers:
+        - name: train-norm-plus-bridge
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet h5py
+              export PATH="$(dirname "$PY"):$PATH"
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              exec torchrun --standalone --nproc_per_node=2 \
+                vans_qa/full_scale/train_joint_coupled_normalized.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --cycle_loss_weight 0 \
+                --bridge_hidden_dim 2048 \
+                --epochs 1 \
+                --val_every_steps 500 \
+                --save_every_steps 1000 \
+                --max_val_items 100 \
+                --out_dir /data/raw_data/joint_coupled_norm_bridge_runs
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+            - name: PYTORCH_ALLOC_CONF
+              value: expandable_segments:True
+          resources:
+            requests:
+              cpu: "10"
+              memory: "27Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "2"
+            limits:
+              cpu: "12"
+              memory: "31500Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "2"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-56-train-norm-plus-bridge.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-train-norm-plus-bridge -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-train-norm-plus-bridge -n williamli-scvl
