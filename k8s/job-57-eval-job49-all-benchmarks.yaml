@@ -1,0 +1,165 @@
+# Step 57: job-49 (COIN-mixing alone, original bridge, normalization on,
+# cycle_loss_weight=0.1) has a completed, healthy training run but was
+# NEVER evaluated on any of the three forward-direction benchmarks this
+# project uses -- only its own 100-item training-time snapshot
+# (best_fwd_val_acc=0.73) and its reverse-direction test are known. With
+# MVBench scores across the existing joint variants all underwhelming
+# (job-13 baseline 67.27% still beats every joint variant, job-42 best
+# joint at 63.09%), job-49 is the one real gap: does mixing COIN into the
+# reverse pool (without touching bridge capacity/cycle loss) change
+# forward-direction generalization at all? Runs all three benchmarks for
+# job-49 in one job (COIN full-test, TempCompass OOD, MVBench OOD), same
+# pattern as job-46/45/54 but for this one new checkpoint.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-eval-job49-all
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-fiona-001.sdmz.amnh.org
+                      - hcc-chase-shor-c4705.unl.edu
+                      - ry-gpu-01.sdsc.optiputer.net
+                      - ry-gpu-03.sdsc.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c6009.unl.edu
+                      - k8s-chase-ci-07.calit2.optiputer.net
+                      - k8s-3090-01.usd.edu
+                      - k8s-haosu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5909.unl.edu
+                      - hcc-nrp-shor-c5925.unl.edu
+                      - hpc-nrp-g1.nmsu.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - k8s-chase-ci-02.calit2.optiputer.net
+                      - ry-gpu-09.sdsc.optiputer.net
+                      - ry-gpu-15.sdsc.optiputer.net
+                      - hcc-nrp-shor-c5809.unl.edu
+                      - hcc-chase-shor-c4715.unl.edu
+      containers:
+        - name: eval-job49-all
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              CKPT="job49_coin_mix=/data/raw_data/joint_coupled_mixed_normalized_nobridge_runs/best_forward.pt"
+
+              cd "$REPO"
+              echo "=== COIN full-test ==="
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --split_part test \
+                --checkpoint "$CKPT" \
+                --out_path /data/raw_data/forward_fulltest_comparison_job49.json
+
+              echo "=== TempCompass OOD ==="
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_tempcompass.json \
+                --split_part test \
+                --checkpoint "$CKPT" \
+                --out_path /data/raw_data/tempcompass_forward_comparison_job49.json
+
+              echo "=== MVBench OOD ==="
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_mvbench.json \
+                --split_part test \
+                --checkpoint "$CKPT" \
+                --out_path /data/raw_data/mvbench_forward_comparison_job49.json
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work_mvbench
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "19200Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-57-eval-job49-all-benchmarks.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-eval-job49-all -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-eval-job49-all -n williamli-scvl
