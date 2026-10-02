@@ -72,6 +72,18 @@ spec:
               CKPT="job49_coin_mix=/data/raw_data/joint_coupled_mixed_normalized_nobridge_runs/best_forward.pt"
 
               cd "$REPO"
+
+              # COIN full-test and TempCompass both read VANS clips, which
+              # live under /data/vans_work (symlinked from the HF backup);
+              # MVBench's clips were populated separately under
+              # /data/vans_work_mvbench by job-52 and need no symlink.
+              # VANS_WORK_ROOT must match whichever qa_split is being read,
+              # set inline per call rather than once at the pod level.
+              export VANS_WORK_ROOT=/data/vans_work
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
               echo "=== COIN full-test ==="
               "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
                 --qa_split /data/raw_data/qa_split_temporal.json \
@@ -87,6 +99,7 @@ spec:
                 --out_path /data/raw_data/tempcompass_forward_comparison_job49.json
 
               echo "=== MVBench OOD ==="
+              export VANS_WORK_ROOT=/data/vans_work_mvbench
               "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
                 --qa_split /data/raw_data/qa_split_mvbench.json \
                 --split_part test \
@@ -95,8 +108,6 @@ spec:
           env:
             - name: VANS_ROOT
               value: /data
-            - name: VANS_WORK_ROOT
-              value: /data/vans_work_mvbench
             - name: THINKJEPA_ROOT
               value: /home/jovyan/ThinkJEPA
             - name: HF_HOME
