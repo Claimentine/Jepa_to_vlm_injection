@@ -73,25 +73,22 @@ spec:
 
               cd "$REPO"
 
-              # COIN full-test and TempCompass both read VANS clips, which
-              # live under /data/vans_work (symlinked from the HF backup);
-              # MVBench's clips were populated separately under
-              # /data/vans_work_mvbench by job-52 and need no symlink.
-              # VANS_WORK_ROOT must match whichever qa_split is being read,
-              # set inline per call rather than once at the pod level.
-              export VANS_WORK_ROOT=/data/vans_work
-              mkdir -p "$VANS_WORK_ROOT"
-              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
-              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
-
-              echo "=== COIN full-test ==="
-              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
-                --qa_split /data/raw_data/qa_split_temporal.json \
-                --split_part test \
-                --checkpoint "$CKPT" \
-                --out_path /data/raw_data/forward_fulltest_comparison_job49.json
+              # Each benchmark's clips live under its OWN VANS_WORK_ROOT --
+              # COIN full-test reads VANS clips under /data/vans_work
+              # (symlinked from the HF backup); TempCompass's own clips were
+              # populated separately under /data/vans_work_tempcompass (no
+              # symlink needed, see job-45); MVBench's under
+              # /data/vans_work_mvbench (see job-52/54). A single shared
+              # value (the bug in this job's first two attempts) silently
+              # produces n=0 for whichever benchmark doesn't match.
+              #
+              # COIN full-test already completed and its result is saved at
+              # forward_fulltest_comparison_job49.json (n=2854, acc=0.6713,
+              # easy=0.6938, hard=0.6489) -- not re-run here to avoid
+              # burning another ~70min; only TempCompass and MVBench remain.
 
               echo "=== TempCompass OOD ==="
+              export VANS_WORK_ROOT=/data/vans_work_tempcompass
               "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
                 --qa_split /data/raw_data/qa_split_tempcompass.json \
                 --split_part test \
