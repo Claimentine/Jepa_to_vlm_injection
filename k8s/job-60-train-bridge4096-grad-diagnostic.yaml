@@ -1,0 +1,149 @@
+# Step 60: push bridge capacity further than job-42's bridge_hidden_dim=2048
+# (job-39's smoke test OOM'd at 4096 on a 22GB card with 2-GPU DDP: "GPU 1
+# has a total capacity of 22.06 GiB ... this process has 16.29 GiB memory
+# in use" on every reverse-direction item). Requesting A100s specifically
+# this time (40GB/80GB, vs whatever 22-24GB card the NotIn-blacklist might
+# land on) for the headroom 4096 needs, accepting a longer scheduling queue
+# as the tradeoff -- same policy this project already uses for full-scale
+# training runs per k8s/README.md's "GPU node affinity policy" section.
+#
+# Also turns on --log_bridge_grad_conflict (new flag, see
+# train_joint_coupled_normalized.py's own changelog comment at that
+# argparse entry): logs cosine similarity between fwd_loss's and rev_loss's
+# own gradients on the shared bridge parameters each step. Distinguishes
+# genuine task interference (gradients pointing opposite directions on the
+# bridge) from mere loss-scale imbalance (which LossNormalizer already
+# corrects for, and which job-34's own normalization fix already addressed)
+# -- answers whether a PCGrad-style gradient-surgery fix is worth pursuing
+# next, or whether scale was really the whole story.
+#
+# Otherwise identical to job-42's own winning recipe: --disable_norm
+# --cycle_loss_weight 0 (job-56's run already showed normalization hurts
+# on TOP of this recipe -- COIN 61.46%/TempCompass 61.40% vs job-42's
+# 66.71%/75.71% -- so this does NOT re-enable normalization), no COIN
+# mixing, same qa_split/epochs/val schedule as job-22/34/36/42/56.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-train-bridge4096-grad-diag
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A100-PCIE-40GB
+                      - NVIDIA-A100-SXM4-80GB
+                      - NVIDIA-A100-80GB-PCIe
+      containers:
+        - name: train-bridge4096-grad-diag
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet h5py
+              export PATH="$(dirname "$PY"):$PATH"
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              exec torchrun --standalone --nproc_per_node=2 \
+                vans_qa/full_scale/train_joint_coupled_normalized.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --disable_norm \
+                --cycle_loss_weight 0 \
+                --bridge_hidden_dim 4096 \
+                --log_bridge_grad_conflict \
+                --epochs 1 \
+                --val_every_steps 500 \
+                --save_every_steps 1000 \
+                --max_val_items 100 \
+                --out_dir /data/raw_data/joint_coupled_bridge4096_runs
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+            - name: PYTORCH_ALLOC_CONF
+              value: expandable_segments:True
+          resources:
+            requests:
+              cpu: "10"
+              memory: "27Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "2"
+            limits:
+              cpu: "12"
+              memory: "31500Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "2"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-60-train-bridge4096-grad-diagnostic.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-train-bridge4096-grad-diag -n williamli-scvl
+# Clean up when done:
+#   kubectl delete job ruixin-train-bridge4096-grad-diag -n williamli-scvl

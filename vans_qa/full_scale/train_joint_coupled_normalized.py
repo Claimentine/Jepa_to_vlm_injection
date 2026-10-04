@@ -205,6 +205,14 @@ def main():
                           "Linear -- tests whether a single-linear-layer bottleneck (not gradient "
                           "coupling -- job-36's --cycle_loss_weight 0 already isolated that "
                           "variable) is what limits the bridge, independent of loss normalization")
+    ap.add_argument("--log_bridge_grad_conflict", action="store_true",
+                     help="log cosine similarity between fwd_loss's and rev_loss's own gradients "
+                          "on the shared bridge parameters each step (bridge_grad_cos_sim in "
+                          "train_log.jsonl) -- distinguishes genuine task interference (gradients "
+                          "pointing opposite directions) from mere loss-scale imbalance (which "
+                          "LossNormalizer already corrects for). Two extra torch.autograd.grad "
+                          "calls on bridge-only parameters per step -- cheap relative to the full "
+                          "forward/backward, safe to leave on for a full run")
     ap.add_argument("--val_every_steps", type=int, default=500)
     ap.add_argument("--save_every_steps", type=int, default=1000)
     ap.add_argument("--max_val_items", type=int, default=100)
@@ -406,6 +414,35 @@ def main():
             total_loss = total_loss + args.cycle_loss_weight * cyc_loss_norm
             log_entry["cycle_loss"] = float(cyc_loss.item())
             log_entry["cycle_loss_ema"] = cyc_ema
+
+            if args.log_bridge_grad_conflict and fwd_ok and rev_ok:
+                # Diagnostic only, opt-in -- does fwd_loss's gradient on the
+                # SHARED bridge parameters point the same direction as
+                # rev_loss's, or do the two tasks actively fight over the
+                # bridge (not just differ in raw magnitude, which
+                # LossNormalizer already corrects for)? retain_graph=True
+                # keeps total_loss.backward() below valid; allow_unused=True
+                # since a given step's bridge forward pass may not touch
+                # every bridge parameter (e.g. the unused head's bias in an
+                # asymmetric forward/reverse composition).
+                bridge_params = [p for p in bridge.parameters() if p.requires_grad]
+                fwd_grads = torch.autograd.grad(
+                    fwd_loss_norm, bridge_params, retain_graph=True, allow_unused=True)
+                rev_grads = torch.autograd.grad(
+                    rev_loss_norm, bridge_params, retain_graph=True, allow_unused=True)
+                fwd_flat = torch.cat([
+                    (g if g is not None else torch.zeros_like(p)).reshape(-1)
+                    for g, p in zip(fwd_grads, bridge_params)
+                ])
+                rev_flat = torch.cat([
+                    (g if g is not None else torch.zeros_like(p)).reshape(-1)
+                    for g, p in zip(rev_grads, bridge_params)
+                ])
+                denom = fwd_flat.norm() * rev_flat.norm()
+                cos_sim = float((fwd_flat @ rev_flat / denom).item()) if denom > 0 else 0.0
+                log_entry["bridge_grad_cos_sim"] = cos_sim
+                log_entry["bridge_grad_fwd_norm"] = float(fwd_flat.norm().item())
+                log_entry["bridge_grad_rev_norm"] = float(rev_flat.norm().item())
 
             total_loss.backward()
             if is_ddp():
