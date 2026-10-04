@@ -77,14 +77,14 @@ spec:
               value: "1"
           resources:
             requests:
-              cpu: "4"
-              memory: "12Gi"
+              cpu: "5"
+              memory: "13Gi"
               ephemeral-storage: "4Gi"
               nvidia.com/gpu: "1"
             limits:
               cpu: "6"
-              memory: "16Gi"
-              ephemeral-storage: "8Gi"
+              memory: "15600Mi"
+              ephemeral-storage: "4800Mi"
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: git-repo-code
@@ -118,7 +118,7 @@ spec:
           emptyDir: {}
         - name: conda-storage
           persistentVolumeClaim:
-            claimName: ruixin-conda-vol
+            claimName: ruixin-conda-vol-ddp
         - name: data-storage
           persistentVolumeClaim:
             claimName: jepa-vlm-injection-data-vol
