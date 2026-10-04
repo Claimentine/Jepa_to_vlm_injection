@@ -1,0 +1,109 @@
+# Step 61: ThinkJEPA's own official recipe (scripts/train.sh, FiLM guidance,
+# frozen VLM) on our EgoDex 2000-episode cache -- the ThinkJEPA-as-baseline
+# reference point. 20 epochs, batch 2 (batch 4 OOM'd on a 24GB 3090 even
+# with expandable_segments; batch 2 peaks ~16.7GiB).
+#
+# Why this is a Job, not a bare Pod: the first two runs were bare
+# `kind: Pod` objects and both were SIGKILLed (exit 137) at exactly 6 hours
+# (00:19->06:19 and 07:50->13:50). k8s/pod-devbox.yaml documents the
+# onboarding guide's rule that interactive pods are auto-destroyed after 6h;
+# our batch Jobs (job-53 ~22h, job-54 ~44h) have not hit that. Running as a
+# Job removes that exposure, and backoffLimit auto-restarts a killed run.
+#
+# AUTO_RESUME=1 + the same OUT_DIR means each restart picks up the latest
+# checkpoint (ckpt_latest.pt / training_state.json), so a kill only costs the
+# partial epoch in progress. Verified 2026-10-04: resume from epoch 8 ran
+# epochs 9-15 cleanly.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-thinkjepa-stage1
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+      containers:
+        - name: stage1
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+            - "-c"
+            - |
+              set -euo pipefail
+              TJ=/home/jovyan/ThinkJEPA
+              PY=/home/jovyan/conda-envs/thinkjepa/bin/python
+              BUNDLE=/data/raw_data/thinkjepa_egodex_iso
+              RUN_ROOT=/data/raw_data/thinkjepa_stage1_run2
+              export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+              cd "$TJ"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              DATA_DIR="${BUNDLE}/supervision_hdf5" \
+              CACHE_DIR="${BUNDLE}/cache" \
+              TRAIN_MANIFEST="${BUNDLE}/manifests/portable_v1/train_cache.txt" \
+              VAL_MANIFEST="${BUNDLE}/manifests/portable_v1/test_cache.txt" \
+              SPLIT_META="${BUNDLE}/manifests/portable_v1/meta.json" \
+              OUT_DIR="${RUN_ROOT}" \
+              EPOCHS=20 \
+              TRAIN_BATCH_SIZE=2 \
+              TEST_BATCH_SIZE=2 \
+              NUM_WORKERS=4 \
+              PIN_MEMORY=1 \
+              CHECKPOINT_SELECTION=best \
+              AUTO_RESUME=1 \
+              PYBIN="$PY" \
+              bash scripts/train.sh
+
+              echo "SCRIPT_DONE"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests: {cpu: "8", memory: "24Gi", ephemeral-storage: "2Gi", nvidia.com/gpu: "1"}
+            limits: {cpu: "10", memory: "32Gi", ephemeral-storage: "4Gi", nvidia.com/gpu: "1"}
+          volumeMounts:
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-61-thinkjepa-stage1-official-recipe.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-thinkjepa-stage1 -n williamli-scvl
