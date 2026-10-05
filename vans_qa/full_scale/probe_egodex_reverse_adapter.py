@@ -90,7 +90,7 @@ def describe(obj, name, depth=0):
             describe(v, f"[{k!r}]", depth + 1)
     elif isinstance(obj, (list, tuple)):
         print(f"{pad}{name}: {type(obj).__name__} len={len(obj)}", flush=True)
-        for i, v in enumerate(obj[:6]):
+        for i, v in enumerate(obj):
             describe(v, f"[{i}]", depth + 1)
     else:
         print(f"{pad}{name}: {type(obj).__name__} = {str(obj)[:120]}", flush=True)
@@ -107,6 +107,11 @@ def main():
 
     train_loader, test_loader = build_dataloaders(args)
     print(f"[INFO] train_loader batches~{len(train_loader)} test_loader batches~{len(test_loader)}", flush=True)
+    ds = train_loader.dataset
+    for attr in ("query_tfs", "joint_names", "tfs_names", "query_joint_names", "camera_mode"):
+        if hasattr(ds, attr):
+            print(f"[INFO] dataset.{attr} = {getattr(ds, attr)}", flush=True)
+    print(f"[INFO] WRISTS constant = {WRISTS}", flush=True)
 
     batch = next(iter(train_loader))
     print("[INFO] first train batch structure:", flush=True)
