@@ -53,16 +53,26 @@ CHECKPOINTS = {
 
 
 def build_dataloaders(args):
+    # dataset_path must be the supervision_hdf5 directory itself -- matches
+    # thinker_train.py's own call (its first positional arg is args.data_dir,
+    # which scripts/train.sh sets to "${BUNDLE}/supervision_hdf5"). There is
+    # no separate supervision_cache_root override in the real training call;
+    # build_egodex_dataloaders derives supervision_root from dataset_path
+    # itself via _expand_roots_for_sidecar_lookup when use_npz_cache=True,
+    # so dataset_path has to BE that root, not the bundle's own top level
+    # (confirmed the hard way: passing the bundle root produced
+    # "schema-v2 join requires source_video_relpath and explicit
+    # supervision_root" / "cam_ext is None" on every sample).
     return build_egodex_dataloaders(
-        dataset_path=EGODEX_BUNDLE,
+        dataset_path=os.path.join(EGODEX_BUNDLE, "supervision_hdf5"),
         query_tfs=WRISTS,
+        if_return_path=True,
         train_batch=args.batch_size,
         test_batch=args.batch_size,
         train_manifest=os.path.join(EGODEX_BUNDLE, "manifests/portable_v1/train_cache.txt"),
         test_manifest=os.path.join(EGODEX_BUNDLE, "manifests/portable_v1/test_cache.txt"),
         use_npz_cache=True,
         cache_dir=os.path.join(EGODEX_BUNDLE, "cache"),
-        supervision_cache_root=os.path.join(EGODEX_BUNDLE, "supervision_hdf5"),
         num_workers=0,
         pin_memory=False,
         load_cache_images=False,
