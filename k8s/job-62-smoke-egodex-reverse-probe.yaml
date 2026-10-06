@@ -1,0 +1,105 @@
+# Step 62 (Stage 2 of the EgoDex plan): does OUR reverse-direction predictor
+# (job-15, trained only on VANS/COIN/Ego4D self-supervised pairs, never on
+# EgoDex) already carry useful trajectory signal, without adding EgoDex
+# training data? Freezes job-15's predictor entirely, trains ONLY a small
+# linear probe (pooled predicted future latent -> future WRIST xyz) on
+# EgoDex's train split, reports ADE/FDE on the test split via the identical
+# formula to ThinkJEPA's own compute_trajectory_loss_and_accuracy -- directly
+# comparable to job-61's own ADE=0.0683/FDE=0.0733 reference (ThinkJEPA
+# trained end-to-end ON EgoDex).
+#
+# Smoke test first: small batch caps on both train/test loops, 2 probe
+# epochs -- same discipline as every other training job in this project
+# (job-08/14/39/47/55/59 etc.) before committing to a full run.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ruixin-smoke-egodex-reverse-probe
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: NotIn
+                values:
+                  - NVIDIA-TITAN-Xp
+                  - NVIDIA-TITAN-X-Pascal
+                  - NVIDIA-GeForce-GTX-1080
+                  - NVIDIA-GeForce-GTX-1080-Ti
+                  - Quadro-M4000
+                  - Tesla-V100-PCIE-16GB
+                  - Tesla-V100-SXM2-16GB
+                  - Tesla-V100-SXM2-32GB
+                  - NVIDIA-GeForce-RTX-2080-Ti
+                  - NVIDIA-TITAN-RTX
+  containers:
+    - name: probe
+      image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+      command:
+        - "bash"
+        - "-c"
+        - |
+          set -euo pipefail
+          PY=/home/jovyan/conda-envs/thinkjepa/bin/python
+          REPO=/code/Jepa_to_vlm_injection
+          cd "$REPO"
+          nvidia-smi --query-gpu=index,name,memory.total --format=csv
+          exec "$PY" vans_qa/full_scale/probe_egodex_reverse_adapter.py \
+            --checkpoints job15_independent \
+            --batch_size 4 \
+            --probe_epochs 2 \
+            --max_train_batches 10 \
+            --max_test_batches 10 \
+            --out_json /data/raw_data/egodex_reverse_probe_smoke.json
+          echo "SCRIPT_DONE"
+      env:
+        - name: VANS_ROOT
+          value: /data
+        - name: THINKJEPA_ROOT
+          value: /home/jovyan/ThinkJEPA
+        - name: PYTHONUNBUFFERED
+          value: "1"
+      resources:
+        requests: {cpu: "4", memory: "16Gi", ephemeral-storage: "2Gi", nvidia.com/gpu: "1"}
+        limits: {cpu: "6", memory: "19Gi", ephemeral-storage: "4Gi", nvidia.com/gpu: "1"}
+      volumeMounts:
+        - name: git-repo-code
+          mountPath: /code
+        - name: conda-storage
+          mountPath: /home/jovyan
+        - name: data-storage
+          mountPath: /data
+  initContainers:
+    - name: init-clone-repo
+      image: alpine/git
+      resources:
+        requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+        limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+      args:
+        - clone
+        - --single-branch
+        - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+        - /opt/repo/Jepa_to_vlm_injection
+      volumeMounts:
+        - name: git-repo-code
+          mountPath: /opt/repo
+  volumes:
+    - name: git-repo-code
+      emptyDir: {}
+    - name: conda-storage
+      persistentVolumeClaim:
+        claimName: ruixin-conda-vol
+    - name: data-storage
+      persistentVolumeClaim:
+        claimName: jepa-vlm-injection-data-vol
+  securityContext:
+    fsGroup: 1000
+    fsGroupChangePolicy: OnRootMismatch
+  restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-62-smoke-egodex-reverse-probe.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f ruixin-smoke-egodex-reverse-probe -n williamli-scvl
