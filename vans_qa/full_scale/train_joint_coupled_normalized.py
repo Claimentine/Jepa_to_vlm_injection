@@ -206,13 +206,16 @@ def main():
                           "coupling -- job-36's --cycle_loss_weight 0 already isolated that "
                           "variable) is what limits the bridge, independent of loss normalization")
     ap.add_argument("--log_bridge_grad_conflict", action="store_true",
-                     help="log cosine similarity between fwd_loss's and rev_loss's own gradients "
-                          "on the shared bridge parameters each step (bridge_grad_cos_sim in "
-                          "train_log.jsonl) -- distinguishes genuine task interference (gradients "
-                          "pointing opposite directions) from mere loss-scale imbalance (which "
-                          "LossNormalizer already corrects for). Two extra torch.autograd.grad "
-                          "calls on bridge-only parameters per step -- cheap relative to the full "
-                          "forward/backward, safe to leave on for a full run")
+                     help="log cos(fwd_loss grad, cycle_loss grad) on jepa_to_vlm params and "
+                          "cos(rev_loss grad, cycle_loss grad) on vlm_to_jepa params each step "
+                          "(bridge_grad_fwd_vs_cycle_cos_sim / bridge_grad_rev_vs_cycle_cos_sim in "
+                          "train_log.jsonl) -- tests whether cycle_loss, the one term touching both "
+                          "heads, fights each task's own gradient on the parameters that task "
+                          "actually uses (a direct fwd-vs-rev comparison is tautologically 0.0: "
+                          "the two losses have disjoint parameter support by construction). Two "
+                          "extra torch.autograd.grad calls on bridge-only parameters per step -- "
+                          "cheap relative to the full forward/backward, safe to leave on for a "
+                          "full run")
     ap.add_argument("--val_every_steps", type=int, default=500)
     ap.add_argument("--save_every_steps", type=int, default=1000)
     ap.add_argument("--max_val_items", type=int, default=100)
@@ -416,33 +419,49 @@ def main():
             log_entry["cycle_loss_ema"] = cyc_ema
 
             if args.log_bridge_grad_conflict and fwd_ok and rev_ok:
-                # Diagnostic only, opt-in -- does fwd_loss's gradient on the
-                # SHARED bridge parameters point the same direction as
-                # rev_loss's, or do the two tasks actively fight over the
-                # bridge (not just differ in raw magnitude, which
-                # LossNormalizer already corrects for)? retain_graph=True
-                # keeps total_loss.backward() below valid; allow_unused=True
-                # since a given step's bridge forward pass may not touch
-                # every bridge parameter (e.g. the unused head's bias in an
-                # asymmetric forward/reverse composition).
-                bridge_params = [p for p in bridge.parameters() if p.requires_grad]
-                fwd_grads = torch.autograd.grad(
-                    fwd_loss_norm, bridge_params, retain_graph=True, allow_unused=True)
-                rev_grads = torch.autograd.grad(
-                    rev_loss_norm, bridge_params, retain_graph=True, allow_unused=True)
-                fwd_flat = torch.cat([
-                    (g if g is not None else torch.zeros_like(p)).reshape(-1)
-                    for g, p in zip(fwd_grads, bridge_params)
-                ])
-                rev_flat = torch.cat([
-                    (g if g is not None else torch.zeros_like(p)).reshape(-1)
-                    for g, p in zip(rev_grads, bridge_params)
-                ])
-                denom = fwd_flat.norm() * rev_flat.norm()
-                cos_sim = float((fwd_flat @ rev_flat / denom).item()) if denom > 0 else 0.0
-                log_entry["bridge_grad_cos_sim"] = cos_sim
-                log_entry["bridge_grad_fwd_norm"] = float(fwd_flat.norm().item())
-                log_entry["bridge_grad_rev_norm"] = float(rev_flat.norm().item())
+                # Diagnostic only, opt-in. An earlier version of this logged
+                # cos(fwd_loss grad, rev_loss grad) over ALL shared bridge
+                # params -- but fwd_loss only ever touches jepa_to_vlm (via
+                # the forward injector's ForwardingAdapter) and rev_loss only
+                # ever touches vlm_to_jepa (via the reverse predictor's), a
+                # DISJOINT split of bridge.parameters() by construction. That
+                # made the comparison tautologically 0.0 regardless of real
+                # interference -- confirmed empirically in job-60's smoke
+                # test (exactly 0.0 on 20/20 steps despite nonzero individual
+                # norms). The real question is whether cycle_loss -- the one
+                # term that touches BOTH heads -- fights each task's own
+                # gradient on the parameters that task actually uses:
+                #   cos(fwd_loss grad, cycle_loss grad) on jepa_to_vlm params
+                #   cos(rev_loss grad, cycle_loss grad) on vlm_to_jepa params
+                # retain_graph=True keeps total_loss.backward() below valid;
+                # allow_unused=True since a given step's forward pass may
+                # not touch every parameter of a head (e.g. an unused bias).
+                def _grad_cos_sim(loss_a, loss_b, params):
+                    params = [p for p in params if p.requires_grad]
+                    if not params:
+                        return 0.0, 0.0, 0.0
+                    grads_a = torch.autograd.grad(loss_a, params, retain_graph=True, allow_unused=True)
+                    grads_b = torch.autograd.grad(loss_b, params, retain_graph=True, allow_unused=True)
+                    flat_a = torch.cat([
+                        (g if g is not None else torch.zeros_like(p)).reshape(-1)
+                        for g, p in zip(grads_a, params)
+                    ])
+                    flat_b = torch.cat([
+                        (g if g is not None else torch.zeros_like(p)).reshape(-1)
+                        for g, p in zip(grads_b, params)
+                    ])
+                    denom = flat_a.norm() * flat_b.norm()
+                    cos = float((flat_a @ flat_b / denom).item()) if denom > 0 else 0.0
+                    return cos, float(flat_a.norm().item()), float(flat_b.norm().item())
+
+                fwd_vs_cyc_cos, fwd_norm, _ = _grad_cos_sim(
+                    fwd_loss_norm, cyc_loss_norm, bridge.jepa_to_vlm.parameters())
+                rev_vs_cyc_cos, rev_norm, _ = _grad_cos_sim(
+                    rev_loss_norm, cyc_loss_norm, bridge.vlm_to_jepa.parameters())
+                log_entry["bridge_grad_fwd_vs_cycle_cos_sim"] = fwd_vs_cyc_cos
+                log_entry["bridge_grad_rev_vs_cycle_cos_sim"] = rev_vs_cyc_cos
+                log_entry["bridge_grad_fwd_norm"] = fwd_norm
+                log_entry["bridge_grad_rev_norm"] = rev_norm
 
             total_loss.backward()
             if is_ddp():

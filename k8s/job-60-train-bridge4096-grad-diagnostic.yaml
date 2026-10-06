@@ -1,21 +1,24 @@
 # Step 60: push bridge capacity further than job-42's bridge_hidden_dim=2048
 # (job-39's smoke test OOM'd at 4096 on a 22GB card with 2-GPU DDP: "GPU 1
 # has a total capacity of 22.06 GiB ... this process has 16.29 GiB memory
-# in use" on every reverse-direction item). Requesting A100s specifically
-# this time (40GB/80GB, vs whatever 22-24GB card the NotIn-blacklist might
-# land on) for the headroom 4096 needs, accepting a longer scheduling queue
-# as the tradeoff -- same policy this project already uses for full-scale
-# training runs per k8s/README.md's "GPU node affinity policy" section.
+# in use" on every reverse-direction item). An A100-only allowlist was tried
+# first here and reverted after leaving the smoke test Pending 14h with zero
+# cluster-wide A100 availability; back on the standard NotIn blacklist, and
+# the smoke test (standard blacklist) already confirmed 4096 fits with no
+# OOM on whatever card it actually landed on.
 #
-# Also turns on --log_bridge_grad_conflict (new flag, see
-# train_joint_coupled_normalized.py's own changelog comment at that
-# argparse entry): logs cosine similarity between fwd_loss's and rev_loss's
-# own gradients on the shared bridge parameters each step. Distinguishes
-# genuine task interference (gradients pointing opposite directions on the
-# bridge) from mere loss-scale imbalance (which LossNormalizer already
-# corrects for, and which job-34's own normalization fix already addressed)
-# -- answers whether a PCGrad-style gradient-surgery fix is worth pursuing
-# next, or whether scale was really the whole story.
+# Also turns on --log_bridge_grad_conflict. The smoke test's own run of
+# this flag logged a naive fwd_loss-vs-rev_loss gradient cosine similarity,
+# which turned out to be tautologically 0.0 every step: fwd_loss only
+# touches bridge.jepa_to_vlm and rev_loss only touches bridge.vlm_to_jepa
+# (disjoint parameter support via the ForwardingAdapter composition), so
+# that comparison can never show real interference. Fixed before this full
+# run to instead log cos(fwd_loss grad, cycle_loss grad) on jepa_to_vlm
+# params and cos(rev_loss grad, cycle_loss grad) on vlm_to_jepa params --
+# i.e. does cycle_loss (the one term touching both heads) fight each task's
+# own gradient on the parameters that task actually uses. Answers whether a
+# PCGrad-style gradient-surgery fix is worth pursuing next, or whether scale
+# (already handled by LossNormalizer / job-34's fix) was the whole story.
 #
 # Otherwise identical to job-42's own winning recipe: --disable_norm
 # --cycle_loss_weight 0 (job-56's run already showed normalization hurts
