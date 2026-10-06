@@ -55,6 +55,10 @@ spec:
                     operator: NotIn
                     values:
                       - nrp-01.laccd.edu
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "20000"
       containers:
         - name: train-bridge4096-grad-diag
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
