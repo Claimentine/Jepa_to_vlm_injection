@@ -62,8 +62,8 @@ spec:
         - name: PYTHONUNBUFFERED
           value: "1"
       resources:
-        requests: {cpu: "4", memory: "16Gi", ephemeral-storage: "2Gi", nvidia.com/gpu: "1"}
-        limits: {cpu: "6", memory: "19Gi", ephemeral-storage: "4Gi", nvidia.com/gpu: "1"}
+        requests: {cpu: "4", memory: "20Gi", ephemeral-storage: "2Gi", nvidia.com/gpu: "1"}
+        limits: {cpu: "5", memory: "24Gi", ephemeral-storage: "4Gi", nvidia.com/gpu: "1"}
       volumeMounts:
         - name: git-repo-code
           mountPath: /code
@@ -71,6 +71,8 @@ spec:
           mountPath: /home/jovyan
         - name: data-storage
           mountPath: /data
+        - name: shm
+          mountPath: /dev/shm
   initContainers:
     - name: init-clone-repo
       image: alpine/git
@@ -94,6 +96,10 @@ spec:
     - name: data-storage
       persistentVolumeClaim:
         claimName: jepa-vlm-injection-data-vol
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 8Gi
   securityContext:
     fsGroup: 1000
     fsGroupChangePolicy: OnRootMismatch
