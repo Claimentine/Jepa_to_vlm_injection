@@ -63,11 +63,10 @@ from egodex.trajectory_dataset import build_egodex_dataloaders, WRISTS  # noqa: 
 WRIST_JOINT_IDX = [24, 50]
 N_WRIST_JOINTS = len(WRIST_JOINT_IDX)
 
-# extras['vjepa_input_frame_indices'] (past, 32) followed by
-# ['vjepa_target_frame_indices'] (future, 32) are absolute source-video frame
-# numbers sampled at a stride (~5), forming one 64-entry sequence that maps onto
-# xyz_world's 64-frame axis. Future trajectory = xyz_world[:, 32:64]; the
-# combined indices are checked to be strictly increasing in batch_to_samples().
+# xyz_world's 64-entry axis is aligned to concat(vjepa_input_frame_indices,
+# vjepa_target_frame_indices), per the assertion in ThinkJEPA's
+# trajectory_dataset.py (expected_frame_indices). Future = positions 32:64.
+# Indices may repeat (tubelet pooling), so no monotonicity is assumed.
 FUTURE_FRAMES = slice(32, 64)
 
 BASE = os.environ.get("VANS_ROOT", "/data")
@@ -187,16 +186,10 @@ def batch_to_samples(batch, device):
     vlm_new = extras["vlm_new"]
     vlm_old_len = extras["vlm_old_len"]
     vlm_new_len = extras["vlm_new_len"]
-    input_frame_idx = extras["vjepa_input_frame_indices"]    # (B,32), absolute source-video frame numbers
-    target_frame_idx = extras["vjepa_target_frame_indices"]  # (B,32), absolute source-video frame numbers
-
     samples = []
     for i in range(B):
         old_len = int(vlm_old_len[i])
         new_len = int(vlm_new_len[i])
-        combined = torch.cat([input_frame_idx[i], target_frame_idx[i]])
-        if not bool((combined[1:] > combined[:-1]).all()):
-            raise ValueError(f"past+future frame indices are not strictly increasing: {combined.tolist()}")
         target = xyz_world[i, FUTURE_FRAMES][:, WRIST_JOINT_IDX, :]  # (32, 2, 3)
         samples.append({
             "in_feats": vjepa_in[i:i + 1].to(device),               # (1,16,256,1024)
