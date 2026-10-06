@@ -100,7 +100,7 @@ def build_dataloaders(args):
         test_manifest=os.path.join(EGODEX_BUNDLE, "manifests/portable_v1/test_cache.txt"),
         use_npz_cache=True,
         cache_dir=os.path.join(EGODEX_BUNDLE, "cache"),
-        num_workers=0,
+        num_workers=args.num_workers,
         pin_memory=False,
         load_cache_images=False,
         camera_mode="egodex",
@@ -302,6 +302,11 @@ def main():
     ap.add_argument("--checkpoints", nargs="+", default=["job15_independent"],
                      help="one or more labels from CHECKPOINTS (or label=path)")
     ap.add_argument("--batch_size", type=int, default=4)
+    ap.add_argument("--num_workers", type=int, default=4,
+                     help="DataLoader worker count -- matches job-61's own NUM_WORKERS=4 for the "
+                          "real EgoDex training recipe; only affects per-batch iteration speed, "
+                          "not the one-time dataset/manifest construction inside "
+                          "build_egodex_dataloaders() itself")
     ap.add_argument("--probe_epochs", type=int, default=10)
     ap.add_argument("--probe_lr", type=float, default=1e-3)
     ap.add_argument("--probe_hidden_dim", type=int, default=512)
