@@ -76,7 +76,8 @@ spec:
 
               cd "$REPO"
               nvidia-smi --query-gpu=index,name,memory.total --format=csv
-              exec torchrun --standalone --nproc_per_node=2 \
+              mkdir -p /data/raw_data/joint_coupled_bridge4096_runs
+              torchrun --standalone --nproc_per_node=2 \
                 vans_qa/full_scale/train_joint_coupled_normalized.py \
                 --qa_split /data/raw_data/qa_split_temporal.json \
                 --disable_norm \
@@ -87,7 +88,8 @@ spec:
                 --val_every_steps 500 \
                 --save_every_steps 1000 \
                 --max_val_items 100 \
-                --out_dir /data/raw_data/joint_coupled_bridge4096_runs
+                --out_dir /data/raw_data/joint_coupled_bridge4096_runs 2>&1 \
+                | tee /data/raw_data/joint_coupled_bridge4096_runs/full_run.log
           env:
             - name: VANS_ROOT
               value: /data

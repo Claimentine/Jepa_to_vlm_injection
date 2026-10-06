@@ -17,8 +17,8 @@ Batch structure (verified live via --inspect_batch_only on 2026-10-05): a
 cam_int, img, lang_instruct, confs, extras, paths); extras carries
 vlm_old/vlm_new (+ _mask/_len), vjepa_input_feats/vjepa_target_feats
 (B,16,256,1024, matching this project's own in_feats/out_feats convention
-exactly), and vjepa_target_frame_indices (B,32) -- the real frame indices
-used for the trajectory target, read directly rather than assumed.
+exactly), and vjepa_input/target_frame_indices (B,32) -- absolute frame numbers
+from which the window-relative trajectory target positions are derived.
 """
 import argparse
 import json
@@ -63,11 +63,10 @@ from egodex.trajectory_dataset import build_egodex_dataloaders, WRISTS  # noqa: 
 WRIST_JOINT_IDX = [24, 50]
 N_WRIST_JOINTS = len(WRIST_JOINT_IDX)
 
-# The T=64 raw-frame axis (xyz_world etc.) is NOT assumed to split as a plain
-# [0:32]/[32:64] slice -- the batch's own extras['vjepa_target_frame_indices']
-# (B,32) gives the exact frame indices vjepa_target_feats was computed from,
-# confirmed present via a live --inspect_batch_only dump, so the trajectory
-# target is gathered using those real indices instead of a hypothesized slice.
+# extras['vjepa_target_frame_indices'] / ['vjepa_input_frame_indices'] are
+# ABSOLUTE source-video frame numbers (values up to ~69), not positions into
+# the 64-frame xyz_world window. The window-relative position is
+# target_idx - input_idx[:, 0], which batch_to_samples() computes and range-checks.
 
 BASE = os.environ.get("VANS_ROOT", "/data")
 EGODEX_BUNDLE = os.environ.get("EGODEX_BUNDLE", "/data/raw_data/thinkjepa_egodex_iso")
@@ -186,13 +185,21 @@ def batch_to_samples(batch, device):
     vlm_new = extras["vlm_new"]
     vlm_old_len = extras["vlm_old_len"]
     vlm_new_len = extras["vlm_new_len"]
-    target_frame_idx = extras["vjepa_target_frame_indices"]  # (B,32), real indices
+    target_frame_idx = extras["vjepa_target_frame_indices"]  # (B,32), absolute source-video frame numbers
+    input_frame_idx = extras["vjepa_input_frame_indices"]    # (B,32), absolute source-video frame numbers
 
     samples = []
     for i in range(B):
         old_len = int(vlm_old_len[i])
         new_len = int(vlm_new_len[i])
-        target = xyz_world[i, target_frame_idx[i]][:, WRIST_JOINT_IDX, :]  # (32, 2, 3)
+        window_start = int(input_frame_idx[i, 0])
+        rel_target = target_frame_idx[i] - window_start
+        if int(rel_target.min()) < 0 or int(rel_target.max()) >= xyz_world.shape[1]:
+            raise ValueError(
+                f"target frames {rel_target.tolist()} fall outside xyz_world window "
+                f"of {xyz_world.shape[1]} frames (window_start={window_start})"
+            )
+        target = xyz_world[i, rel_target][:, WRIST_JOINT_IDX, :]  # (32, 2, 3)
         samples.append({
             "in_feats": vjepa_in[i:i + 1].to(device),               # (1,16,256,1024)
             "vlm_old": vlm_old[i, :, :old_len, :].to(device),       # (L,S_real,2048)
