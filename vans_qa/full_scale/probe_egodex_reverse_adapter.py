@@ -63,10 +63,12 @@ from egodex.trajectory_dataset import build_egodex_dataloaders, WRISTS  # noqa: 
 WRIST_JOINT_IDX = [24, 50]
 N_WRIST_JOINTS = len(WRIST_JOINT_IDX)
 
-# extras['vjepa_target_frame_indices'] / ['vjepa_input_frame_indices'] are
-# ABSOLUTE source-video frame numbers (values up to ~69), not positions into
-# the 64-frame xyz_world window. The window-relative position is
-# target_idx - input_idx[:, 0], which batch_to_samples() computes and range-checks.
+# extras['vjepa_input_frame_indices'] (past, 32) followed by
+# ['vjepa_target_frame_indices'] (future, 32) are absolute source-video frame
+# numbers sampled at a stride (~5), forming one 64-entry sequence that maps onto
+# xyz_world's 64-frame axis. Future trajectory = xyz_world[:, 32:64]; the
+# combined indices are checked to be strictly increasing in batch_to_samples().
+FUTURE_FRAMES = slice(32, 64)
 
 BASE = os.environ.get("VANS_ROOT", "/data")
 EGODEX_BUNDLE = os.environ.get("EGODEX_BUNDLE", "/data/raw_data/thinkjepa_egodex_iso")
@@ -185,21 +187,17 @@ def batch_to_samples(batch, device):
     vlm_new = extras["vlm_new"]
     vlm_old_len = extras["vlm_old_len"]
     vlm_new_len = extras["vlm_new_len"]
-    target_frame_idx = extras["vjepa_target_frame_indices"]  # (B,32), absolute source-video frame numbers
     input_frame_idx = extras["vjepa_input_frame_indices"]    # (B,32), absolute source-video frame numbers
+    target_frame_idx = extras["vjepa_target_frame_indices"]  # (B,32), absolute source-video frame numbers
 
     samples = []
     for i in range(B):
         old_len = int(vlm_old_len[i])
         new_len = int(vlm_new_len[i])
-        window_start = int(input_frame_idx[i, 0])
-        rel_target = target_frame_idx[i] - window_start
-        if int(rel_target.min()) < 0 or int(rel_target.max()) >= xyz_world.shape[1]:
-            raise ValueError(
-                f"target frames {rel_target.tolist()} fall outside xyz_world window "
-                f"of {xyz_world.shape[1]} frames (window_start={window_start})"
-            )
-        target = xyz_world[i, rel_target][:, WRIST_JOINT_IDX, :]  # (32, 2, 3)
+        combined = torch.cat([input_frame_idx[i], target_frame_idx[i]])
+        if not bool((combined[1:] > combined[:-1]).all()):
+            raise ValueError(f"past+future frame indices are not strictly increasing: {combined.tolist()}")
+        target = xyz_world[i, FUTURE_FRAMES][:, WRIST_JOINT_IDX, :]  # (32, 2, 3)
         samples.append({
             "in_feats": vjepa_in[i:i + 1].to(device),               # (1,16,256,1024)
             "vlm_old": vlm_old[i, :, :old_len, :].to(device),       # (L,S_real,2048)
