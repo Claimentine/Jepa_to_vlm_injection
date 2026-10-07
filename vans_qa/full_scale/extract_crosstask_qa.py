@@ -309,9 +309,15 @@ def main():
     ap.add_argument("--vjepa_cache_dir", default=os.path.join(WORK_BASE, "vjepa_cache_full"))
     ap.add_argument("--vjepa_checkpoint", default=os.environ.get("VJEPA2_CKPT", "/data/checkpoints/vjepa2/vitl.pt"))
     ap.add_argument("--limit_videos", type=int, default=None, help="cap distinct videos (smoke test)")
-    ap.add_argument("--num_frames", type=int, default=16)
+    ap.add_argument("--num_frames", type=int, default=None,
+                     help="defaults to NUM_PAST_FRAMES (32): the model does 2x temporal tubelet "
+                          "pooling, so 32 input frames yields the (16,256,1024) shape every other "
+                          "cache in this project uses; 16 fails encode_vjepa_clip's shape check")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+    if args.num_frames is None:
+        from cache_train.rebuild_causal_cache import NUM_PAST_FRAMES
+        args.num_frames = NUM_PAST_FRAMES
 
     crosstask_dir = fetch_crosstask_annotations(args.annotations_cache_dir)
     pairs = select_qa_pairs(crosstask_dir, limit_videos=args.limit_videos, seed=args.seed)
