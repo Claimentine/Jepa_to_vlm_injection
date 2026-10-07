@@ -217,6 +217,28 @@ def ade_fde(pred, target, thr=0.05):
     return float(avg_dist.mean().item()), float(final_dist.mean().item()), float(acc.item())
 
 
+def static_baseline_ade_fde(loader, max_batches=None, thr=0.05):
+    """Trivial baseline, no model: predicts the wrist stays at its last
+    observed (past-window) position for the whole future window. If a
+    trained probe can't beat this, it hasn't learned any real motion
+    signal -- just necessary context for judging the probe's ADE/FDE."""
+    all_pred, all_target = [], []
+    for bi, batch in enumerate(loader):
+        if max_batches and bi >= max_batches:
+            break
+        (xyz_cam, R_cam, xyz_world, R_world, tfs_in_cam, tfs, cam_ext, cam_int,
+         img, lang_instruct, confs, extras, paths) = batch
+        last_pos = xyz_world[:, 31][:, WRIST_JOINT_IDX, :]          # (B,2,3) last past frame
+        pred = last_pos.unsqueeze(1).expand(-1, 32, -1, -1)         # (B,32,2,3)
+        target = xyz_world[:, FUTURE_FRAMES][:, :, WRIST_JOINT_IDX, :]  # (B,32,2,3)
+        all_pred.append(pred)
+        all_target.append(target)
+    pred_stack = torch.cat(all_pred, dim=0)
+    target_stack = torch.cat(all_target, dim=0)
+    ade, fde, acc = ade_fde(pred_stack, target_stack, thr=thr)
+    return ade, fde, acc, pred_stack.shape[0]
+
+
 def describe(obj, name, depth=0):
     pad = "  " * depth
     if torch.is_tensor(obj):
@@ -301,6 +323,9 @@ def run_probe(label, predictor, train_loader, test_loader, device, args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--inspect_batch_only", action="store_true")
+    ap.add_argument("--baseline_only", action="store_true",
+                     help="compute the static (stay-at-last-observed-position) baseline on the "
+                          "test split and exit -- no checkpoint, no probe training, no GPU needed")
     ap.add_argument("--checkpoints", nargs="+", default=["job15_independent"],
                      help="one or more labels from CHECKPOINTS (or label=path)")
     ap.add_argument("--batch_size", type=int, default=4)
@@ -319,6 +344,13 @@ def main():
 
     train_loader, test_loader = build_dataloaders(args)
     print(f"[INFO] train_loader batches~{len(train_loader)} test_loader batches~{len(test_loader)}", flush=True)
+
+    if args.baseline_only:
+        ade, fde, acc, n = static_baseline_ade_fde(test_loader, max_batches=args.max_test_batches)
+        print(f"[STATIC_BASELINE] n={n} ADE={ade:.6f} FDE={fde:.6f} acc@0.05={acc:.4f}", flush=True)
+        print("[DONE] baseline_only -- stopping here", flush=True)
+        return
+
     ds = train_loader.dataset
     for attr in ("query_tfs", "joint_names", "tfs_names", "query_joint_names", "camera_mode"):
         if hasattr(ds, attr):
