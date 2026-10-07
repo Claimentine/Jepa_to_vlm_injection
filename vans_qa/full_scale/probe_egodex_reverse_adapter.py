@@ -149,26 +149,32 @@ def predict_future_latent(predictor, in_feats, extras, device):
     return y_future
 
 
-class TrajectoryProbe(nn.Module):
-    """Small trained head: pooled predicted future latent -> future WRIST xyz
-    trajectory. Everything upstream of this (the predictor) stays frozen --
-    this is the only part allowed to learn, so a good result means the
-    FROZEN predictor's own latent space already carries real trajectory
-    signal, not that we re-trained our way to a good answer."""
+class TokenTrajectoryProbe(nn.Module):
+    """Trained head on top of the frozen predictor. Keeps the temporal axis:
+    spatial patches are pooled per token with learned attention (so the probe
+    can focus on hand locations rather than averaging them away), then each
+    future token is decoded to the wrist xyz of its two raw frames. Only this
+    head learns, so a good result means the FROZEN predictor's latent already
+    carries the trajectory signal."""
 
-    def __init__(self, in_dim, hidden_dim, out_frames, out_joints):
+    def __init__(self, dim, hidden_dim, n_tokens, n_joints):
         super().__init__()
-        self.out_frames = out_frames
-        self.out_joints = out_joints
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
+        self.n_tokens = n_tokens
+        self.n_joints = n_joints
+        self.attn_score = nn.Linear(dim, 1)
+        self.time_embed = nn.Parameter(torch.zeros(n_tokens, dim))
+        self.head = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, out_frames * out_joints * 3),
+            nn.Linear(hidden_dim, 2 * n_joints * 3),
         )
 
-    def forward(self, pooled_feat):
-        out = self.net(pooled_feat)
-        return out.view(out.shape[0], self.out_frames, self.out_joints, 3)
+    def forward(self, tokens):
+        B = tokens.shape[0]
+        weights = torch.softmax(self.attn_score(tokens).squeeze(-1), dim=-1)  # (B,T,P)
+        pooled = (weights.unsqueeze(-1) * tokens).sum(dim=2) + self.time_embed  # (B,T,D)
+        out = self.head(pooled).view(B, self.n_tokens, 2, self.n_joints, 3)
+        return out.reshape(B, self.n_tokens * 2, self.n_joints, 3)  # (B,32,J,3)
 
 
 def batch_to_samples(batch, device):
@@ -228,9 +234,9 @@ def describe(obj, name, depth=0):
 
 
 def run_probe(label, predictor, train_loader, test_loader, device, args):
-    probe = TrajectoryProbe(
-        in_dim=rev.D_EMBED, hidden_dim=args.probe_hidden_dim,
-        out_frames=32, out_joints=N_WRIST_JOINTS,
+    probe = TokenTrajectoryProbe(
+        dim=rev.D_EMBED, hidden_dim=args.probe_hidden_dim,
+        n_tokens=rev.T_PER_CLIP, n_joints=N_WRIST_JOINTS,
     ).to(device)
     opt = torch.optim.AdamW(probe.parameters(), lr=args.probe_lr)
 
@@ -247,8 +253,7 @@ def run_probe(label, predictor, train_loader, test_loader, device, args):
                     y_future = predict_future_latent(
                         predictor, s["in_feats"], {"vlm_old": s["vlm_old"], "vlm_new": s["vlm_new"]}, device,
                     )  # (1,16,256,1024), frozen -- no grad needed through the predictor itself
-                pooled = y_future.mean(dim=(1, 2))  # (1,1024)
-                pred_traj = probe(pooled)[0]        # (32,2,3)
+                pred_traj = probe(y_future)[0]  # (32,2,3)
                 preds.append(pred_traj)
                 targets.append(s["target"])
             pred_stack = torch.stack(preds)    # (B,32,2,3)
@@ -277,8 +282,7 @@ def run_probe(label, predictor, train_loader, test_loader, device, args):
                 y_future = predict_future_latent(
                     predictor, s["in_feats"], {"vlm_old": s["vlm_old"], "vlm_new": s["vlm_new"]}, device,
                 )
-                pooled = y_future.mean(dim=(1, 2))
-                pred_traj = probe(pooled)[0]
+                pred_traj = probe(y_future)[0]
                 all_pred.append(pred_traj)
                 all_target.append(s["target"])
     pred_stack = torch.stack(all_pred)
