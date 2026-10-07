@@ -1,7 +1,9 @@
-# Step 64: GPU eval of the joint-trained forward checkpoints (job-42 bridge
-# MLP-2048, job-49 COIN-mix) on the CrossTask OOD split, reading the decoupled
-# input cache built by job-63. Run after job-63 completes. Same
-# eval_forward_checkpoint.py entry point as job-57, with --precompute_cache_dir.
+# Step 64: GPU eval of the full forward-checkpoint set (same set as the
+# TempCompass/MVBench comparisons in job-41/46/54/57/58) on the CrossTask OOD
+# split, reading the decoupled input cache built by job-63. Includes
+# job13_independent as the non-joint baseline, plus every joint variant
+# (job22/34/36/42/49/56), so CrossTask's results are directly comparable to
+# the other two OOD benchmarks. Run after job-63 completes.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -51,9 +53,14 @@ spec:
                 --qa_split /data/raw_data/qa_split_crosstask.json \
                 --split_part test \
                 --precompute_cache_dir "$CACHE" \
+                --checkpoint "job13_independent=/data/raw_data/qa_full_runs_temporal_crossattn/jepa/best.pt" \
+                --checkpoint "job22_joint_vans_only=/data/raw_data/joint_coupled_runs/best_forward.pt" \
+                --checkpoint "job34_joint_normalized=/data/raw_data/joint_coupled_normalized_runs/best_forward.pt" \
+                --checkpoint "job36_joint_cycle0=/data/raw_data/joint_coupled_cycle0_runs/best_forward.pt" \
                 --checkpoint "job42_bridge_mlp2048=/data/raw_data/joint_coupled_bridge_mlp_runs/best_forward.pt" \
                 --checkpoint "job49_coin_mix=/data/raw_data/joint_coupled_mixed_normalized_nobridge_runs/best_forward.pt" \
-                --out_path /data/raw_data/crosstask_forward_comparison_joint.json
+                --checkpoint "job56_norm_bridge=/data/raw_data/joint_coupled_norm_bridge_runs/best_forward.pt" \
+                --out_path /data/raw_data/crosstask_forward_comparison_full.json
               echo "SCRIPT_DONE"
           env:
             - name: VANS_ROOT
