@@ -1,0 +1,80 @@
+# Step 66: static (stay-at-last-observed-position) baseline for the EgoDex
+# wrist-trajectory task, on the full test split (139 episodes). No model, no
+# GPU needed -- gives the number the Stage-2 reverse-probe (job-65: ADE
+# 0.260672, FDE 0.146493) must beat to show it learned real motion signal,
+# not just the typical magnitude of wrist displacement over 32 frames.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ruixin-egodex-static-baseline
+spec:
+  containers:
+    - name: baseline
+      image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+      command:
+        - "bash"
+      args:
+        - "-c"
+        - |
+          set -euo pipefail
+          PY=/home/jovyan/conda-envs/thinkjepa/bin/python
+          REPO=/code/Jepa_to_vlm_injection
+          cd "$REPO"
+          "$PY" vans_qa/full_scale/probe_egodex_reverse_adapter.py \
+            --baseline_only \
+            --batch_size 4 \
+            --num_workers 4
+          echo "SCRIPT_DONE"
+      env:
+        - name: VANS_ROOT
+          value: /data
+        - name: THINKJEPA_ROOT
+          value: /home/jovyan/ThinkJEPA
+        - name: PYTHONUNBUFFERED
+          value: "1"
+      resources:
+        requests: {cpu: "4", memory: "12Gi", ephemeral-storage: "2Gi"}
+        limits: {cpu: "4.5", memory: "14Gi", ephemeral-storage: "4Gi"}
+      volumeMounts:
+        - name: git-repo-code
+          mountPath: /code
+        - name: conda-storage
+          mountPath: /home/jovyan
+        - name: data-storage
+          mountPath: /data
+        - name: shm
+          mountPath: /dev/shm
+  initContainers:
+    - name: init-clone-repo
+      image: alpine/git
+      resources:
+        requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+        limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+      args:
+        - clone
+        - --single-branch
+        - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+        - /opt/repo/Jepa_to_vlm_injection
+      volumeMounts:
+        - name: git-repo-code
+          mountPath: /opt/repo
+  volumes:
+    - name: git-repo-code
+      emptyDir: {}
+    - name: conda-storage
+      persistentVolumeClaim:
+        claimName: ruixin-conda-vol
+    - name: data-storage
+      persistentVolumeClaim:
+        claimName: jepa-vlm-injection-data-vol
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 4Gi
+  securityContext:
+    fsGroup: 1000
+    fsGroupChangePolicy: OnRootMismatch
+  restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-66-egodex-static-baseline.yaml -n williamli-scvl
