@@ -1,0 +1,81 @@
+# Step 63: CPU-only build of the decoupled eval input cache for the CrossTask
+# OOD split (qa_split_crosstask.json, produced by job-59's extraction). Per the
+# standing instruction, every eval uses the CPU/GPU-decoupled pipeline: this
+# job does the CPU-bound decode/processor work once, and the GPU eval job
+# (job-64) reads it via --precompute_cache_dir. Run only after job-59's full
+# extraction has written qa_split_crosstask.json and its clips/vjepa caches.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-crosstask-eval-cache-build
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      containers:
+        - name: cache-build
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              export VANS_WORK_ROOT=/data/vans_work_crosstask
+              "$PY" vans_qa/full_scale/build_eval_input_cache.py \
+                --qa_split /data/raw_data/qa_split_crosstask.json \
+                --split_part test \
+                --cache_dir /data/vans_work_crosstask/eval_input_cache_crosstask
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests: {cpu: "8", memory: "16Gi", ephemeral-storage: "2Gi"}
+            limits: {cpu: "9", memory: "19200Mi", ephemeral-storage: "4Gi"}
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-63-crosstask-eval-cache-build.yaml -n williamli-scvl
