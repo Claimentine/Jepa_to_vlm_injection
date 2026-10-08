@@ -3,14 +3,26 @@ trained on EgoDex -- only VANS/COIN/Ego4D self-supervised pairs) already
 carry useful trajectory signal, without any EgoDex-specific training?
 
 Freezes a given checkpoint's CortexGuidedVideoPredictor entirely. Trains
-ONLY a small linear probe (predicted future latent -> 3D joint positions)
-on EgoDex's train split, then reports ADE/FDE on the held-out test split
-using ThinkJEPA's own compute_trajectory_loss_and_accuracy -- same formula,
-same units as job-61's own reported numbers (ADE=0.0683, FDE=0.0733 at
-epoch 20, their own officially-trained-on-EgoDex reference point), so the
-two are directly comparable: "how good is our predictor's latent space as
-a feature extractor for a real downstream task it never saw," vs. "how
-good is a model actually trained end-to-end on that task."
+ONLY a small probe head on EgoDex's train split, then reports ADE/FDE on
+the held-out test split using ThinkJEPA's own
+compute_trajectory_loss_and_accuracy -- same formula, same units as job-61's
+own reported numbers (ADE=0.0683, FDE=0.0733 at epoch 20, their own
+officially-trained-on-EgoDex reference point), so the two are directly
+comparable: "how good is our predictor's latent space as a feature
+extractor for a real downstream task it never saw," vs. "how good is a
+model actually trained end-to-end on that task."
+
+The probe predicts a DISPLACEMENT from the last observed wrist position,
+not an absolute xyz_world position -- an earlier version regressed
+absolute position directly and lost badly to the trivial
+--baseline_only static (stay-put) baseline (ADE 0.2607 vs 0.0274): since
+xyz_world's origin is defined per-episode by that episode's own camera
+extrinsics (an ARKit/SLAM-style session frame, not a shared global frame),
+absolute coordinates carry no meaning across episodes, so a generic
+frozen latent has no way to recover a per-episode origin it was never
+told. Predicting displacement sidesteps that: the probe's output layer is
+zero-initialized, so it starts exactly AT the static baseline and can
+only improve on it by learning real motion signal.
 
 Batch structure (verified live via --inspect_batch_only on 2026-10-05): a
 13-tuple (xyz_cam, R_cam, xyz_world, R_world, tfs_in_cam, tfs, cam_ext,
@@ -155,7 +167,22 @@ class TokenTrajectoryProbe(nn.Module):
     can focus on hand locations rather than averaging them away), then each
     future token is decoded to the wrist xyz of its two raw frames. Only this
     head learns, so a good result means the FROZEN predictor's latent already
-    carries the trajectory signal."""
+    carries the trajectory signal.
+
+    Predicts a DISPLACEMENT from the last observed wrist position, not an
+    absolute xyz_world position. xyz_world's origin is defined per-episode
+    by that episode's own camera extrinsics (an ARKit/SLAM-style session
+    frame -- confirmed by reading trajectory_dataset.py's
+    _project_camera_xyz_to_world_np), so absolute coordinates carry no
+    meaning across episodes; a generic frozen latent has no way to recover
+    a per-episode origin it was never told. The static stay-at-last-position
+    baseline beat the earlier absolute-position version of this probe
+    (ADE 0.0274 vs 0.2607) precisely because it sidesteps that calibration
+    problem for free. Predicting displacement does the same for the probe:
+    the zero-init final layer starts the probe EXACTLY at the static
+    baseline (delta=0), so it can only do better than that baseline by
+    learning real motion signal, not worse by failing to learn a per-episode
+    constant it was never given enough information to infer."""
 
     def __init__(self, dim, hidden_dim, n_tokens, n_joints):
         super().__init__()
@@ -168,6 +195,11 @@ class TokenTrajectoryProbe(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 2 * n_joints * 3),
         )
+        # Zero-init the output layer so the probe starts EXACTLY at the
+        # static baseline (predicted displacement = 0 for every sample
+        # before any training) and has to earn any improvement over it.
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
 
     def forward(self, tokens):
         B = tokens.shape[0]
@@ -196,12 +228,18 @@ def batch_to_samples(batch, device):
     for i in range(B):
         old_len = int(vlm_old_len[i])
         new_len = int(vlm_new_len[i])
-        target = xyz_world[i, FUTURE_FRAMES][:, WRIST_JOINT_IDX, :]  # (32, 2, 3)
+        target = xyz_world[i, FUTURE_FRAMES][:, WRIST_JOINT_IDX, :]  # (32, 2, 3), absolute
+        # last_pos: the last PAST frame's wrist position (index 31), same
+        # per-episode world frame as target -- used to turn the impossible
+        # cross-episode absolute-position regression into a well-posed
+        # relative-displacement one (see TrajectoryProbe/run_probe).
+        last_pos = xyz_world[i, 31][WRIST_JOINT_IDX, :]              # (2, 3)
         samples.append({
             "in_feats": vjepa_in[i:i + 1].to(device),               # (1,16,256,1024)
             "vlm_old": vlm_old[i, :, :old_len, :].to(device),       # (L,S_real,2048)
             "vlm_new": vlm_new[i, :, :new_len, :].to(device),       # (L,S_real,2048)
-            "target": target.to(device),                             # (32,2,3)
+            "target": target.to(device),                             # (32,2,3), absolute
+            "last_pos": last_pos.to(device),                         # (2,3), absolute
         })
     return samples
 
@@ -269,17 +307,18 @@ def run_probe(label, predictor, train_loader, test_loader, device, args):
             if max_batches and bi >= max_batches:
                 break
             samples = batch_to_samples(batch, device)
-            preds, targets = [], []
+            pred_deltas, target_deltas = [], []
             for s in samples:
                 with torch.no_grad():
                     y_future = predict_future_latent(
                         predictor, s["in_feats"], {"vlm_old": s["vlm_old"], "vlm_new": s["vlm_new"]}, device,
                     )  # (1,16,256,1024), frozen -- no grad needed through the predictor itself
-                pred_traj = probe(y_future)[0]  # (32,2,3)
-                preds.append(pred_traj)
-                targets.append(s["target"])
-            pred_stack = torch.stack(preds)    # (B,32,2,3)
-            target_stack = torch.stack(targets)
+                pred_delta = probe(y_future)[0]  # (32,2,3) -- displacement from last_pos
+                target_delta = s["target"] - s["last_pos"].unsqueeze(0)  # (32,2,3)
+                pred_deltas.append(pred_delta)
+                target_deltas.append(target_delta)
+            pred_stack = torch.stack(pred_deltas)    # (B,32,2,3)
+            target_stack = torch.stack(target_deltas)
             loss = nn.functional.mse_loss(pred_stack, target_stack)
             if train:
                 opt.zero_grad()
@@ -304,9 +343,10 @@ def run_probe(label, predictor, train_loader, test_loader, device, args):
                 y_future = predict_future_latent(
                     predictor, s["in_feats"], {"vlm_old": s["vlm_old"], "vlm_new": s["vlm_new"]}, device,
                 )
-                pred_traj = probe(y_future)[0]
-                all_pred.append(pred_traj)
-                all_target.append(s["target"])
+                pred_delta = probe(y_future)[0]
+                pred_abs = s["last_pos"].unsqueeze(0) + pred_delta  # reconstruct absolute position
+                all_pred.append(pred_abs)
+                all_target.append(s["target"])  # already absolute
     pred_stack = torch.stack(all_pred)
     target_stack = torch.stack(all_target)
     ade, fde, acc = ade_fde(pred_stack.unsqueeze(0), target_stack.unsqueeze(0))
@@ -374,9 +414,13 @@ def main():
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
+    base_ade, base_fde, base_acc, base_n = static_baseline_ade_fde(test_loader, max_batches=args.max_test_batches)
+
     print("[SUMMARY]", flush=True)
     for r in results:
         print(f"  {r['label']}: ADE={r['ADE']:.6f} FDE={r['FDE']:.6f} acc@0.05={r['acc_at_0.05']:.4f} n={r['n_test']}", flush=True)
+    print(f"  static_baseline (stay-put, must-beat bar): ADE={base_ade:.6f} FDE={base_fde:.6f} "
+          f"acc@0.05={base_acc:.4f} n={base_n}", flush=True)
     print("  job61_thinkjepa_official_recipe (reference): ADE=0.068294 FDE=0.073280", flush=True)
 
     if args.out_json:
