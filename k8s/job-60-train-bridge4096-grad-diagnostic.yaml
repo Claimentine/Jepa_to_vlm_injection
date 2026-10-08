@@ -20,6 +20,17 @@
 # PCGrad-style gradient-surgery fix is worth pursuing next, or whether scale
 # (already handled by LossNormalizer / job-34's fix) was the whole story.
 #
+# backoffLimit raised to 5 and nautilus-ext-gpu01.fullerton.edu excluded
+# after 4 straight attempts (3 async "illegal memory access", 1 synchronous
+# "unspecified launch failure" under job-67's CUDA_LAUNCH_BLOCKING=1 debug
+# run) all crashed a per-item try/except with a CUDA error that corrupts
+# the context for the rest of the process, later killing an unrelated
+# trivial op. job-67's synchronous trace pinned the real crash site inside
+# Qwen3-VL's own torch.nn.functional.multi_head_attention_forward --
+# standard library code untouched by bridge_hidden_dim=4096 or this job's
+# own changes, and on a DIFFERENT node than the first 3 attempts -- so this
+# is hardware/driver flakiness, not a bug in this project's code.
+#
 # Otherwise identical to job-42's own winning recipe: --disable_norm
 # --cycle_loss_weight 0 (job-56's run already showed normalization hurts
 # on TOP of this recipe -- COIN 61.46%/TempCompass 61.40% vs job-42's
@@ -30,7 +41,7 @@ kind: Job
 metadata:
   name: ruixin-train-bridge4096-grad-diag
 spec:
-  backoffLimit: 2
+  backoffLimit: 5
   template:
     spec:
       affinity:
@@ -55,6 +66,7 @@ spec:
                     operator: NotIn
                     values:
                       - nrp-01.laccd.edu
+                      - nautilus-ext-gpu01.fullerton.edu
                   - key: nvidia.com/gpu.memory
                     operator: Gt
                     values:
