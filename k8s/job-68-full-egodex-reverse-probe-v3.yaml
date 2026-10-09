@@ -1,0 +1,115 @@
+# Step 68: full EgoDex reverse-probe, v3 (predicts displacement from last
+# observed wrist position, not absolute xyz_world -- v2's absolute-position
+# version lost badly to the static stay-put baseline: ADE 0.2607 vs 0.0274.
+# v3's smoke test (n=40) already beats both the static baseline and job-61's
+# own ThinkJEPA-on-EgoDex reference on FDE: 0.0447 vs 0.0851 / 0.0733, though
+# still behind the static baseline on ADE (0.0504 vs 0.0251). This full run
+# (1861 train / 139 test episodes, 10 probe epochs) checks whether that holds
+# at scale. job-15 frozen predictor (never trained on EgoDex).
+#
+# Kind: Job, not a bare Pod, so the run is not subject to the ~6h pod limit.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-full-egodex-reverse-probe-v3
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-01.laccd.edu
+      containers:
+        - name: probe-v3-full
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/thinkjepa/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/egodex_reverse_probe_v3_full
+              "$PY" vans_qa/full_scale/probe_egodex_reverse_adapter.py \
+                --checkpoints job15_independent \
+                --batch_size 4 \
+                --probe_epochs 10 \
+                --num_workers 4 \
+                --out_json /data/raw_data/egodex_reverse_probe_v3_full/job15_full.json \
+                2>&1 | tee /data/raw_data/egodex_reverse_probe_v3_full/full_run.log
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests: {cpu: "4", memory: "20Gi", ephemeral-storage: "2Gi", nvidia.com/gpu: "1"}
+            limits: {cpu: "4.8", memory: "24Gi", ephemeral-storage: "4Gi", nvidia.com/gpu: "1"}
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+            - name: shm
+              mountPath: /dev/shm
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-68-full-egodex-reverse-probe-v3.yaml -n williamli-scvl
