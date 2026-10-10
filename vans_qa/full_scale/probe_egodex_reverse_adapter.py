@@ -52,6 +52,7 @@ if THINKJEPA_ROOT not in sys.path:
     sys.path.insert(0, THINKJEPA_ROOT)
 
 import train_latent_world_model_full as rev  # noqa: E402
+from common.cross_modal_bridge import CrossModalBridge, ForwardingAdapter  # noqa: E402
 from egodex.trajectory_dataset import build_egodex_dataloaders, WRISTS  # noqa: E402
 
 # compute_trajectory_loss_and_accuracy's exact formula (confirmed by reading
@@ -88,6 +89,7 @@ CHECKPOINTS = {
     "job15_independent": "/data/raw_data/latent_world_model_runs/crossattn/best.pt",
     "job42_bridge_mlp2048": "/data/raw_data/joint_coupled_bridge_mlp_runs/best_reverse.pt",
     "job49_coin_mix": "/data/raw_data/joint_coupled_mixed_normalized_nobridge_runs/best_reverse.pt",
+    "job60_bridge4096": "/data/raw_data/joint_coupled_bridge4096_runs/best_reverse.pt",
 }
 
 
@@ -123,11 +125,33 @@ def load_frozen_predictor(label, device):
     path = CHECKPOINTS[label] if "=" not in label else label.split("=", 1)[1]
     predictor = rev.build_predictor(device, "crossattn")
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    # job15_independent's format (plain {"predictor_state": ...}), confirmed
-    # by reading train_latent_world_model_full.py's own torch.save call sites
-    # directly -- no bridge/ForwardingAdapter composition involved for this
-    # checkpoint. job42/job49's best_reverse.pt format is NOT yet confirmed to
-    # match -- only job15_independent is wired up so far.
+    bridge = None
+    if "bridge_state" in ckpt:
+        # Joint-training checkpoints (train_joint_coupled_normalized.py,
+        # e.g. job-42/49/60's best_reverse.pt): {"predictor_state": ...,
+        # "bridge_state": ...}. predictor.guidance_old_adapter/new_adapter
+        # were replaced with a parameter-free ForwardingAdapter(bridge.
+        # vlm_to_jepa, predictor.context_adapter) during training (see
+        # train_joint_coupled_normalized.py's own composition), so the
+        # predictor's own state_dict does NOT include the bridge's real
+        # weights -- loading predictor_state alone would silently evaluate
+        # with an UNTRAINED substitute there. Same bridge-rewiring trick
+        # eval_forward_checkpoint.py already uses for the forward side,
+        # mirrored here for the reverse side's own adapters.
+        bridge_state = ckpt["bridge_state"]
+        if "jepa_to_vlm.weight" in bridge_state:
+            hidden_dim = None
+        else:
+            hidden_dim = bridge_state["jepa_to_vlm.0.weight"].shape[0]
+        print(f"[INFO] {path}: has a shared CrossModalBridge (hidden_dim={hidden_dim}) -- "
+              "rewiring ForwardingAdapter before loading state dicts", flush=True)
+        bridge = CrossModalBridge(jepa_dim=1024, vlm_dim=2048, hidden_dim=hidden_dim).to(device)
+        predictor.guidance_old_adapter = ForwardingAdapter(bridge.vlm_to_jepa, predictor.context_adapter)
+        predictor.guidance_new_adapter = ForwardingAdapter(bridge.vlm_to_jepa, predictor.context_adapter)
+        bridge.load_state_dict(bridge_state)
+        bridge.eval()
+        for p in bridge.parameters():
+            p.requires_grad_(False)
     state = ckpt["predictor_state"] if "predictor_state" in ckpt else ckpt
     predictor.load_state_dict(state)
     predictor.eval()
