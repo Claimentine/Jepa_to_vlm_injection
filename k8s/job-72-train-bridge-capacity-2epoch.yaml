@@ -46,6 +46,16 @@ spec:
                       - nrp-01.laccd.edu
                       - nautilus-ext-gpu01.fullerton.edu
                       - hcc-nrp-shor-c5809.unl.edu
+                      # Excluded 2026-10-11: scheduled here despite this
+                      # node's own nvidia.com/gpu.product label being
+                      # NVIDIA-TITAN-Xp, which is already in the blacklist
+                      # above -- the scheduler let it through anyway
+                      # (unexplained), and PyTorch then refused the card
+                      # (sm_61 unsupported by this build), stalling the job
+                      # for 2.5h with no training output. Hostname exclusion
+                      # as a belt-and-suspenders fix since the product
+                      # blacklist alone didn't actually keep it out.
+                      - dtn-gpu2.kreonet.net
       containers:
         - name: train-bridge-capacity-2epoch
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
