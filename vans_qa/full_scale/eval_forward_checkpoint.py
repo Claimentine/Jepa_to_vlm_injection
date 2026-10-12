@@ -109,6 +109,12 @@ def main():
                           "evaluate_logprob loads each item's already-decoded-and-processed "
                           "model inputs from here instead of doing that CPU-bound work live, "
                           "falling back to live building on any per-item cache miss")
+    ap.add_argument("--resume", action="store_true",
+                     help="if --out_path already exists, load it first and skip any checkpoint "
+                          "label already present with the same split_part -- lets a multi-checkpoint "
+                          "run recover from a crash (node eviction, CUDA fault, etc.) without "
+                          "re-evaluating checkpoints that already finished. Off by default so a "
+                          "plain rerun with the same --out_path always re-evaluates everything.")
     args = ap.parse_args()
 
     checkpoints = []
@@ -140,7 +146,17 @@ def main():
     layer_indices = select_layer_indices(len(resolve_decoder_layers(model)), args.layer_strategy)
 
     results = {}
+    if args.resume and args.out_path and os.path.exists(args.out_path):
+        with open(args.out_path) as f:
+            results = json.load(f)
+        print(f"[INFO] --resume: loaded {len(results)} existing result(s) from {args.out_path}", flush=True)
+
     for label, checkpoint_path in checkpoints:
+        existing = results.get(label)
+        if args.resume and existing is not None and existing.get("split_part") == args.split_part:
+            print(f"[SKIP] {label} {args.split_part}: already in {args.out_path} "
+                  f"(n={existing.get('n_total')} acc={existing.get('acc')})", flush=True)
+            continue
         injector = load_checkpoint_into_fresh_injector(checkpoint_path, hidden_size, layer_indices, args.seed, device)
         # A fresh hook per checkpoint (its pre_hook closures bake in this
         # specific injector's own trained weights via self.injector.apply) --
@@ -162,11 +178,15 @@ def main():
             "n_total": tally.n_total, "acc": tally.acc,
             "acc_by_difficulty": tally.acc_by_difficulty,
         }
+        # Write after EVERY checkpoint, not just at the end -- a crash
+        # (node eviction, CUDA fault) partway through a multi-checkpoint run
+        # must not lose already-finished results, or --resume above would
+        # have nothing to skip on the next attempt.
+        if args.out_path:
+            with open(args.out_path, "w") as f:
+                json.dump(results, f, indent=2)
 
     print(f"[SUMMARY] {json.dumps(results, indent=2)}", flush=True)
-    if args.out_path:
-        with open(args.out_path, "w") as f:
-            json.dump(results, f, indent=2)
 
 
 if __name__ == "__main__":

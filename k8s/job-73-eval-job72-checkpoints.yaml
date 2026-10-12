@@ -70,6 +70,7 @@ spec:
                 --qa_split /data/raw_data/qa_split_temporal.json \
                 --split_part test \
                 --checkpoint "${CKPTS[0]}" --checkpoint "${CKPTS[1]}" --checkpoint "${CKPTS[2]}" \
+                --resume \
                 --out_path /data/raw_data/forward_fulltest_comparison_job72.json
 
               echo "=== TempCompass OOD ==="
@@ -78,6 +79,7 @@ spec:
                 --qa_split /data/raw_data/qa_split_tempcompass.json \
                 --split_part test \
                 --checkpoint "${CKPTS[0]}" --checkpoint "${CKPTS[1]}" --checkpoint "${CKPTS[2]}" \
+                --resume \
                 --out_path /data/raw_data/tempcompass_forward_comparison_job72.json
 
               echo "=== MVBench OOD ==="
@@ -86,6 +88,7 @@ spec:
                 --qa_split /data/raw_data/qa_split_mvbench.json \
                 --split_part test \
                 --checkpoint "${CKPTS[0]}" --checkpoint "${CKPTS[1]}" --checkpoint "${CKPTS[2]}" \
+                --resume \
                 --out_path /data/raw_data/mvbench_forward_comparison_job72.json
 
               echo "=== CrossTask OOD (decoupled cache from job-63) ==="
@@ -95,6 +98,7 @@ spec:
                 --split_part test \
                 --precompute_cache_dir /data/vans_work_crosstask/eval_input_cache_crosstask \
                 --checkpoint "${CKPTS[0]}" --checkpoint "${CKPTS[1]}" --checkpoint "${CKPTS[2]}" \
+                --resume \
                 --out_path /data/raw_data/crosstask_forward_comparison_job72.json
           env:
             - name: VANS_ROOT
