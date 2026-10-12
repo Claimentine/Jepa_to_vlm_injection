@@ -74,7 +74,20 @@ from egodex.trajectory_dataset import build_egodex_dataloaders, WRISTS  # noqa: 
 # ["rightHand","rightForearm"] + LEFT_FINGERS (20) + ["leftHand","leftForearm"],
 # so the two wrist joints sit at fixed indices 24 (rightHand) and 50 (leftHand).
 WRIST_JOINT_IDX = [24, 50]
-N_WRIST_JOINTS = len(WRIST_JOINT_IDX)
+ALL_JOINT_IDX = list(range(52))
+
+# IMPORTANT: job-61's own reported ADE=0.0683/FDE=0.0733 is computed over ALL
+# 52 joints, not just wrists -- confirmed by reading thinker_train.py's own
+# two compute_trajectory_loss_and_accuracy call sites directly: both call it
+# with no joint_keep_idx argument, which defaults to None (no subsetting),
+# and REF_MODE="${REF_MODE:-none}" in scripts/train.sh means job-61's actual
+# run also skipped the hand-reference-offset correction entirely (ref_mode
+# "none" matches none of the "perhand"/"right"/"left"/"both"/"avg" branches).
+# So a wrist-only probe result is NOT directly comparable to job-61's number
+# -- wrists are a smaller, smoother-motion subset and easier to predict than
+# fingers. --joint_subset all reproduces job-61's own evaluation scope for a
+# genuine apples-to-apples comparison; --joint_subset wrists (the default)
+# keeps the original, cheaper, non-comparable-to-job-61 probe.
 
 # xyz_world's 64-entry axis is aligned to concat(vjepa_input_frame_indices,
 # vjepa_target_frame_indices), per the assertion in ThinkJEPA's
@@ -233,7 +246,7 @@ class TokenTrajectoryProbe(nn.Module):
         return out.reshape(B, self.n_tokens * 2, self.n_joints, 3)  # (B,32,J,3)
 
 
-def batch_to_samples(batch, device):
+def batch_to_samples(batch, device, joint_idx):
     """De-batches one EgoDex DataLoader batch into a list of per-sample dicts
     with everything this script needs, in the unbatched [L,S,D] convention
     build_thinkjepa_guidance_inputs/load_pair already use elsewhere in this
@@ -252,18 +265,18 @@ def batch_to_samples(batch, device):
     for i in range(B):
         old_len = int(vlm_old_len[i])
         new_len = int(vlm_new_len[i])
-        target = xyz_world[i, FUTURE_FRAMES][:, WRIST_JOINT_IDX, :]  # (32, 2, 3), absolute
-        # last_pos: the last PAST frame's wrist position (index 31), same
+        target = xyz_world[i, FUTURE_FRAMES][:, joint_idx, :]  # (32, J, 3), absolute
+        # last_pos: the last PAST frame's joint position(s) (index 31), same
         # per-episode world frame as target -- used to turn the impossible
         # cross-episode absolute-position regression into a well-posed
         # relative-displacement one (see TrajectoryProbe/run_probe).
-        last_pos = xyz_world[i, 31][WRIST_JOINT_IDX, :]              # (2, 3)
+        last_pos = xyz_world[i, 31][joint_idx, :]              # (J, 3)
         samples.append({
             "in_feats": vjepa_in[i:i + 1].to(device),               # (1,16,256,1024)
             "vlm_old": vlm_old[i, :, :old_len, :].to(device),       # (L,S_real,2048)
             "vlm_new": vlm_new[i, :, :new_len, :].to(device),       # (L,S_real,2048)
-            "target": target.to(device),                             # (32,2,3), absolute
-            "last_pos": last_pos.to(device),                         # (2,3), absolute
+            "target": target.to(device),                             # (32,J,3), absolute
+            "last_pos": last_pos.to(device),                         # (J,3), absolute
         })
     return samples
 
@@ -279,8 +292,8 @@ def ade_fde(pred, target, thr=0.05):
     return float(avg_dist.mean().item()), float(final_dist.mean().item()), float(acc.item())
 
 
-def static_baseline_ade_fde(loader, max_batches=None, thr=0.05):
-    """Trivial baseline, no model: predicts the wrist stays at its last
+def static_baseline_ade_fde(loader, joint_idx, max_batches=None, thr=0.05):
+    """Trivial baseline, no model: predicts the joint(s) stay at their last
     observed (past-window) position for the whole future window. If a
     trained probe can't beat this, it hasn't learned any real motion
     signal -- just necessary context for judging the probe's ADE/FDE."""
@@ -290,9 +303,9 @@ def static_baseline_ade_fde(loader, max_batches=None, thr=0.05):
             break
         (xyz_cam, R_cam, xyz_world, R_world, tfs_in_cam, tfs, cam_ext, cam_int,
          img, lang_instruct, confs, extras, paths) = batch
-        last_pos = xyz_world[:, 31][:, WRIST_JOINT_IDX, :]          # (B,2,3) last past frame
-        pred = last_pos.unsqueeze(1).expand(-1, 32, -1, -1)         # (B,32,2,3)
-        target = xyz_world[:, FUTURE_FRAMES][:, :, WRIST_JOINT_IDX, :]  # (B,32,2,3)
+        last_pos = xyz_world[:, 31][:, joint_idx, :]          # (B,J,3) last past frame
+        pred = last_pos.unsqueeze(1).expand(-1, 32, -1, -1)         # (B,32,J,3)
+        target = xyz_world[:, FUTURE_FRAMES][:, :, joint_idx, :]  # (B,32,J,3)
         all_pred.append(pred)
         all_target.append(target)
     pred_stack = torch.cat(all_pred, dim=0)
@@ -317,10 +330,10 @@ def describe(obj, name, depth=0):
         print(f"{pad}{name}: {type(obj).__name__} = {str(obj)[:120]}", flush=True)
 
 
-def run_probe(label, predictor, train_loader, test_loader, device, args):
+def run_probe(label, predictor, train_loader, test_loader, device, args, joint_idx):
     probe = TokenTrajectoryProbe(
         dim=rev.D_EMBED, hidden_dim=args.probe_hidden_dim,
-        n_tokens=rev.T_PER_CLIP, n_joints=N_WRIST_JOINTS,
+        n_tokens=rev.T_PER_CLIP, n_joints=len(joint_idx),
     ).to(device)
     opt = torch.optim.AdamW(probe.parameters(), lr=args.probe_lr)
 
@@ -330,7 +343,7 @@ def run_probe(label, predictor, train_loader, test_loader, device, args):
         for bi, batch in enumerate(loader):
             if max_batches and bi >= max_batches:
                 break
-            samples = batch_to_samples(batch, device)
+            samples = batch_to_samples(batch, device, joint_idx)
             pred_deltas, target_deltas = [], []
             for s in samples:
                 with torch.no_grad():
@@ -362,7 +375,7 @@ def run_probe(label, predictor, train_loader, test_loader, device, args):
         for bi, batch in enumerate(test_loader):
             if args.max_test_batches and bi >= args.max_test_batches:
                 break
-            samples = batch_to_samples(batch, device)
+            samples = batch_to_samples(batch, device, joint_idx)
             for s in samples:
                 y_future = predict_future_latent(
                     predictor, s["in_feats"], {"vlm_old": s["vlm_old"], "vlm_new": s["vlm_new"]}, device,
@@ -392,6 +405,12 @@ def main():
                           "test split and exit -- no checkpoint, no probe training, no GPU needed")
     ap.add_argument("--checkpoints", nargs="+", default=["job15_independent"],
                      help="one or more labels from CHECKPOINTS (or label=path)")
+    ap.add_argument("--joint_subset", choices=["wrists", "all"], default="wrists",
+                     help="'wrists' (default): the original 2-joint probe, cheaper but NOT "
+                          "comparable to job-61's own reported ADE/FDE (computed over all 52 "
+                          "joints, confirmed by reading thinker_train.py's call sites directly). "
+                          "'all': reproduces job-61's evaluation scope for a genuine "
+                          "apples-to-apples comparison.")
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--num_workers", type=int, default=4,
                      help="DataLoader worker count -- matches job-61's own NUM_WORKERS=4 for the "
@@ -405,12 +424,14 @@ def main():
     ap.add_argument("--max_test_batches", type=int, default=None, help="smoke-test cap")
     ap.add_argument("--out_json", default=None)
     args = ap.parse_args()
+    joint_idx = ALL_JOINT_IDX if args.joint_subset == "all" else WRIST_JOINT_IDX
+    print(f"[INFO] joint_subset={args.joint_subset} ({len(joint_idx)} joints)", flush=True)
 
     train_loader, test_loader = build_dataloaders(args)
     print(f"[INFO] train_loader batches~{len(train_loader)} test_loader batches~{len(test_loader)}", flush=True)
 
     if args.baseline_only:
-        ade, fde, acc, n = static_baseline_ade_fde(test_loader, max_batches=args.max_test_batches)
+        ade, fde, acc, n = static_baseline_ade_fde(test_loader, joint_idx, max_batches=args.max_test_batches)
         print(f"[STATIC_BASELINE] n={n} ADE={ade:.6f} FDE={fde:.6f} acc@0.05={acc:.4f}", flush=True)
         print("[DONE] baseline_only -- stopping here", flush=True)
         return
@@ -433,12 +454,12 @@ def main():
     results = []
     for label in args.checkpoints:
         predictor = load_frozen_predictor(label, device)
-        results.append(run_probe(label, predictor, train_loader, test_loader, device, args))
+        results.append(run_probe(label, predictor, train_loader, test_loader, device, args, joint_idx))
         del predictor
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    base_ade, base_fde, base_acc, base_n = static_baseline_ade_fde(test_loader, max_batches=args.max_test_batches)
+    base_ade, base_fde, base_acc, base_n = static_baseline_ade_fde(test_loader, joint_idx, max_batches=args.max_test_batches)
 
     print("[SUMMARY]", flush=True)
     for r in results:
