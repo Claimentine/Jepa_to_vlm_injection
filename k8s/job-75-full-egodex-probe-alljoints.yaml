@@ -39,6 +39,7 @@ spec:
                       - nrp-01.laccd.edu
                       - nautilus-ext-gpu01.fullerton.edu
                       - dtn-gpu2.kreonet.net
+                      - hcc-chase-shor-c4705.unl.edu
       containers:
         - name: probe-alljoints-full
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
