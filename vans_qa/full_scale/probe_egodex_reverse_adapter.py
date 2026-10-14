@@ -103,6 +103,13 @@ CHECKPOINTS = {
     "job42_bridge_mlp2048": "/data/raw_data/joint_coupled_bridge_mlp_runs/best_reverse.pt",
     "job49_coin_mix": "/data/raw_data/joint_coupled_mixed_normalized_nobridge_runs/best_reverse.pt",
     "job60_bridge4096": "/data/raw_data/joint_coupled_bridge4096_runs/best_reverse.pt",
+    # job-72's step_4000 (job-42's recipe, 2 epochs instead of 1) -- the
+    # current best overall checkpoint: beats job-42 on all four forward
+    # benchmarks and is the first joint-trained checkpoint to beat the
+    # independent baseline on MVBench/CrossTask. Same {"injector_state",
+    # "predictor_state", "bridge_state"} format as the others -- the periodic
+    # step_N.pt save includes all three, not just the reverse side.
+    "job72_step4000": "/data/raw_data/best_overall_job72_step4000/best_forward_and_reverse.pt",
 }
 
 
