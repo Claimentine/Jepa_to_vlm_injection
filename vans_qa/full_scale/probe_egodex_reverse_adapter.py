@@ -110,6 +110,15 @@ CHECKPOINTS = {
     # "predictor_state", "bridge_state"} format as the others -- the periodic
     # step_N.pt save includes all three, not just the reverse side.
     "job72_step4000": "/data/raw_data/best_overall_job72_step4000/best_forward_and_reverse.pt",
+    # No-guidance ablation: same training recipe as job15_independent
+    # (train_latent_world_model_full.py) but built with guidance="none" --
+    # the predictor has no guidance_old_adapter/guidance_memory_readers at
+    # all (confirmed: 152 vs 227 state_dict keys against job15's crossattn
+    # checkpoint). This is the reverse-direction analogue of the forward
+    # side's "injection=none" zero-shot control: does the predictor's own
+    # latent carry EgoDex trajectory signal with NO VLM guidance input
+    # whatsoever, vs. job15's real cross-attention guidance.
+    "job_none_guidance": "/data/raw_data/latent_world_model_runs/none/best.pt",
 }
 
 
@@ -143,8 +152,14 @@ def build_dataloaders(args):
 
 def load_frozen_predictor(label, device):
     path = CHECKPOINTS[label] if "=" not in label else label.split("=", 1)[1]
-    predictor = rev.build_predictor(device, "crossattn")
     ckpt = torch.load(path, map_location=device, weights_only=False)
+    # Build with the SAME guidance mode the checkpoint was trained with --
+    # "none"-guidance predictors (e.g. job_none_guidance) have no
+    # guidance_old_adapter/guidance_memory_readers modules at all, so
+    # hardcoding "crossattn" here would load_state_dict() against a
+    # structurally different module and fail on missing/unexpected keys.
+    guidance_mode = ckpt.get("guidance", "crossattn")
+    predictor = rev.build_predictor(device, guidance_mode)
     bridge = None
     if "bridge_state" in ckpt:
         # Joint-training checkpoints (train_joint_coupled_normalized.py,
@@ -321,6 +336,34 @@ def static_baseline_ade_fde(loader, joint_idx, max_batches=None, thr=0.05):
     return ade, fde, acc, pred_stack.shape[0]
 
 
+def constant_velocity_baseline_ade_fde(loader, joint_idx, max_batches=None, thr=0.05):
+    """Standard trajectory-forecasting baseline (used e.g. in Social-GAN,
+    Trajectron++): estimate per-frame velocity from the last two OBSERVED
+    frames (indices 30, 31) and linearly extrapolate it across the 32
+    future steps. Stronger than the stay-put static baseline whenever the
+    joint is actually moving at a roughly constant velocity at the moment
+    the window ends -- a probe that can't beat THIS has learned nothing
+    beyond "keep going the way you were already going"."""
+    all_pred, all_target = [], []
+    for bi, batch in enumerate(loader):
+        if max_batches and bi >= max_batches:
+            break
+        (xyz_cam, R_cam, xyz_world, R_world, tfs_in_cam, tfs, cam_ext, cam_int,
+         img, lang_instruct, confs, extras, paths) = batch
+        pos_30 = xyz_world[:, 30][:, joint_idx, :]            # (B,J,3)
+        pos_31 = xyz_world[:, 31][:, joint_idx, :]            # (B,J,3)
+        velocity = pos_31 - pos_30                            # (B,J,3), per-frame-step
+        steps = torch.arange(1, 33, dtype=velocity.dtype, device=velocity.device)  # (32,)
+        pred = pos_31.unsqueeze(1) + steps.view(1, 32, 1, 1) * velocity.unsqueeze(1)  # (B,32,J,3)
+        target = xyz_world[:, FUTURE_FRAMES][:, :, joint_idx, :]  # (B,32,J,3)
+        all_pred.append(pred)
+        all_target.append(target)
+    pred_stack = torch.cat(all_pred, dim=0)
+    target_stack = torch.cat(all_target, dim=0)
+    ade, fde, acc = ade_fde(pred_stack, target_stack, thr=thr)
+    return ade, fde, acc, pred_stack.shape[0]
+
+
 def describe(obj, name, depth=0):
     pad = "  " * depth
     if torch.is_tensor(obj):
@@ -440,6 +483,8 @@ def main():
     if args.baseline_only:
         ade, fde, acc, n = static_baseline_ade_fde(test_loader, joint_idx, max_batches=args.max_test_batches)
         print(f"[STATIC_BASELINE] n={n} ADE={ade:.6f} FDE={fde:.6f} acc@0.05={acc:.4f}", flush=True)
+        cv_ade, cv_fde, cv_acc, cv_n = constant_velocity_baseline_ade_fde(test_loader, joint_idx, max_batches=args.max_test_batches)
+        print(f"[CONSTANT_VELOCITY_BASELINE] n={cv_n} ADE={cv_ade:.6f} FDE={cv_fde:.6f} acc@0.05={cv_acc:.4f}", flush=True)
         print("[DONE] baseline_only -- stopping here", flush=True)
         return
 
@@ -467,12 +512,15 @@ def main():
             torch.cuda.empty_cache()
 
     base_ade, base_fde, base_acc, base_n = static_baseline_ade_fde(test_loader, joint_idx, max_batches=args.max_test_batches)
+    cv_ade, cv_fde, cv_acc, cv_n = constant_velocity_baseline_ade_fde(test_loader, joint_idx, max_batches=args.max_test_batches)
 
     print("[SUMMARY]", flush=True)
     for r in results:
         print(f"  {r['label']}: ADE={r['ADE']:.6f} FDE={r['FDE']:.6f} acc@0.05={r['acc_at_0.05']:.4f} n={r['n_test']}", flush=True)
     print(f"  static_baseline (stay-put, must-beat bar): ADE={base_ade:.6f} FDE={base_fde:.6f} "
           f"acc@0.05={base_acc:.4f} n={base_n}", flush=True)
+    print(f"  constant_velocity_baseline (linear extrapolation, must-beat bar): ADE={cv_ade:.6f} FDE={cv_fde:.6f} "
+          f"acc@0.05={cv_acc:.4f} n={cv_n}", flush=True)
     print("  job61_thinkjepa_official_recipe (reference): ADE=0.068294 FDE=0.073280", flush=True)
 
     if args.out_json:
