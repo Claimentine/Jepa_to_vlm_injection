@@ -1,0 +1,102 @@
+# Step 80: pure connectivity probe -- is YouTube's bot-check/rate-limit
+# that stopped CrossTask's extraction (job-59-derived full run, ~230/2692
+# videos before "Sign in to confirm you're not a bot") still blocking us,
+# or has it cleared? Tries yt-dlp + deno (no cookies -- same approach
+# extract_crosstask_qa.py already proved works when it works) on 15
+# distinct YouCook2 video ids from VANS-DATA_YouCook.csv. Download only,
+# no ffmpeg trim, no V-JEPA encoding, no GPU needed -- just answers the
+# one question before committing to a real extraction run.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-smoke-youcook-download
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      containers:
+        - name: smoke-youcook-download
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet yt-dlp
+              export PATH="$(dirname "$PY"):$PATH"
+              which yt-dlp
+
+              echo "=== installing deno (yt-dlp JS runtime) ==="
+              cd /tmp
+              curl -sL https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip -o deno.zip
+              unzip -q deno.zip
+              ./deno --version
+
+              cd "$REPO"
+              "$PY" vans_qa/full_scale/smoke_test_youcook_download.py \
+                --csv_path /data/hf_data/VANS-DATA_YouCook.csv \
+                --out_dir /data/vans_work_youcook/smoke_download \
+                --limit 15
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+              ephemeral-storage: "4Gi"
+            limits:
+              cpu: "2"
+              memory: "4800Mi"
+              ephemeral-storage: "6Gi"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-80-smoke-youcook-download.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-smoke-youcook-download -n williamli-scvl
