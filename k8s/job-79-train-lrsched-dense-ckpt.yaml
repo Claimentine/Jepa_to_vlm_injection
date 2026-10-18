@@ -1,0 +1,158 @@
+# Step 79: job-72's exact recipe (job-42's recipe + --epochs 2) but with
+# two changes aimed at the paper-prep "push scores further" plan:
+#   1. --lr_schedule warmup_cosine (--warmup_steps 300, ~4.5% of job-72's
+#      total 6688 steps) instead of the constant --lr job-42/60/72 all
+#      used -- tests whether job-72's own step~4500 instability (100-item
+#      val snapshot: 0.84/0.86 -> 0.41 -> 0.66/0.82/0.79) was a constant-LR
+#      artifact a schedule avoids.
+#   2. --save_every_steps 250 instead of 1000 -- job-73's eval could only
+#      bracket the dip at step_4000/5000/6000 granularity (the only
+#      multiples of 1000 saved); this gives ~27 checkpoints across the 2
+#      epochs, enough to find the actual best stopping point precisely
+#      rather than guessing between 1000-step neighbors. (~448MB/ckpt,
+#      ~12GB total -- checked against 225GB free on the data PVC first.)
+#
+# Same recipe otherwise (--disable_norm --cycle_loss_weight 0
+# --bridge_hidden_dim 2048), same 2-GPU DDP setup as job-72, written to
+# its own output dir so job-72's original run is untouched for comparison.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-train-lrsched-dense-ckpt
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-01.laccd.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - hcc-nrp-shor-c5809.unl.edu
+                      - dtn-gpu2.kreonet.net
+                      - hcc-chase-shor-c4705.unl.edu
+      containers:
+        - name: train-lrsched-dense-ckpt
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet h5py
+              export PATH="$(dirname "$PY"):$PATH"
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/joint_coupled_bridge_mlp_2epoch_lrsched_runs
+              torchrun --standalone --nproc_per_node=2 \
+                vans_qa/full_scale/train_joint_coupled_normalized.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --disable_norm \
+                --cycle_loss_weight 0 \
+                --bridge_hidden_dim 2048 \
+                --epochs 2 \
+                --lr_schedule warmup_cosine \
+                --warmup_steps 300 \
+                --val_every_steps 500 \
+                --save_every_steps 250 \
+                --max_val_items 100 \
+                --out_dir /data/raw_data/joint_coupled_bridge_mlp_2epoch_lrsched_runs 2>&1 \
+                | tee /data/raw_data/joint_coupled_bridge_mlp_2epoch_lrsched_runs/full_run.log
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+            - name: PYTORCH_ALLOC_CONF
+              value: expandable_segments:True
+          resources:
+            requests:
+              cpu: "10"
+              memory: "27Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "2"
+            limits:
+              cpu: "12"
+              memory: "31500Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "2"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-79-train-lrsched-dense-ckpt.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-train-lrsched-dense-ckpt -n williamli-scvl

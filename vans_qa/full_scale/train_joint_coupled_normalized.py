@@ -86,6 +86,7 @@ ranks there correctly, it just needed more timeout headroom -- bumped to
 import argparse
 import datetime
 import json
+import math
 import os
 import random
 import sys
@@ -191,6 +192,15 @@ def main():
     ap.add_argument("--rev_qa_split", default=os.path.join(rev.BASE, "raw_data/qa_split_full.json"))
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--lr_schedule", choices=["constant", "warmup_cosine"], default="constant",
+                     help="'constant' (default, unchanged from job-22/42/60/72): --lr the whole "
+                          "run. 'warmup_cosine': linear warmup over --warmup_steps then cosine "
+                          "decay to 0 over the remaining steps -- tests whether job-72's step~4500 "
+                          "val_acc dip (0.84/0.86 -> 0.41, 100-item snapshot) was a constant-LR "
+                          "instability that a schedule avoids, and whether that then makes training "
+                          "longer than 2 epochs safe to try.")
+    ap.add_argument("--warmup_steps", type=int, default=200,
+                     help="only used when --lr_schedule warmup_cosine")
     ap.add_argument("--cycle_loss_weight", type=float, default=0.1)
     ap.add_argument("--loss_norm_decay", type=float, default=0.98,
                      help="EMA decay for the per-loss magnitude normalizer -- higher means "
@@ -334,6 +344,22 @@ def main():
         print(f"[INFO] n_steps_per_epoch={n_steps_per_epoch} per rank "
               f"(total forward={len(fwd_train)} reverse={len(rev_train)})", flush=True)
 
+    total_steps = args.epochs * n_steps_per_epoch
+    if args.lr_schedule == "warmup_cosine":
+        warmup_steps = max(1, args.warmup_steps)
+
+        def _lr_lambda(done_steps):
+            if done_steps < warmup_steps:
+                return done_steps / warmup_steps
+            progress = (done_steps - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=_lr_lambda)
+        if is_main:
+            print(f"[INFO] lr_schedule=warmup_cosine warmup_steps={warmup_steps} total_steps={total_steps}", flush=True)
+    else:
+        scheduler = None
+
     for epoch in range(args.epochs):
         rng.shuffle(my_fwd_train)
         rng.shuffle(my_rev_train)
@@ -467,7 +493,10 @@ def main():
             if is_ddp():
                 sync_gradients(all_params, world_size)
             opt.step()
+            if scheduler is not None:
+                scheduler.step()
             step += 1
+            log_entry["lr"] = opt.param_groups[0]["lr"]
 
             if is_main:
                 log_f.write(json.dumps(log_entry) + "\n")
