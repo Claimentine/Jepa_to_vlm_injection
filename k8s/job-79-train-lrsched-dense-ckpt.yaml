@@ -49,6 +49,16 @@ spec:
                       - hcc-nrp-shor-c5809.unl.edu
                       - dtn-gpu2.kreonet.net
                       - hcc-chase-shor-c4705.unl.edu
+                  # Added after two consecutive CUDA OOM failures on 10.58GiB
+                  # cards (unlisted ~10-11GB-class GPU, not one of the older
+                  # cards already blacklisted above) -- job-72's own successful
+                  # run apparently just got lucky with bigger-memory cards both
+                  # times. Require >16GB VRAM explicitly instead of trying to
+                  # blacklist every small card by name one at a time.
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "16000"
       containers:
         - name: train-lrsched-dense-ckpt
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
