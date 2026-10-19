@@ -38,8 +38,8 @@ tested, i.e. no forward/reverse trade-off either.
 
 | Checkpoint | COIN (in-domain) n=2853 | TempCompass (OOD) n=3829 | MVBench (OOD) n=9223-9229 | CrossTask (OOD) n=1557-1558 |
 |---|---|---|---|---|
-| Zero-shot frozen VLM (no injection at all) | 51.2% | 50.7% | *(running)* | *(running)* |
-| Content-free injection (random noise, real trained cross-attn) | 58.4% | 51.2% | *(running)* | *(running)* |
+| Zero-shot frozen VLM (no injection at all) | 51.2% | 50.7% | 50.3% | 51.4% |
+| Content-free injection (random noise, real trained cross-attn) | 58.4% | 51.2% | 53.3% | 57.7% |
 | Independent training, forward-only (job-13) | 74.8% | 72.3% | 67.3% | 74.7% |
 | Joint, 1 epoch, bridge MLP (job-42) | 66.7% | 75.7% | 63.1% | 70.1% |
 | Joint, 1 epoch, bridge width x2 (job-60) | 58.7% | 67.6% | 55.1% | 59.4% |
@@ -47,9 +47,12 @@ tested, i.e. no forward/reverse trade-off either.
 
 CrossTask is evaluated on a reduced-scale corpus (1013/2692 source videos,
 ~37.6%) due to YouTube bot-detection rate-limiting during extraction -- see
-Limitations. The two baseline rows (zero-shot, content-free) are a new
-addition for paper prep; MVBench/CrossTask for them are mid-run as of this
-writing.
+Limitations. Content-free injection beats zero-shot by 6-7pts on COIN and
+CrossTask (both instructional-video domains) but only ~1-2pts on
+TempCompass/MVBench (general-purpose OOD) -- consistent with that gap being
+a domain-matched training-time shortcut rather than a genuine
+content-free architectural benefit; any report of a *real* injection's
+gain over chance should use these rows as the in-domain floor, not 50%.
 
 ### Reverse: EgoDex trajectory prediction, frozen-predictor probe (n=139 test episodes, all 52 hand/finger joints)
 
@@ -86,7 +89,10 @@ guidance, not just probe capacity.
 | job-56 | job-34's normalization combined with job-42's MLP bridge | 61.5% | Worse than either change alone |
 | job-60 | job-42's recipe, bridge_hidden_dim doubled to 4096 | 58.7% | Forward loss failed to converge (ema plateaued ~0.68-0.70 vs job-42's ~0.58-0.60) -- a width/LR mismatch, not a capacity win; ruled out via loss-curve comparison and a corrected gradient-conflict diagnostic |
 | **job-72** | job-42's *exact* recipe, `--epochs 2` instead of 1 | **70.9%** | **Breakthrough**: beats job-42 on all 4 forward benchmarks; beats job-13 on 3/4 OOD benchmarks (first time any joint checkpoint has) |
-| job-79 (running) | job-72's recipe + warmup/cosine LR schedule + checkpoints every 250 steps instead of 1000 | *(in progress)* | Testing whether a schedule avoids job-72's own step~4500 training-instability dip and finds an even better stopping point |
+| job-79 | job-72's recipe + warmup/cosine LR schedule + checkpoints every 250 steps instead of 1000 | peak 100-item snapshot 63% (vs. job-72's own 86%) | **Negative result**: the schedule did NOT fix the instability (still dipped to 44-55% through most of epoch 2) and markedly LOWERED the achievable peak -- cosine-decaying to ~0 by the end under-trains relative to job-72's constant 1e-4 throughout. Full-test eval skipped (the 100-item ceiling is far enough below job-72's to not be worth confirming); constant LR remains the better choice, this lever is deprioritized. |
+| job-82/83/84 (running) | C1: job-42's recipe, `--layer_strategy` in {last4, uniform4, all} instead of middle4 | *(in progress)* | Which VLM decoder layers receive injection -- mirrors ThinkJEPA's own layer-selection ablation |
+| job-85 (running) | C2: job-42's recipe, `--injection_mode film` instead of cross_attn | *(in progress)* | Re-tests FiLM (bandwidth-limited diagnosis was made early, under the old v1 architecture) on the current winning recipe |
+| job-86 (running) | A1: job-42's recipe, `--injection constant` -- the "VLM-only, trained" baseline, finishing a run that was never completed under the current architecture | *(in progress)* | |
 
 ## Planned additional experiments (paper prep)
 
@@ -103,7 +109,7 @@ wherever one already covers the need, flagged explicitly below.
 
 | # | Baseline | Status | Cost |
 |---|---|---|---|
-| A1 | **"VLM-only, trained"** -- a trained adapter/head on the VLM's own hidden states with zero external (JEPA) conditioning. This is what ThinkJEPA's own "Qwen3-VL Thinking" baseline row actually is (Table 1: a *trained* downstream head on VLM features, not zero-shot) -- stronger and fairer than our current `zeroshot_none` row, which has no training at all. | **Code already exists** (`train_qa_full.py --injection constant`) **but was never run to completion** under the current temporal-pooling architecture (`qa_full_runs_temporal/constant` doesn't exist; the only `constant` run on disk is an abandoned 3-step v1-pooling run). | Cheap -- same training script, same data, just finish the run. |
+| A1 | **"VLM-only, trained"** -- a trained adapter/head on the VLM's own hidden states with zero external (JEPA) conditioning. This is what ThinkJEPA's own "Qwen3-VL Thinking" baseline row actually is (Table 1: a *trained* downstream head on VLM features, not zero-shot) -- stronger and fairer than our current `zeroshot_none` row, which has no training at all. | **Running (job-86)**. | Cheap -- same training script, same data, just finish the run. |
 | A2 | **A second open-source VLM, zero-shot, on our own QA task** (e.g. Qwen2-VL-2B-Instruct) -- addresses "is this specific backbone doing something unusual" the way LION's Table 1 contextualizes itself against Flamingo/Kosmos/BLIP-2/LLaVA/InstructBLIP, all run on the *same* benchmark suite. Per the scope note above we cannot cite their own papers' numbers -- has to be run through our harness, same as LION runs every baseline on its own eval pipeline. | Not started. | Moderate -- new model download + inference wiring, no new data. |
 
 ### B. Reverse direction -- external trajectory baselines (near-zero cost)
@@ -117,8 +123,8 @@ wherever one already covers the need, flagged explicitly below.
 
 | # | Ablation | Mirrors | Status |
 |---|---|---|---|
-| C1 | **VLM layer-selection** for the forward injector: `--layer_strategy` already supports `{middle4, last4, uniform4, all}`, but job-42/72's winning recipe has only ever been run with `middle4`. | ThinkJEPA Table 4 (last-layer vs. mid-layer vs. all-layer/pyramid guidance) | Not started -- same training script, different flag, same compute as job-72 once per variant. |
-| C2 | **Conditioning mechanism**: cross-attention (current default) vs. FiLM (`LayerWiseJEPAInjector`'s `film` mode already exists in `common/jepa_injection_model.py`, but was diagnosed as bandwidth-limited and dropped early in the project -- never re-tested on the current winning (job-72-style, 2-epoch) recipe specifically). | ThinkJEPA Table 8 (FiLM vs. cross-attn vs. AdaLN) and LION's own adapter-design ablations | Not started. |
+| C1 | **VLM layer-selection** for the forward injector: `--layer_strategy` already supports `{middle4, last4, uniform4, all}`, but job-42/72's winning recipe has only ever been run with `middle4`. | ThinkJEPA Table 4 (last-layer vs. mid-layer vs. all-layer/pyramid guidance) | **Running (job-82/83/84)**, at job-42's 1-epoch budget first -- `train_joint_coupled_normalized.py`/`eval_forward_checkpoint.py` now record and auto-detect `layer_strategy` per checkpoint. |
+| C2 | **Conditioning mechanism**: cross-attention (current default) vs. FiLM (`LayerWiseJEPAInjector`'s `film` mode already exists in `common/jepa_injection_model.py`, but was diagnosed as bandwidth-limited and dropped early in the project -- never re-tested on the current winning (job-72-style, 2-epoch) recipe specifically). | ThinkJEPA Table 8 (FiLM vs. cross-attn vs. AdaLN) and LION's own adapter-design ablations | **Running (job-85)**, at job-42's 1-epoch budget. |
 
 ### D. One small additional eval slice (no new download)
 
@@ -130,6 +136,14 @@ LION's **POPE** object-hallucination table (does injection make the model
 average?). Only build a dedicated small POPE-style yes/no set from
 already-downloaded COIN clips (no new video download) if this existing
 slice turns out too small/noisy to be conclusive on its own.
+
+### E. More training data
+
+| # | Source | Status |
+|---|---|---|
+| E1 | **YouCook2** -- `VANS-DATA_YouCook.csv` (26,558 QA-pair rows) and `build_qa_pairs_full.py` (already scans it) have existed for a while, and `step1_youcook_fixed.py` already knows how to split a video into per-step clips, but no video had ever actually been downloaded on this cluster. job-80 (connectivity smoke test, no cookies, same yt-dlp+deno approach `extract_crosstask_qa.py` uses) came back clean: 14/15 videos ok, zero bot-check failures. **job-81 is now downloading all 1790 official YouCook2 videos** (`download_youcook_videos.py`, resumable, rate-limit-aware) -- once done, run `step1_youcook_fixed.py` -> `build_qa_pairs_full.py` -> `extract_vjepa_features_full.py`/`extract_vlm_guidance_full.py` to actually add this data to training. |
+| E2 | **More Ego4D narration-source videos** -- only 63 of the 9,611 eligible videos (narration source) have been downloaded so far; the `ego4d` CLI's license credentials expired and need renewing at [ego4d-data.org](https://ego4d-data.org/) before more can be fetched. Blocked on the user, not on anything technical. |
+| E3 | **Mix already-extracted Ego4D data into training** -- `ego4d_longaxis_narration/` already has 780 npz feature-cache clips sitting unused (only ever used for OOD eval, never training), zero new download needed. Not started. |
 
 ## Scope and limitations (read before citing any number above)
 
@@ -183,6 +197,9 @@ vans_qa/full_scale/             the real-scale pipeline (12k+ COIN/YouCook2 QA p
   smoke_test_youcook_download.py  YouTube download connectivity probe (yt-dlp + deno,
                                    no cookies) -- checks bot-detection status before
                                    committing to a real extraction run
+  download_youcook_videos.py      production YouCook2 downloader (resumable JSONL
+                                   manifest, rate-limit-aware), driven by YouCook2's
+                                   own official annotation file
 
 egodex_probe/                   earlier, smaller EgoDex classification testbed
                                   (13-way "what task is this clip" probe) used to shake
