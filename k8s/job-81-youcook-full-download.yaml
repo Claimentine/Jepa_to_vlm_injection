@@ -1,0 +1,151 @@
+# Step 81: full-scale YouCook2 video download -- the missing first stage of
+# a pipeline that's otherwise already built (VANS-DATA_YouCook.csv's 26,558
+# QA-pair rows + step1_youcook_fixed.py's clip-splitting + build_qa_pairs_full.py
+# already scanning both CSVs), but no video has ever actually been fetched on
+# this cluster. job-80's connectivity smoke test (15 videos, no cookies, same
+# yt-dlp+deno approach) came back clean: 14/15 ok, zero bot-check failures.
+#
+# Fetches the official YouCook2 annotation tarball directly (337KB, no auth,
+# http://youcook2.eecs.umich.edu/static/YouCookII/youcookii_annotations_trainval.tar.gz),
+# then downloads all 1790 videos it lists (1333 train + 457 val) via
+# download_youcook_videos.py. The shell script owns the rate-limit retry
+# loop directly (sleep 70min and rerun on exit code 2) rather than relying
+# on Kubernetes' own pod-restart backoff, which doesn't wait nearly long
+# enough -- same lesson the old (different-cluster) download_videos.py's
+# own docstring already drew. The downloader itself is resumable (skips
+# anything already in its manifest), so each retry picks up where the last
+# one left off regardless of which loop mechanism triggers it.
+#
+# Kind: Job, not a bare Pod, so the run is not subject to the ~6h pod limit.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-youcook-full-download
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - node-1-3.sdsc.optiputer.net
+                      - moff.sdstate.edu
+      containers:
+        - name: youcook-full-download
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet yt-dlp
+              export PATH="$(dirname "$PY"):$PATH"
+              which yt-dlp
+
+              echo "=== installing deno (yt-dlp JS runtime) ==="
+              cd /tmp
+              curl -sL https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip -o deno.zip
+              unzip -q deno.zip
+              ./deno --version
+
+              echo "=== fetching official YouCook2 annotations (no auth needed) ==="
+              mkdir -p /data/raw_data /data/vans_work_youcook
+              if [ ! -f /data/raw_data/youcookii_annotations_trainval.json ]; then
+                curl -sL http://youcook2.eecs.umich.edu/static/YouCookII/youcookii_annotations_trainval.tar.gz -o /tmp/yc2ann.tar.gz
+                tar -xzf /tmp/yc2ann.tar.gz -C /data/raw_data
+              fi
+
+              cd "$REPO"
+              N_CYCLES=0
+              MAX_CYCLES=20
+              while [ "$N_CYCLES" -lt "$MAX_CYCLES" ]; do
+                N_CYCLES=$((N_CYCLES + 1))
+                echo "=== download cycle $N_CYCLES/$MAX_CYCLES ==="
+                set +e
+                "$PY" vans_qa/full_scale/download_youcook_videos.py \
+                  --annotations_json /data/raw_data/youcookii_annotations_trainval.json \
+                  --out_root /data/vans_work_youcook/videos/youcook2 \
+                  --manifest /data/vans_work_youcook/youcook_download_manifest.jsonl \
+                  --workers 3 --delay 1.5
+                RC=$?
+                set -e
+                if [ "$RC" -eq 0 ]; then
+                  echo "=== download complete (exit 0) ==="
+                  break
+                elif [ "$RC" -eq 2 ]; then
+                  echo "=== rate-limited, sleeping 70min before retrying ==="
+                  sleep 4200
+                else
+                  echo "=== unexpected exit code $RC, stopping ==="
+                  exit "$RC"
+                fi
+              done
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "6Gi"
+              ephemeral-storage: "8Gi"
+            limits:
+              cpu: "4.8"
+              memory: "7200Mi"
+              ephemeral-storage: "10Gi"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-81-youcook-full-download.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-youcook-full-download -n williamli-scvl

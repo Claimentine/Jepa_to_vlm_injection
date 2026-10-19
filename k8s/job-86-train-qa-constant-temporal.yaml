@@ -1,0 +1,151 @@
+# Step 86: A1 -- finish the "VLM-only, trained" baseline (train_qa_full.py's
+# injection=constant: still routes through JepaInjector/the real
+# cross-attention mechanism and trains it, but the "JEPA" tokens fed in are
+# a single learned-but-content-free parameter, not real video features).
+# This is what ThinkJEPA's own "Qwen3-VL Thinking" baseline row actually is
+# (Table 1: a *trained* downstream head on VLM features, not zero-shot) --
+# stronger and fairer than our existing zeroshot_none row, which has no
+# training at all. Code has existed the whole time
+# (train_qa_full.py --injection constant) but was never run to completion
+# under the current temporal-pooling architecture: qa_full_runs_temporal/
+# has jepa/ and random/ siblings (both complete, 6654 steps each) but no
+# constant/ -- the only constant run on disk is an abandoned 3-step
+# v1-pooling run (qa_full_runs/constant, different architecture entirely).
+#
+# Exact same recipe/split/schedule as qa_full_runs_temporal/jepa and
+# .../random (injection_site=cross_attn, layer_strategy=middle4, 1 epoch,
+# seed=42) so the three are directly comparable -- --out_dir is the shared
+# parent, train_qa_full.py appends args.injection as the subdirectory
+# itself (run_dir = os.path.join(args.out_dir, args.injection)).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-train-qa-constant-temporal
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-01.laccd.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - hcc-nrp-shor-c5809.unl.edu
+                      - dtn-gpu2.kreonet.net
+                      - hcc-chase-shor-c4705.unl.edu
+      containers:
+        - name: train-qa-constant-temporal
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/train_qa_full.py \
+                --split /data/raw_data/qa_split_temporal.json \
+                --injection constant \
+                --injection_site cross_attn \
+                --layer_strategy middle4 \
+                --epochs 1 \
+                --val_every_steps 500 \
+                --save_every_steps 1000 \
+                --max_val_items 100 \
+                --out_dir /data/raw_data/qa_full_runs_temporal
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "6"
+              memory: "24Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "7.2"
+              memory: "28800Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-86-train-qa-constant-temporal.yaml -n williamli-scvl
+#
+# Output: /data/raw_data/qa_full_runs_temporal/constant/{train_log.jsonl,
+# best.pt, step_<N>.pt} -- then run through eval_forward_checkpoint.py on
+# all 4 benchmarks the same way job-77 did for .../random/best.pt.

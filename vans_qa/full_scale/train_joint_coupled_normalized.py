@@ -188,6 +188,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--qa_split", default=os.path.join(fwd.BASE, "raw_data/qa_split_temporal.json"))
     ap.add_argument("--layer_strategy", default="middle4", choices=["middle4", "last4", "uniform4", "all"])
+    ap.add_argument("--injection_mode", default="cross_attn", choices=["cross_attn", "film"],
+                     help="forward injector's conditioning mechanism -- cross_attn (default, used by "
+                          "every job-22 through job-79 run) or film (LayerWiseJEPAInjector's "
+                          "alternative mode, never re-tested on the current winning recipe since an "
+                          "early, since-superseded diagnosis that it was bandwidth-limited)")
     ap.add_argument("--cache_dir", default=os.path.join(rev.WORK_BASE, "vlm_guidance_cache_paired"))
     ap.add_argument("--rev_qa_split", default=os.path.join(rev.BASE, "raw_data/qa_split_full.json"))
     ap.add_argument("--epochs", type=int, default=1)
@@ -271,7 +276,7 @@ def main():
     layer_indices = select_layer_indices(len(resolve_decoder_layers(model)), args.layer_strategy)
     injector = LayerWiseJEPAInjector(
         hidden_size=hidden_size, layer_indices=layer_indices, condition_mode="jepa",
-        seed=args.seed, mode="cross_attn",
+        seed=args.seed, mode=args.injection_mode,
     ).to(device)
     hook = DecoderLayerInjectionHook(model, injector)
 
@@ -524,6 +529,7 @@ def main():
                 if fwd_val_tally.acc > best_fwd_val_acc:
                     best_fwd_val_acc = fwd_val_tally.acc
                     torch.save({"step": step, "val_acc": fwd_val_tally.acc,
+                                "injection_mode": args.injection_mode, "layer_strategy": args.layer_strategy,
                                 "injector_state": injector.state_dict(), "bridge_state": bridge.state_dict()},
                                os.path.join(run_dir, "best_forward.pt"))
                 if rev_val_metrics["pred_loss"] < best_rev_val_mse:
@@ -534,7 +540,8 @@ def main():
 
             if is_main and args.save_every_steps and step % args.save_every_steps == 0:
                 torch.save({
-                    "step": step, "injector_state": injector.state_dict(),
+                    "step": step, "injection_mode": args.injection_mode, "layer_strategy": args.layer_strategy,
+                    "injector_state": injector.state_dict(),
                     "predictor_state": predictor.state_dict(), "bridge_state": bridge.state_dict(),
                 }, os.path.join(run_dir, f"step_{step}.pt"))
                 print(f"[epoch {epoch} step {step}] saved checkpoint -> step_{step}.pt", flush=True)

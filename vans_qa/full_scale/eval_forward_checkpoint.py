@@ -119,12 +119,21 @@ def evaluate_logprob_none(model, processor, items, device, rng, prefetch_depth=4
     return tally
 
 
-def load_checkpoint_into_fresh_injector(checkpoint_path, hidden_size, layer_indices, seed, device):
+def load_checkpoint_into_fresh_injector(checkpoint_path, model, hidden_size, default_layer_strategy, seed, device):
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    # Older checkpoints (job-22 through job-79) predate these fields -- they
+    # were all cross_attn/middle4, so that's the correct fallback, not just
+    # an arbitrary default.
+    injection_mode = ckpt.get("injection_mode", "cross_attn")
+    layer_strategy = ckpt.get("layer_strategy", default_layer_strategy)
+    layer_indices = select_layer_indices(len(resolve_decoder_layers(model)), layer_strategy)
     injector = LayerWiseJEPAInjector(
         hidden_size=hidden_size, layer_indices=layer_indices, condition_mode="jepa",
-        seed=seed, mode="cross_attn",
+        seed=seed, mode=injection_mode,
     ).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    print(f"[INFO] {checkpoint_path}: injection_mode={injection_mode} layer_strategy={layer_strategy} "
+          f"({'from checkpoint' if 'injection_mode' in ckpt else 'default -- not recorded in this checkpoint'})",
+          flush=True)
     if "bridge_state" in ckpt:
         # jepa_to_vlm.weight (single Linear) vs jepa_to_vlm.0.weight (2-layer
         # MLP, --bridge_hidden_dim run) tells us which architecture to build;
@@ -201,7 +210,6 @@ def main():
     hidden_size = model.config.text_config.hidden_size
     n_tokens = 64
     placeholder_id = processor.tokenizer.pad_token_id
-    layer_indices = select_layer_indices(len(resolve_decoder_layers(model)), args.layer_strategy)
 
     results = {}
     if args.resume and args.out_path and os.path.exists(args.out_path):
@@ -222,7 +230,7 @@ def main():
                 precompute_cache_dir=args.precompute_cache_dir,
             )
         else:
-            injector = load_checkpoint_into_fresh_injector(checkpoint_path, hidden_size, layer_indices, args.seed, device)
+            injector = load_checkpoint_into_fresh_injector(checkpoint_path, model, hidden_size, args.layer_strategy, args.seed, device)
             # A fresh hook per checkpoint (its pre_hook closures bake in this
             # specific injector's own trained weights via self.injector.apply) --
             # must remove() it before the next checkpoint's hook is created, or
