@@ -88,6 +88,49 @@ guidance, not just probe capacity.
 | **job-72** | job-42's *exact* recipe, `--epochs 2` instead of 1 | **70.9%** | **Breakthrough**: beats job-42 on all 4 forward benchmarks; beats job-13 on 3/4 OOD benchmarks (first time any joint checkpoint has) |
 | job-79 (running) | job-72's recipe + warmup/cosine LR schedule + checkpoints every 250 steps instead of 1000 | *(in progress)* | Testing whether a schedule avoids job-72's own step~4500 training-instability dip and finds an even better stopping point |
 
+## Planned additional experiments (paper prep)
+
+Designed by cross-referencing two papers' experiment sections: **ThinkJEPA**
+(shares our EgoDex ADE/FDE task directly -- its baseline/ablation choices
+transfer almost one-to-one) and **LION** (*Empowering Multimodal Large
+Language Model with Dual-Level Visual Knowledge*, arXiv:2311.11860 -- a
+VQA/captioning-style MLLM paper, useful for how it structures baseline-model
+comparisons and component-ablation tables on standard benchmarks). Kept as
+small/cheap as possible: reusing existing data and existing code paths
+wherever one already covers the need, flagged explicitly below.
+
+### A. Forward direction -- baseline models (reuse the existing QA task, no new dataset)
+
+| # | Baseline | Status | Cost |
+|---|---|---|---|
+| A1 | **"VLM-only, trained"** -- a trained adapter/head on the VLM's own hidden states with zero external (JEPA) conditioning. This is what ThinkJEPA's own "Qwen3-VL Thinking" baseline row actually is (Table 1: a *trained* downstream head on VLM features, not zero-shot) -- stronger and fairer than our current `zeroshot_none` row, which has no training at all. | **Code already exists** (`train_qa_full.py --injection constant`) **but was never run to completion** under the current temporal-pooling architecture (`qa_full_runs_temporal/constant` doesn't exist; the only `constant` run on disk is an abandoned 3-step v1-pooling run). | Cheap -- same training script, same data, just finish the run. |
+| A2 | **A second open-source VLM, zero-shot, on our own QA task** (e.g. Qwen2-VL-2B-Instruct) -- addresses "is this specific backbone doing something unusual" the way LION's Table 1 contextualizes itself against Flamingo/Kosmos/BLIP-2/LLaVA/InstructBLIP, all run on the *same* benchmark suite. Per the scope note above we cannot cite their own papers' numbers -- has to be run through our harness, same as LION runs every baseline on its own eval pipeline. | Not started. | Moderate -- new model download + inference wiring, no new data. |
+
+### B. Reverse direction -- external trajectory baselines (near-zero cost)
+
+| # | Baseline | Status | Cost |
+|---|---|---|---|
+| B1 | **EgoDex's own released trajectory-prediction baselines**: decoder-only and encoder-decoder transformers x {Behavior Cloning, DDPM, Flow Matching} (6 numbers). ThinkJEPA's own Table 3 just *cites* these directly from EgoDex's paper/codebase ("implemented from [15]") rather than re-running them -- we are evaluating on the same EgoDex ADE/FDE task, so we can do the same. | Not started -- needs locating EgoDex's released numbers/checkpoints for these 6 baselines. | **Near zero** -- citation, not a training run. |
+| B2 | **Prompt-only VLM baseline** -- directly prompt Qwen3-VL-2B-Thinking with the past video window and ask it to output future 3D hand trajectories as JSON waypoints, interpolated to the full horizon and scored with the same ADE/FDE code. Mirrors ThinkJEPA's Table 10 exactly (their result: ADE/FDE 10.855/10.927 vs. their method's 0.061/0.056 -- a deliberately weak but informative reference). More informative than our current `job_none_guidance` row since it tests the VLM's own native spatial reasoning with no architecture support at all, not just "JEPA predictor without guidance." | Not started. | Cheap -- inference + JSON parsing only, no training. |
+
+### C. Ablations on the current best recipe (job-72-style), not yet run
+
+| # | Ablation | Mirrors | Status |
+|---|---|---|---|
+| C1 | **VLM layer-selection** for the forward injector: `--layer_strategy` already supports `{middle4, last4, uniform4, all}`, but job-42/72's winning recipe has only ever been run with `middle4`. | ThinkJEPA Table 4 (last-layer vs. mid-layer vs. all-layer/pyramid guidance) | Not started -- same training script, different flag, same compute as job-72 once per variant. |
+| C2 | **Conditioning mechanism**: cross-attention (current default) vs. FiLM (`LayerWiseJEPAInjector`'s `film` mode already exists in `common/jepa_injection_model.py`, but was diagnosed as bandwidth-limited and dropped early in the project -- never re-tested on the current winning (job-72-style, 2-epoch) recipe specifically). | ThinkJEPA Table 8 (FiLM vs. cross-attn vs. AdaLN) and LION's own adapter-design ablations | Not started. |
+
+### D. One small additional eval slice (no new download)
+
+Our existing `qa_split_mvbench.json` already has an `object_existence`
+sub-category (visible in every MVBench result's `acc_by_difficulty` dict
+above) -- reporting it as its own row is a free, zero-cost analogue of
+LION's **POPE** object-hallucination table (does injection make the model
+*more* confident about objects that aren't there, not just better on
+average?). Only build a dedicated small POPE-style yes/no set from
+already-downloaded COIN clips (no new video download) if this existing
+slice turns out too small/noisy to be conclusive on its own.
+
 ## Scope and limitations (read before citing any number above)
 
 - **Not comparable to official benchmark leaderboards.** COIN/TempCompass/
