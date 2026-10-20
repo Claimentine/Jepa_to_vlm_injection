@@ -1,0 +1,159 @@
+# Step 87: debug reproduction for job-85's hang -- C2's FiLM ablation
+# (train_joint_coupled_normalized.py --injection_mode film) ran 4.5+ hours
+# under 2-GPU DDP with ZERO step-progress output and zero errors/warnings,
+# and was killed without diagnosis (job-85's pod/logs are gone). This never
+# hit NCCL's 3h collective-timeout kill, which rules out a stuck
+# all_reduce/barrier -- so whatever it is, it's stuck in pre-collective
+# local computation, or just pathologically slow.
+#
+# FiLM mode by itself (non-DDP, no bridge) is known-good: a full
+# train_qa_full.py --injection jepa --injection_site film run completed
+# normally in the past (see common/jepa_injection_model.py's own
+# LayerWiseJEPAInjector docstring, "Confirmed 2026-09-01" comment) -- it
+# just never learned anything (chance-level val_acc throughout). The
+# combination never exercised before job-85: FiLM mode + the shared
+# CrossModalBridge rewiring + DDP's manual-gradient-sync joint-training loop.
+#
+# This smoke test isolates variables: single process (no torchrun/DDP at
+# all, WORLD_SIZE unset so is_ddp() is False), --max_train_items 20 and
+# --val_every_steps 5 so even a dead-slow-but-not-hung run reaches visible
+# output within minutes, not hours. If THIS hangs too, the bug is in
+# film+bridge itself, not DDP. If this runs fine, the bug is DDP-specific.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-smoke-film-debug
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-01.laccd.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - hcc-nrp-shor-c5809.unl.edu
+                      - dtn-gpu2.kreonet.net
+                      - hcc-chase-shor-c4705.unl.edu
+      containers:
+        - name: smoke-film-debug
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet h5py "huggingface-hub<2.0"
+              export PATH="$(dirname "$PY"):$PATH"
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/smoke_film_debug_runs
+              timeout 1800 "$PY" -u vans_qa/full_scale/train_joint_coupled_normalized.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --disable_norm \
+                --cycle_loss_weight 0 \
+                --bridge_hidden_dim 2048 \
+                --injection_mode film \
+                --epochs 1 \
+                --max_train_items 20 \
+                --val_every_steps 5 \
+                --save_every_steps 1000 \
+                --max_val_items 10 \
+                --out_dir /data/raw_data/smoke_film_debug_runs
+              echo "SMOKE_FILM_DEBUG_DONE rc=$?"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+            - name: PYTORCH_ALLOC_CONF
+              value: expandable_segments:True
+          resources:
+            requests:
+              cpu: "5"
+              memory: "16Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "6"
+              memory: "19200Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-87-smoke-film-debug.yaml -n williamli-scvl
