@@ -23,36 +23,49 @@ results** and the experiment history that led to them; see
 ## Headline results
 
 **Joint (bidirectional) training no longer trades off against either
-direction's own independently-trained baseline, given enough training
-budget** -- job-72 (job-42's exact recipe, trained 2 epochs instead of 1,
-evaluated at its step_4000 checkpoint) beats job-42 on *all four* forward
-benchmarks, and beats the independent-training baseline (job-13) on
-3 of 4 (TempCompass, MVBench, CrossTask) -- the first joint-trained
-checkpoint in this project's history to do so on any out-of-domain
-benchmark. On the reverse side, every joint checkpoint tested (including
-undertrained ones) already beats ThinkJEPA's own officially-trained-on-EgoDex
-reference, with job-72's step_4000 achieving the best ADE of any checkpoint
-tested, i.e. no forward/reverse trade-off either.
+direction's own independently-trained baseline on the OOD benchmarks,
+given enough training budget** -- job-72 (job-42's exact recipe, trained 2
+epochs instead of 1, evaluated at its step_4000 checkpoint) beats job-42
+on TempCompass/MVBench/CrossTask outright and **ties job-42 on COIN's hard
+subset** (63.3% both -- see note below the table), and beats the
+independent-training baseline (job-13) on 3 of 4 (TempCompass, MVBench,
+CrossTask) -- the first joint-trained checkpoint in this project's history
+to do so on any out-of-domain benchmark. On the reverse side, every joint
+checkpoint tested (including undertrained ones) already beats ThinkJEPA's
+own officially-trained-on-EgoDex reference, with job-72's step_4000
+achieving the best ADE of any checkpoint tested, i.e. no forward/reverse
+trade-off either.
 
 ### Forward: "predict what happens next" QA accuracy (full test splits)
 
-| Checkpoint | COIN (in-domain) n=2853 | TempCompass (OOD) n=3829 | MVBench (OOD) n=9223-9229 | CrossTask (OOD) n=1557-1558 |
+COIN is reported on its **hard subset only** (the full split also tags
+each item "easy"; we only care about the hard half -- it's the only part
+where the task isn't close to trivially solvable from a single frame).
+
+| Checkpoint | COIN hard-subset (in-domain) | TempCompass (OOD) n=3829 | MVBench (OOD) n=9223-9229 | CrossTask (OOD) n=1557-1558 |
 |---|---|---|---|---|
-| Zero-shot frozen VLM (no injection at all) | 51.2% | 50.7% | 50.3% | 51.4% |
-| Content-free injection (random noise, real trained cross-attn) | 58.4% | 51.2% | 53.3% | 57.7% |
-| Independent training, forward-only (job-13) | 74.8% | 72.3% | 67.3% | 74.7% |
-| Joint, 1 epoch, bridge MLP (job-42) | 66.7% | 75.7% | 63.1% | 70.1% |
+| Zero-shot frozen VLM (no injection at all) | 51.4% | 50.7% | 50.3% | 51.4% |
+| Content-free injection (random noise, real trained cross-attn) | 56.1% | 51.2% | 53.3% | 57.7% |
+| Independent training, forward-only (job-13) | 58.7% | 72.3% | 67.3% | 74.7% |
+| Joint, 1 epoch, bridge MLP (job-42) | 63.3% | 75.7% | 63.1% | 70.1% |
 | Joint, 1 epoch, bridge width x2 (job-60) | 58.7% | 67.6% | 55.1% | 59.4% |
-| **Joint, 2 epochs, step_4000 (job-72, current best)** | **70.9%** | **76.7%** | **69.4%** | **75.6%** |
+| **Joint, 2 epochs, step_4000 (job-72, current best)** | 63.3% | **76.7%** | **69.4%** | **75.6%** |
 
 CrossTask is evaluated on a reduced-scale corpus (1013/2692 source videos,
 ~37.6%) due to YouTube bot-detection rate-limiting during extraction -- see
-Limitations. Content-free injection beats zero-shot by 6-7pts on COIN and
-CrossTask (both instructional-video domains) but only ~1-2pts on
+Limitations. Content-free injection beats zero-shot by ~5pts on COIN-hard
+and CrossTask (both instructional-video domains) but only ~1-2pts on
 TempCompass/MVBench (general-purpose OOD) -- consistent with that gap being
 a domain-matched training-time shortcut rather than a genuine
 content-free architectural benefit; any report of a *real* injection's
 gain over chance should use these rows as the in-domain floor, not 50%.
+
+**Important nuance from switching COIN to hard-only**: job-72's overall-accuracy
+win over job-42 on COIN (70.9% vs 66.7%, the pre-hard-only numbers) was being
+driven almost entirely by the *easy* subset (78.4% vs 70.1%) -- on hard
+items specifically, training 2 epochs instead of 1 made **zero** difference
+(63.3% both). The "longer training helps" story holds cleanly on the three
+OOD benchmarks but, on COIN specifically, only on the easy half of the task.
 
 ### Reverse: EgoDex trajectory prediction, frozen-predictor probe (n=139 test episodes, all 52 hand/finger joints)
 
@@ -75,20 +88,20 @@ static baseline (0.0307), while every guided checkpoint does -- evidence
 that beating the static baseline specifically requires real cross-modal
 guidance, not just probe capacity.
 
-## Experiment history (forward recipe ablation lineage, COIN full-test accuracy)
+## Experiment history (forward recipe ablation lineage, COIN hard-subset accuracy)
 
-| Job | Recipe change (relative to previous row) | COIN acc | Outcome |
+| Job | Recipe change (relative to previous row) | COIN hard acc | Outcome |
 |---|---|---|---|
-| job-13 | Independent (non-joint) training, forward direction only | 74.8% | Reference ceiling pre-joint-training |
-| job-22 | First joint (shared-bridge) training; reverse side trained on VANS data only | 68.3% | Large drop vs. independent |
-| job-30 | + mix COIN into the reverse-direction training pool | 68.2% | No improvement over job-22 |
-| job-34 | + EMA loss-magnitude normalization across fwd/rev/cycle losses | 67.2% | Normalization alone doesn't close the gap |
+| job-13 | Independent (non-joint) training, forward direction only | 58.7% | Reference ceiling pre-joint-training |
+| job-22 | First joint (shared-bridge) training; reverse side trained on VANS data only | 60.1% | Large drop vs. independent on overall accuracy (68.3% vs 74.8%), though close on hard alone |
+| job-30 | + mix COIN into the reverse-direction training pool | 59.4% | No improvement over job-22 |
+| job-34 | + EMA loss-magnitude normalization across fwd/rev/cycle losses | 63.8% | Normalization alone doesn't close the overall-accuracy gap |
 | job-36 | cycle_loss_weight=0 (on job-34's normalized recipe) | *(CrossTask 59.9% / MVBench 55.2% / TempCompass 64.0%)* | Removing cycle loss alone doesn't help here |
-| job-42 | disable_norm + cycle_loss_weight=0 + bridge as 2-layer MLP (hidden=2048), 1 epoch | 66.7% | **The eventually-winning recipe -- but under-trained at 1 epoch** (its own loss curve hadn't converged) |
-| job-49 | + mix COIN into job-42's recipe | 67.1% | Marginal change |
-| job-56 | job-34's normalization combined with job-42's MLP bridge | 61.5% | Worse than either change alone |
+| job-42 | disable_norm + cycle_loss_weight=0 + bridge as 2-layer MLP (hidden=2048), 1 epoch | 63.3% | **The eventually-winning recipe -- but under-trained at 1 epoch** (its own loss curve hadn't converged) |
+| job-49 | + mix COIN into job-42's recipe | 64.9% | Marginal change |
+| job-56 | job-34's normalization combined with job-42's MLP bridge | 56.4% | Worse than either change alone |
 | job-60 | job-42's recipe, bridge_hidden_dim doubled to 4096 | 58.7% | Forward loss failed to converge (ema plateaued ~0.68-0.70 vs job-42's ~0.58-0.60) -- a width/LR mismatch, not a capacity win; ruled out via loss-curve comparison and a corrected gradient-conflict diagnostic |
-| **job-72** | job-42's *exact* recipe, `--epochs 2` instead of 1 | **70.9%** | **Breakthrough**: beats job-42 on all 4 forward benchmarks; beats job-13 on 3/4 OOD benchmarks (first time any joint checkpoint has) |
+| **job-72** | job-42's *exact* recipe, `--epochs 2` instead of 1 | 63.3% (tied with job-42) | **Breakthrough on the 3 OOD benchmarks** (beats job-42 outright on TempCompass/MVBench/CrossTask, beats job-13 on all 3 -- first time any joint checkpoint has); on COIN specifically the 2-epoch gain lives entirely in the *easy* subset, hard is unchanged (see note above) |
 | job-79 | job-72's recipe + warmup/cosine LR schedule + checkpoints every 250 steps instead of 1000 | peak 100-item snapshot 63% (vs. job-72's own 86%) | **Negative result**: the schedule did NOT fix the instability (still dipped to 44-55% through most of epoch 2) and markedly LOWERED the achievable peak -- cosine-decaying to ~0 by the end under-trains relative to job-72's constant 1e-4 throughout. Full-test eval skipped (the 100-item ceiling is far enough below job-72's to not be worth confirming); constant LR remains the better choice, this lever is deprioritized. |
 | job-82/83/84 (running) | C1: job-42's recipe, `--layer_strategy` in {last4, uniform4, all} instead of middle4 | *(in progress)* | Which VLM decoder layers receive injection -- mirrors ThinkJEPA's own layer-selection ablation |
 | job-85 (running) | C2: job-42's recipe, `--injection_mode film` instead of cross_attn | *(in progress)* | Re-tests FiLM (bandwidth-limited diagnosis was made early, under the old v1 architecture) on the current winning recipe |
