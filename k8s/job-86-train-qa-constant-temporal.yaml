@@ -51,6 +51,9 @@ spec:
                       - hcc-nrp-shor-c5809.unl.edu
                       - dtn-gpu2.kreonet.net
                       - hcc-chase-shor-c4705.unl.edu
+                      # "GPU is lost" device-plugin error, 3 consecutive
+                      # attempts landed here
+                      - k8s-haosu-12.sdsc.optiputer.net
       containers:
         - name: train-qa-constant-temporal
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
