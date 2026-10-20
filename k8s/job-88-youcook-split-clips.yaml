@@ -1,0 +1,113 @@
+# Step 88: split job-81's downloaded YouCook2 videos (1544/1790, 86%) into
+# per-step clips via step1_youcook_fixed.py. CPU-only, no GPU needed.
+#
+# VANS_WORK_ROOT=/data/vans_work_youcook (matches where job-81 put the
+# videos: $VANS_WORK_ROOT/videos/youcook2/<recipe_type>/<video_id>.mp4),
+# NOT the shared /data/vans_work used by the COIN pipeline (whose clips/
+# is a symlink to a separate read-only backup -- writing YouCook2 clips
+# there would conflict with that symlink). Output lands at
+# /data/vans_work_youcook/clips/<video_id>/<step_id>.mp4. Merging this
+# into the same tree build_qa_pairs_full.py scans by default is a
+# separate step, once we're ready to actually build the YouCook2 QA split.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-youcook-split-clips
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - node-1-3.sdsc.optiputer.net
+                      - moff.sdstate.edu
+      containers:
+        - name: youcook-split-clips
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              for CAND in /home/jovyan/conda-envs/thinkjepa/bin/ffmpeg /home/jovyan/conda-envs/qwen3vl/bin/ffmpeg "$(which ffmpeg 2>/dev/null)"; do
+                if [ -n "$CAND" ] && [ -x "$CAND" ]; then FFMPEG_BIN="$CAND"; break; fi
+              done
+              if [ -z "${FFMPEG_BIN:-}" ]; then
+                apt-get update -qq && apt-get install -y -qq ffmpeg
+                FFMPEG_BIN="$(which ffmpeg)"
+              fi
+              export FFMPEG_BIN
+              echo "using ffmpeg at: $FFMPEG_BIN"
+              "$FFMPEG_BIN" -version | head -1
+
+              cd "$REPO"
+              "$PY" vans_qa/full_scale/step1_youcook_fixed.py
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work_youcook
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "6"
+              memory: "8Gi"
+              ephemeral-storage: "4Gi"
+            limits:
+              cpu: "7"
+              memory: "9600Mi"
+              ephemeral-storage: "6Gi"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-88-youcook-split-clips.yaml -n williamli-scvl
