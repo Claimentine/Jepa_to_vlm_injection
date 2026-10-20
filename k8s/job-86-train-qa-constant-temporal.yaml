@@ -63,6 +63,13 @@ spec:
               PY=/home/jovyan/conda-envs/qwen3vl/bin/python
               REPO=/code/Jepa_to_vlm_injection
 
+              # ruixin-conda-vol's shared env drifted: huggingface-hub==2.1.1
+              # got installed at some point, but this env's transformers
+              # requires <2.0 and fails on import. Pin it back before anything
+              # else runs (3 consecutive failures on this exact ImportError
+              # before this fix was added).
+              "$PY" -m pip install --quiet "huggingface-hub<2.0"
+
               mkdir -p "$VANS_WORK_ROOT"
               ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
               ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
