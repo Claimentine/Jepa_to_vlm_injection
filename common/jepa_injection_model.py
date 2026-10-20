@@ -173,9 +173,27 @@ class JepaInjector(nn.Module):
     def forward(self, vjepa_feats):
         # vjepa_feats: (B, T, N, D) float tensor
         if self.mode == "constant":
-            if self.pooling == "temporal" and vjepa_feats.shape[1] != self.constant_tokens.shape[1]:
-                raise ValueError("constant temporal injector was initialized for a different number of frames")
-            return self.constant_tokens.expand(vjepa_feats.shape[0], -1, -1)
+            if self.pooling == "temporal":
+                T = vjepa_feats.shape[1]
+                if T > self.constant_tokens.shape[1]:
+                    raise ValueError(
+                        f"constant temporal injector only supports up to {self.constant_tokens.shape[1]} "
+                        f"frames, got T={T}"
+                    )
+                # Some cached clips have T < 64 (short clips decode fewer
+                # frames than requested); "jepa"/"random" modes handle this
+                # fine since they operate directly on vjepa_feats's own T
+                # axis, but constant_tokens is a fixed (1, 64, H) parameter.
+                # Slicing to the first T positions keeps it content-free and
+                # deterministic (same learned per-position values for a
+                # given position regardless of clip length) instead of
+                # hard-erroring and silently dropping the item -- confirmed
+                # this was skipping ~75% of items (ValueError: "initialized
+                # for a different number of frames") on job-86's first run.
+                tokens = self.constant_tokens[:, :T, :]
+            else:
+                tokens = self.constant_tokens
+            return tokens.expand(vjepa_feats.shape[0], -1, -1)
         if self.mode == "random":
             vjepa_feats = torch.randn(
                 vjepa_feats.shape, generator=self._rng, dtype=vjepa_feats.dtype
