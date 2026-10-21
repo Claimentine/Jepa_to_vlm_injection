@@ -1,0 +1,163 @@
+# Step 93 smoke test: --annotation_source goalstep --pair_mode shortaxis --
+# consecutive top-level GoalStep step pairs instead of longaxis's
+# first/last-step pairs. A direct data audit of the 65 already-downloaded
+# GoalStep videos (done before writing select_shortaxis_pairs_goalstep())
+# found consecutive-step gaps have median=0.7s, p90=10.6s -- far tighter
+# than narration's own shortaxis range, so --min_gap_seconds is lowered to
+# 0 here (narration's shortaxis job-92 uses 10, which would exclude most
+# real GoalStep pairs). Reuses the SAME --video_cache_dir job-50/job-89
+# already populated (583 videos, see extract_ego4d_longaxis.py's own
+# docstring) so this smoke test should barely need any new downloads.
+# --limit 200 (pairs, not videos) before committing to a full run.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-smoke-ego4d-goalstep-shortaxis
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  # excluded 2026-10-21: job-92's first run hit "GPU is
+                  # lost" UnexpectedAdmissionError twice in a row here
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - k8s-chase-ci-01.calit2.optiputer.net
+      containers:
+        - name: smoke-ego4d-goalstep-shortaxis
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet ego4d
+              export PATH="$(dirname "$PY"):$PATH"
+
+              mkdir -p ~/.aws
+              cat > ~/.aws/credentials <<CREDS
+              [default]
+              aws_access_key_id = ${AWS_ACCESS_KEY_ID}
+              aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}
+              CREDS
+              cat > ~/.aws/config <<CFG
+              [default]
+              region = ${AWS_DEFAULT_REGION}
+              CFG
+
+              GOALSTEP=$(find /data/raw_data/ego4d_annotations -iname "goalstep_train.json" | head -1)
+              echo "using goalstep annotations: $GOALSTEP"
+
+              cd "$REPO"
+              exec "$PY" vans_qa/full_scale/extract_ego4d_longaxis.py \
+                --annotation_source goalstep \
+                --goalstep_json "$GOALSTEP" \
+                --pair_mode shortaxis \
+                --min_gap_seconds 0 \
+                --max_gap_seconds 60 \
+                --pairs_per_video 3 \
+                --limit 200 \
+                --output_dir /data/raw_data/ego4d_shortaxis_goalstep_smoke \
+                --video_cache_dir /data/vans_work/ego4d_raw_videos
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: VJEPA2_CKPT
+              value: /data/checkpoints/vjepa2/vitl.pt
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_DEFAULT_REGION
+          resources:
+            requests:
+              cpu: "5"
+              memory: "13Gi"
+              ephemeral-storage: "4Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "6"
+              memory: "15600Mi"
+              ephemeral-storage: "4800Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-93-smoke-ego4d-goalstep-shortaxis.yaml -n williamli-scvl

@@ -34,6 +34,12 @@ spec:
                       - Tesla-V100-SXM2-32GB
                       - NVIDIA-GeForce-RTX-2080-Ti
                       - NVIDIA-TITAN-RTX
+                  # excluded 2026-10-21: first run hit "GPU is lost"
+                  # UnexpectedAdmissionError twice in a row on this node
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - k8s-chase-ci-01.calit2.optiputer.net
       containers:
         - name: smoke-ego4d-shortaxis
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
