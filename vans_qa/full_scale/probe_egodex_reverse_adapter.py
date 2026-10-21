@@ -243,10 +243,11 @@ class TokenTrajectoryProbe(nn.Module):
     learning real motion signal, not worse by failing to learn a per-episode
     constant it was never given enough information to infer."""
 
-    def __init__(self, dim, hidden_dim, n_tokens, n_joints):
+    def __init__(self, dim, hidden_dim, n_tokens, n_joints, target_mode="displacement"):
         super().__init__()
         self.n_tokens = n_tokens
         self.n_joints = n_joints
+        self.target_mode = target_mode
         self.attn_score = nn.Linear(dim, 1)
         self.time_embed = nn.Parameter(torch.zeros(n_tokens, dim))
         self.head = nn.Sequential(
@@ -254,11 +255,20 @@ class TokenTrajectoryProbe(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 2 * n_joints * 3),
         )
-        # Zero-init the output layer so the probe starts EXACTLY at the
-        # static baseline (predicted displacement = 0 for every sample
-        # before any training) and has to earn any improvement over it.
-        nn.init.zeros_(self.head[-1].weight)
-        nn.init.zeros_(self.head[-1].bias)
+        if target_mode == "displacement":
+            # Zero-init the output layer so the probe starts EXACTLY at the
+            # static baseline (predicted displacement = 0 for every sample
+            # before any training) and has to earn any improvement over it.
+            nn.init.zeros_(self.head[-1].weight)
+            nn.init.zeros_(self.head[-1].bias)
+        # target_mode == "absolute": matches ThinkJEPA's own ref_mode="none"
+        # (the config their own officially-reported ADE=0.0683/FDE=0.0733
+        # reference number uses) -- the task head regresses raw xyz_world
+        # position directly, with NO last-observed-position (or any other
+        # hand-reference) offset added back. Zero-init would start this
+        # variant at the origin (0,0,0), which is not a meaningful "do
+        # nothing" baseline the way delta=0 is for displacement mode, so
+        # it keeps the head's default (Kaiming/uniform) init instead.
 
     def forward(self, tokens):
         B = tokens.shape[0]
@@ -384,6 +394,7 @@ def run_probe(label, predictor, train_loader, test_loader, device, args, joint_i
     probe = TokenTrajectoryProbe(
         dim=rev.D_EMBED, hidden_dim=args.probe_hidden_dim,
         n_tokens=rev.T_PER_CLIP, n_joints=len(joint_idx),
+        target_mode=args.target_mode,
     ).to(device)
     opt = torch.optim.AdamW(probe.parameters(), lr=args.probe_lr)
 
@@ -394,18 +405,21 @@ def run_probe(label, predictor, train_loader, test_loader, device, args, joint_i
             if max_batches and bi >= max_batches:
                 break
             samples = batch_to_samples(batch, device, joint_idx)
-            pred_deltas, target_deltas = [], []
+            pred_list, target_list = [], []
             for s in samples:
                 with torch.no_grad():
                     y_future = predict_future_latent(
                         predictor, s["in_feats"], {"vlm_old": s["vlm_old"], "vlm_new": s["vlm_new"]}, device,
                     )  # (1,16,256,1024), frozen -- no grad needed through the predictor itself
-                pred_delta = probe(y_future)[0]  # (32,2,3) -- displacement from last_pos
-                target_delta = s["target"] - s["last_pos"].unsqueeze(0)  # (32,2,3)
-                pred_deltas.append(pred_delta)
-                target_deltas.append(target_delta)
-            pred_stack = torch.stack(pred_deltas)    # (B,32,2,3)
-            target_stack = torch.stack(target_deltas)
+                pred = probe(y_future)[0]  # (32,2,3)
+                if args.target_mode == "displacement":
+                    target = s["target"] - s["last_pos"].unsqueeze(0)  # (32,2,3)
+                else:
+                    target = s["target"]  # (32,2,3), absolute xyz_world, no reference offset
+                pred_list.append(pred)
+                target_list.append(target)
+            pred_stack = torch.stack(pred_list)    # (B,32,2,3)
+            target_stack = torch.stack(target_list)
             loss = nn.functional.mse_loss(pred_stack, target_stack)
             if train:
                 opt.zero_grad()
@@ -430,8 +444,11 @@ def run_probe(label, predictor, train_loader, test_loader, device, args, joint_i
                 y_future = predict_future_latent(
                     predictor, s["in_feats"], {"vlm_old": s["vlm_old"], "vlm_new": s["vlm_new"]}, device,
                 )
-                pred_delta = probe(y_future)[0]
-                pred_abs = s["last_pos"].unsqueeze(0) + pred_delta  # reconstruct absolute position
+                pred = probe(y_future)[0]
+                if args.target_mode == "displacement":
+                    pred_abs = s["last_pos"].unsqueeze(0) + pred  # reconstruct absolute position
+                else:
+                    pred_abs = pred  # already absolute, no reference offset to add back
                 all_pred.append(pred_abs)
                 all_target.append(s["target"])  # already absolute
     pred_stack = torch.stack(all_pred)
@@ -467,6 +484,16 @@ def main():
                           "real EgoDex training recipe; only affects per-batch iteration speed, "
                           "not the one-time dataset/manifest construction inside "
                           "build_egodex_dataloaders() itself")
+    ap.add_argument("--target_mode", choices=["displacement", "absolute"], default="displacement",
+                     help="'displacement' (default): probe predicts displacement from the last "
+                          "observed joint position -- the original, well-posed formulation (see "
+                          "TokenTrajectoryProbe's docstring). 'absolute': probe regresses raw "
+                          "xyz_world directly with NO reference-point offset, matching ThinkJEPA's "
+                          "own ref_mode=\"none\" (the config their officially-reported "
+                          "ADE=0.0683/FDE=0.0733 reference uses) exactly -- for a genuinely "
+                          "apples-to-apples comparison against that number, since 'displacement' "
+                          "mode is functionally closer to ThinkJEPA's own ref_mode=\"perhand\"/"
+                          "\"avg\" (NOT what their reported reference number used).")
     ap.add_argument("--probe_epochs", type=int, default=10)
     ap.add_argument("--probe_lr", type=float, default=1e-3)
     ap.add_argument("--probe_hidden_dim", type=int, default=512)
