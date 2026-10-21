@@ -1,0 +1,137 @@
+# Step 94: C4 -- re-runs the EgoDex reverse probe with --target_mode
+# absolute (new flag, added this session) instead of the original
+# displacement formulation. Motivation: the project's own headline
+# ADE/FDE numbers (e.g. job-72: 0.0331/0.0407) beat ThinkJEPA's own
+# officially-trained-on-EgoDex reference (0.0683/0.0733) despite our
+# predictor never having seen EgoDex -- which raised the question of
+# whether this reflects better representations or an easier task
+# formulation. Reading ThinkJEPA's own cache_train/thinker_train.py
+# directly confirmed their reference number uses ref_mode="none" (no
+# reference-point offset added to the raw camera-frame regression at
+# all), while our displacement-from-last-observed-position probe is
+# functionally closer to their ref_mode in {perhand,avg} -- an easier
+# formulation, not matched to the number we were comparing against.
+# --target_mode absolute reproduces ref_mode="none" exactly (raw
+# xyz_world regression, no offset, non-zero-init head), giving a
+# genuinely apples-to-apples number against ThinkJEPA's reference.
+#
+# Same three checkpoints as the existing headline reverse table
+# (job15_independent, job42_bridge_mlp2048, job72_step4000) so the new
+# "absolute" column sits directly next to the existing "displacement"
+# column for the same rows. Reuses the already-cached EgoDex
+# supervision data and already-trained frozen predictors -- only the
+# probe head (small MLP) is retrained, so this is cheap (job-75/76's
+# own full_run.log shows ~10 probe epochs over 466 cached train
+# batches per checkpoint, no video decode or VLM/VJEPA forward pass
+# needed at train time).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-egodex-probe-refmode-absolute
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-01.laccd.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - dtn-gpu2.kreonet.net
+                      - hcc-chase-shor-c4705.unl.edu
+                      - k8s-chase-ci-01.calit2.optiputer.net
+      containers:
+        - name: probe-refmode-absolute
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/thinkjepa/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/egodex_reverse_probe_refmode_absolute_full
+              "$PY" vans_qa/full_scale/probe_egodex_reverse_adapter.py \
+                --checkpoints job15_independent job42_bridge_mlp2048 job72_step4000 \
+                --joint_subset all \
+                --target_mode absolute \
+                --batch_size 4 \
+                --probe_epochs 10 \
+                --num_workers 4 \
+                --out_json /data/raw_data/egodex_reverse_probe_refmode_absolute_full/results.json \
+                2>&1 | tee /data/raw_data/egodex_reverse_probe_refmode_absolute_full/full_run.log
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests: {cpu: "4", memory: "20Gi", ephemeral-storage: "2Gi", nvidia.com/gpu: "1"}
+            limits: {cpu: "4.8", memory: "24Gi", ephemeral-storage: "4Gi", nvidia.com/gpu: "1"}
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+            - name: shm
+              mountPath: /dev/shm
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-94-egodex-probe-refmode-absolute.yaml -n williamli-scvl
