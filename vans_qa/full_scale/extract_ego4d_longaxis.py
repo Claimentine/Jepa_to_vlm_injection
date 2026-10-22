@@ -518,6 +518,12 @@ def main():
                           "Split is seeded and video-level, done once before pair selection.")
     ap.add_argument("--eval_output_dir", default=None,
                      help="required if --eval_frac > 0 -- held-out videos' pairs are written here")
+    ap.add_argument("--eval_limit", type=int, default=None,
+                     help="cap on EVAL pairs specifically -- the eval video subset can easily "
+                          "yield more candidates than --limit by itself (eval videos aren't a "
+                          "fixed fraction of --limit, they're --eval_frac of ALL videos, with "
+                          "their own independent yield), so without this eval can end up several "
+                          "times larger than intended. Defaults to reusing --limit if unset.")
     ap.add_argument("--output_dir", default=os.path.join(WORK_BASE, "ego4d_longaxis_cache"))
     ap.add_argument("--video_cache_dir", default=os.path.join(WORK_BASE, "ego4d_raw_videos"),
                      help="downloaded whole videos are kept here (not deleted) so a re-run "
@@ -607,7 +613,19 @@ def main():
     eval_pairs = []
     if eval_keys:
         eval_gv, eval_nd = subset_videos(eval_keys)
-        eval_pairs = build_pairs(eval_gv, eval_nd, args.limit)
+        # NOT args.limit: the eval video subset (--eval_frac of all videos)
+        # can easily yield MORE candidate pairs than --limit by itself --
+        # e.g. a real run with --limit 6000 --eval_frac 0.15 on 9611
+        # narration videos produced 6000 train candidates (capped, as
+        # intended) but 3583 eval candidates (not capped at all, since the
+        # 1442 eval videos' own natural yield never reached 6000) -- a
+        # ~4x-larger-than-intended eval set, wasting download/encode time
+        # on pairs beyond what the eval split actually needs. --eval_limit
+        # defaults to None, which falls back to reusing args.limit (the old
+        # behavior) -- pass --eval_limit explicitly whenever --eval_frac is
+        # used so eval doesn't silently balloon past what's actually needed.
+        eval_limit = args.eval_limit if args.eval_limit is not None else args.limit
+        eval_pairs = build_pairs(eval_gv, eval_nd, eval_limit)
         print(f"[INFO] {len(eval_pairs)} candidate {args.pair_mode} pairs for EVAL output "
               f"(annotation_source={args.annotation_source})", flush=True)
 

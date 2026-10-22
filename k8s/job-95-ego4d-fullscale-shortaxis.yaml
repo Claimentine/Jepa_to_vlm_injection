@@ -100,6 +100,7 @@ spec:
                 --window_seconds 8.0 \
                 --limit 6000 \
                 --eval_frac 0.15 \
+                --eval_limit 900 \
                 --eval_output_dir /data/raw_data/ego4d_shortaxis_narration_eval \
                 --output_dir /data/raw_data/ego4d_shortaxis_narration_train \
                 --video_cache_dir /data/vans_work/ego4d_raw_videos_shortaxis
@@ -117,6 +118,7 @@ spec:
                 --pairs_per_video 3 \
                 --limit 5000 \
                 --eval_frac 0.15 \
+                --eval_limit 750 \
                 --eval_output_dir /data/raw_data/ego4d_shortaxis_goalstep_eval \
                 --output_dir /data/raw_data/ego4d_shortaxis_goalstep_train \
                 --video_cache_dir /data/vans_work/ego4d_raw_videos
