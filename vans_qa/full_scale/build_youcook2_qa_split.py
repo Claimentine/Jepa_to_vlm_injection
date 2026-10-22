@@ -1,16 +1,23 @@
-"""Builds a YouCook2-ONLY 2-choice QA eval split, held out as its own
-benchmark rather than merged into build_qa_pairs_full.py's combined
-COIN+YouCook2 train/val/test split -- same role as
-build_mvbench_qa_split.py/build_tempcompass_qa_split.py/
-extract_crosstask_qa.py: a distinct benchmark row, not more COIN training
-data.
+"""Builds a YouCook2 2-choice QA split with BOTH roles at once: a training
+portion (merged into COIN's training pool by a separate step) and a
+held-out eval portion -- "Plan 2", per the user's explicit correction
+("部分加入训练集,部分做一个held-out eval test") after an earlier eval-only
+version of this script. The eval portion still plays the same role as
+build_mvbench_qa_split.py/build_tempcompass_qa_split.py/extract_crosstask_qa.py
+(a distinct benchmark row), it just no longer swallows every matched item.
 
 Mirrors build_qa_pairs_full.py's own pairing logic exactly (same CSV
 schema, same clip_exists() check, same real-caption-from-elsewhere
-distractor convention) but reads only VANS-DATA_YouCook.csv and writes
-ALL matched items to the "test" key (train/val empty), matching how
-TempCompass/MVBench/CrossTask are structured -- this is an eval-only
-benchmark, not additional training data.
+distractor convention) but reads only VANS-DATA_YouCook.csv.
+
+Split is done at the VIDEO level, not the pair level -- same reasoning as
+extract_ego4d_longaxis.py's --eval_frac: input_video_path's first path
+component (e.g. "--bv0V6ZjWI" in "/--bv0V6ZjWI/4.mp4") is the source
+YouTube video id, and consecutive-segment pairs from the same video share
+scene/context, so a pair-level split would leak context between train
+and eval. --train_frac (default 0.85) of distinct video ids go to train,
+the rest to eval ("test" key, kept for naming consistency with the other
+benchmark splits).
 
 Run with VANS_WORK_ROOT pointed at job-88's own output
 (/data/vans_work_youcook, whose clips/ holds step1_youcook_fixed.py's
@@ -45,15 +52,23 @@ def load_rows():
             out_path = (r.get("output_video_path") or "").strip()
             if not (q and a and in_path and out_path):
                 continue
+            # first path component of in_path is the source YouTube video
+            # id (e.g. "--bv0V6ZjWI" in "/--bv0V6ZjWI/4.mp4") -- the
+            # video-level grouping key for the train/eval split below
+            video_id = in_path.lstrip("/").split("/")[0]
             rows.append({"pid": "youcook2_" + in_path.lstrip("/").replace(".mp4", "").replace("/", "__"),
                          "in_path": in_path, "out_path": out_path,
-                         "question": q, "answer": a})
+                         "question": q, "answer": a, "video_id": video_id})
     return rows
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--train_frac", type=float, default=0.85,
+                     help="fraction of distinct source VIDEOS (not pairs) assigned to train -- "
+                          "video-level, not pair-level, so consecutive-segment pairs from the "
+                          "same video never straddle train/eval")
     ap.add_argument("--out", default=OUT_PATH)
     args = ap.parse_args()
 
@@ -65,22 +80,33 @@ def main():
     print(f"[INFO] {len(matched)} rows with BOTH input and output clips actually extracted "
           f"(CLIPS_ROOT={CLIPS_ROOT})", flush=True)
 
+    video_ids = sorted({r["video_id"] for r in matched})
+    rng.shuffle(video_ids)
+    n_train_videos = int(round(len(video_ids) * args.train_frac))
+    train_video_ids = set(video_ids[:n_train_videos])
+    print(f"[INFO] video-level split: {len(train_video_ids)} train / "
+          f"{len(video_ids) - len(train_video_ids)} eval videos "
+          f"(train_frac={args.train_frac}, seed={args.seed}, {len(video_ids)} total)", flush=True)
+
     all_answers = [r["answer"] for r in matched]
-    items = []
+    train_items, eval_items = [], []
     for i, r in enumerate(matched):
         distractor = rng.choice(all_answers[:i] + all_answers[i + 1:]) if len(all_answers) > 1 else r["answer"]
-        items.append({
+        item = {
             "pid": r["pid"],
             "in_clip": os.path.join(CLIPS_ROOT, r["in_path"].lstrip("/")),
             "out_clip": os.path.join(CLIPS_ROOT, r["out_path"].lstrip("/")),
             "question": r["question"],
             "correct_caption": r["answer"],
             "distractor_caption": distractor,
-        })
+        }
+        (train_items if r["video_id"] in train_video_ids else eval_items).append(item)
 
-    rng.shuffle(items)
-    split = {"train": [], "val": [], "test": items}
-    print(f"[INFO] wrote {len(items)} items to test (eval-only benchmark)", flush=True)
+    rng.shuffle(train_items)
+    rng.shuffle(eval_items)
+    split = {"train": train_items, "val": [], "test": eval_items}
+    print(f"[INFO] wrote {len(train_items)} items to train, {len(eval_items)} items to test "
+          f"(held-out eval)", flush=True)
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
