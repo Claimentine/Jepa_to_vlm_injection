@@ -1,0 +1,204 @@
+# Step 95: full-scale shortaxis extraction for BOTH Ego4D annotation
+# sources, validated by job-92 (narration: 197/200 pairs, 98.5% yield) and
+# job-93 (goalstep: 196/200 pairs, 98% yield). Runs narration then goalstep
+# sequentially in one job (one GPU reservation, one conda-vol hold, avoids
+# a second job queuing behind this one for the same RWO volume).
+#
+# Targets (per the user's explicit decision): narration ~6000 training +
+# ~900 eval pairs; goalstep ~5000 training + ~750 eval pairs. Both use the
+# new --eval_frac 0.15 VIDEO-level split (not pair-level, to avoid
+# same-video leakage between train and eval) and gap filtering
+# (--min_gap_seconds/--max_gap_seconds) per the user's explicit requirement
+# ("一定要限制合理的step间隔"). goalstep's --min_gap_seconds is 0 (not
+# narration's 10s default) since GoalStep's own consecutive-step gaps have
+# a 0.7s median -- a 10s floor would exclude most real pairs (see
+# extract_ego4d_longaxis.py's own select_shortaxis_pairs_goalstep
+# docstring for the full data audit behind this choice).
+#
+# This is a LONG-RUNNING job -- likely many hours (possibly over a day):
+# narration needs roughly limit/pairs_per_video ~= 2000 distinct video
+# downloads (most not yet fetched), goalstep needs up to ~1700 (583
+# already cached from job-50, reusing /data/vans_work/ego4d_raw_videos
+# directly -- a real head start). Kind: Job, not a bare Pod, so it is not
+# subject to the ~6h pod limit.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-ego4d-fullscale-shortaxis
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      # excluded 2026-10-21: job-92's first attempt hit
+                      # "GPU is lost" UnexpectedAdmissionError twice here
+                      - k8s-chase-ci-01.calit2.optiputer.net
+      containers:
+        - name: ego4d-fullscale-shortaxis
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet ego4d
+              export PATH="$(dirname "$PY"):$PATH"
+
+              mkdir -p ~/.aws
+              cat > ~/.aws/credentials <<CREDS
+              [default]
+              aws_access_key_id = ${AWS_ACCESS_KEY_ID}
+              aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}
+              CREDS
+              cat > ~/.aws/config <<CFG
+              [default]
+              region = ${AWS_DEFAULT_REGION}
+              CFG
+
+              cd "$REPO"
+
+              echo "=== [1/2] NARRATION shortaxis, target 6000 train / 900 eval ==="
+              mkdir -p /data/raw_data/ego4d_annotations
+              "$PY" -m ego4d.cli.cli -o /data/raw_data/ego4d_annotations \
+                --datasets annotations --annotations narration -y \
+                >/tmp/ego4d_annotations_dl.log 2>&1
+              tail -5 /tmp/ego4d_annotations_dl.log
+              NARRATION=$(find /data/raw_data/ego4d_annotations -iname "narration.json" | head -1)
+              echo "narration file: $NARRATION"
+
+              "$PY" vans_qa/full_scale/extract_ego4d_longaxis.py \
+                --annotation_source narration \
+                --narration_json "$NARRATION" \
+                --pair_mode shortaxis \
+                --min_gap_seconds 10 \
+                --max_gap_seconds 60 \
+                --pairs_per_video 3 \
+                --window_seconds 8.0 \
+                --limit 6000 \
+                --eval_frac 0.15 \
+                --eval_output_dir /data/raw_data/ego4d_shortaxis_narration_eval \
+                --output_dir /data/raw_data/ego4d_shortaxis_narration_train \
+                --video_cache_dir /data/vans_work/ego4d_raw_videos_shortaxis
+
+              echo "=== [2/2] GOALSTEP shortaxis, target 5000 train / 750 eval ==="
+              GOALSTEP=$(find /data/raw_data/ego4d_annotations -iname "goalstep_train.json" | head -1)
+              echo "goalstep file: $GOALSTEP"
+
+              "$PY" vans_qa/full_scale/extract_ego4d_longaxis.py \
+                --annotation_source goalstep \
+                --goalstep_json "$GOALSTEP" \
+                --pair_mode shortaxis \
+                --min_gap_seconds 0 \
+                --max_gap_seconds 60 \
+                --pairs_per_video 3 \
+                --limit 5000 \
+                --eval_frac 0.15 \
+                --eval_output_dir /data/raw_data/ego4d_shortaxis_goalstep_eval \
+                --output_dir /data/raw_data/ego4d_shortaxis_goalstep_train \
+                --video_cache_dir /data/vans_work/ego4d_raw_videos
+
+              echo "FULLSCALE_SHORTAXIS_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: VJEPA2_CKPT
+              value: /data/checkpoints/vjepa2/vitl.pt
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_DEFAULT_REGION
+          resources:
+            requests:
+              cpu: "5"
+              memory: "13Gi"
+              ephemeral-storage: "4Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "6"
+              memory: "15600Mi"
+              ephemeral-storage: "4800Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-95-ego4d-fullscale-shortaxis.yaml -n williamli-scvl
