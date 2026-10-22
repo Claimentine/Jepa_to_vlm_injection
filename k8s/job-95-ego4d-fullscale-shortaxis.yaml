@@ -53,6 +53,9 @@ spec:
                       # excluded 2026-10-21: job-92's first attempt hit
                       # "GPU is lost" UnexpectedAdmissionError twice here
                       - k8s-chase-ci-01.calit2.optiputer.net
+                      # excluded 2026-10-22: job-95's own retries all
+                      # landed here and all hit "GPU is lost" too, 3/3
+                      - nrp-g1.nysernet.org
       containers:
         - name: ego4d-fullscale-shortaxis
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
