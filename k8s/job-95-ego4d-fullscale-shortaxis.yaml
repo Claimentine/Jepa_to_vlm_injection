@@ -153,12 +153,18 @@ spec:
           resources:
             requests:
               cpu: "5"
-              memory: "13Gi"
+              memory: "20Gi"
               ephemeral-storage: "4Gi"
               nvidia.com/gpu: "1"
             limits:
               cpu: "6"
-              memory: "15600Mi"
+              # bumped from 15600Mi (job-92/93's smoke-test value) after the
+              # first full-scale attempt was OOMKilled at pair 65/6000 --
+              # the 200-pair smoke tests never hit this, which points to an
+              # unusually large/long outlier video rather than a steady
+              # per-pair memory leak (65 < the smoke tests' own successful
+              # 200-pair range), but giving real headroom either way
+              memory: "28Gi"
               ephemeral-storage: "4800Mi"
               nvidia.com/gpu: "1"
           volumeMounts:
