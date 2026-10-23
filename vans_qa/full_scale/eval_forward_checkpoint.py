@@ -162,6 +162,14 @@ def main():
                           "--checkpoint job22=/data/.../best_forward.pt -- path may also be the "
                           f"sentinel {NONE_SENTINEL!r} for a true zero-shot frozen-VLM baseline "
                           "(no injector, no hook at all), e.g. --checkpoint zeroshot=NONE")
+    ap.add_argument("--model_id", default=None,
+                     help="HF model id for the frozen VLM, overriding fwd.MODEL_ID "
+                          "(Qwen/Qwen3-VL-2B-Thinking) -- for A2's additional zero-shot VLM "
+                          "baselines (e.g. Qwen3.5-VL). Only meaningful with --checkpoint "
+                          f"label={NONE_SENTINEL!r} (zero-shot); a real checkpoint's injector was "
+                          "trained against the ORIGINAL model's hidden_size/tokenizer, so loading "
+                          "it onto a different --model_id is unsupported and will likely error or "
+                          "silently produce meaningless results.")
     ap.add_argument("--qa_split", default=os.path.join(fwd.BASE, "raw_data/qa_split_temporal.json"))
     ap.add_argument("--split_part", default="test", choices=["val", "test", "train"])
     ap.add_argument("--layer_strategy", default="middle4", choices=["middle4", "last4", "uniform4", "all"])
@@ -202,9 +210,10 @@ def main():
         items = items[: args.limit]
         print(f"[INFO] --limit {args.limit}: evaluating {len(items)} items", flush=True)
 
-    print(f"[INFO] loading {fwd.MODEL_ID} (frozen) ...", flush=True)
-    model = AutoModelForImageTextToText.from_pretrained(fwd.MODEL_ID, dtype="auto").to(device)
-    processor = AutoProcessor.from_pretrained(fwd.MODEL_ID)
+    model_id = args.model_id or fwd.MODEL_ID
+    print(f"[INFO] loading {model_id} (frozen) ...", flush=True)
+    model = AutoModelForImageTextToText.from_pretrained(model_id, dtype="auto").to(device)
+    processor = AutoProcessor.from_pretrained(model_id)
     model.requires_grad_(False)
     model.eval()
     hidden_size = model.config.text_config.hidden_size
