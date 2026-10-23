@@ -93,6 +93,23 @@ spec:
               cd "$REPO"
               nvidia-smi --query-gpu=index,name,memory.total --format=csv
               mkdir -p /data/raw_data/egodex_reverse_probe_refmode_absolute_full
+
+              # Pre-warm the EgoDex cache tree on THIS pod's fresh CephFS
+              # mount before the Python script touches it -- 4 separate
+              # attempts (different nodes each time) all hung 30-45+min in
+              # D-state on this exact dataloader-construction step, each
+              # time confirmed (md5sum from a DIFFERENT, already-running
+              # pod) that the specific file itself was fine -- a cold
+              # CephFS client cache on this job's own fresh mount, not a
+              # storage-wide or node-wide problem. find+xargs parallelizes
+              # the warm-up across many files at once instead of however
+              # build_egodex_dataloaders() scans them internally (looked
+              # serial from the single growing fd we kept observing).
+              echo "[INFO] pre-warming EgoDex cache tree (parallel)..."
+              time find /data/raw_data/thinkjepa_egodex_iso/cache -name '*.npz' -print0 \
+                | xargs -0 -P 32 -I{} sh -c 'cat {} > /dev/null' || true
+              echo "[INFO] pre-warm done"
+
               "$PY" vans_qa/full_scale/probe_egodex_reverse_adapter.py \
                 --checkpoints job15_independent job42_bridge_mlp2048 job72_step4000 \
                 --joint_subset all \
