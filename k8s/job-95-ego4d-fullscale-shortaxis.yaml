@@ -71,6 +71,18 @@ spec:
               "$PY" -m pip install --quiet ego4d
               export PATH="$(dirname "$PY"):$PATH"
 
+              # Pre-warm the qwen3vl conda env + VJEPA2 checkpoint on THIS
+              # pod's fresh CephFS mount -- the 3rd restart of this job
+              # (after an NRP idle-GPU warning email) hung 20+ min loading
+              # the checkpoint with zero CPU-time growth, the exact same
+              # cold-fresh-mount pattern diagnosed and fixed for job-94's
+              # own thinkjepa env + EgoDex data. Parallel warm-up here too.
+              echo "[INFO] pre-warming conda env + checkpoint (parallel)..."
+              time ( find /home/jovyan/conda-envs/qwen3vl -type f -print0 \
+                     | xargs -0 -P 32 -I{} sh -c 'cat {} > /dev/null' 2>/dev/null
+                   cat /data/checkpoints/vjepa2/vitl.pt > /dev/null ) || true
+              echo "[INFO] pre-warm done"
+
               mkdir -p ~/.aws
               cat > ~/.aws/credentials <<CREDS
               [default]
