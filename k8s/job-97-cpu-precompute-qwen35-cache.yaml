@@ -1,0 +1,106 @@
+# Step 97: CPU-ONLY precompute cache for A2's Qwen3.5-9B baseline (COIN +
+# CrossTask), per the user's explicit request to avoid a repeat of job-54's
+# idle-GPU incident (see build_eval_input_cache.py's own docstring: 17+
+# hours at ~0% GPU utilization while the main process was CPU-bound on
+# video decode + processor work). No GPU requested at all here -- only the
+# processor (tokenizer + image/video preprocessor) is loaded, decode+build
+# for every item happens here, and the later GPU job
+# (job-96-eval-qwen35-baseline-style) just does `torch.load` + `.to(device)`
+# + forward pass per item, staying GPU-bound throughout.
+#
+# Separate cache dirs from the existing Qwen3-VL-2B-Thinking caches --
+# Qwen3.5-9B's processor produces different tensors entirely, so sharing a
+# cache_dir between the two models would silently corrupt results.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-cpu-precompute-qwen35-cache
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      containers:
+        - name: cpu-precompute-qwen35-cache
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              MODEL_ID="Qwen/Qwen3.5-9B"
+              cd "$REPO"
+              "$PY" -m pip install --quiet --upgrade transformers
+
+              echo "=== COIN precompute cache (Qwen3.5-9B) ==="
+              "$PY" vans_qa/full_scale/build_eval_input_cache.py \
+                --model_id "$MODEL_ID" \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --split_part test \
+                --cache_dir /data/vans_work/eval_input_cache_coin_qwen35 \
+                --num_shards 1 --shard_idx 0
+
+              echo "=== CrossTask precompute cache (Qwen3.5-9B) ==="
+              "$PY" vans_qa/full_scale/build_eval_input_cache.py \
+                --model_id "$MODEL_ID" \
+                --qa_split /data/raw_data/qa_split_crosstask.json \
+                --split_part test \
+                --cache_dir /data/vans_work_crosstask/eval_input_cache_crosstask_qwen35 \
+                --num_shards 1 --shard_idx 0
+
+              echo "CPU_PRECOMPUTE_QWEN35_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "6"
+              memory: "16Gi"
+              ephemeral-storage: "4Gi"
+            limits:
+              cpu: "8"
+              memory: "16Gi"
+              ephemeral-storage: "4800Mi"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-baselines
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-97-cpu-precompute-qwen35-cache.yaml -n williamli-scvl

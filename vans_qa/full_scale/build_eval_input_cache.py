@@ -48,6 +48,11 @@ import train_qa_full as fwd  # noqa: E402
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--model_id", default=None,
+                     help="HF model id for the processor, overriding fwd.MODEL_ID -- for A2's "
+                          "additional zero-shot VLM baselines. Each model's processor produces "
+                          "different tensors, so use a SEPARATE --cache_dir per model (never "
+                          "share a cache_dir between two different --model_id values).")
     ap.add_argument("--qa_split", required=True)
     ap.add_argument("--split_part", default="test", choices=["val", "test", "train"])
     ap.add_argument("--cache_dir", required=True)
@@ -76,9 +81,10 @@ def main():
     print(f"[INFO] {args.split_part} split: {len(items)} items in shard {args.shard_idx}/{args.num_shards}",
           flush=True)
 
-    print(f"[INFO] loading {fwd.MODEL_ID} processor only (no model, no GPU) ...", flush=True)
+    model_id = args.model_id or fwd.MODEL_ID
+    print(f"[INFO] loading {model_id} processor only (no model, no GPU) ...", flush=True)
     from transformers import AutoProcessor
-    processor = AutoProcessor.from_pretrained(fwd.MODEL_ID)
+    processor = AutoProcessor.from_pretrained(model_id)
 
     import random
     rng = random.Random(args.seed)
