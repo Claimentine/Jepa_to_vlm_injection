@@ -1,0 +1,117 @@
+# Step 99: CPU-ONLY precompute caches for our OWN model's (Qwen3-VL-2B-
+# Thinking, fwd.MODEL_ID's default -- no --model_id override) three
+# benchmarks that have never had one: COIN, TempCompass, MVBench.
+# CrossTask already has one (job-63, 1557 files, confirmed still present).
+#
+# Unlike the A2 baseline caches (job-97, tied to Qwen3.5-9B's own
+# processor), this cache is reusable across EVERY checkpoint we ever
+# evaluate -- the processor is identical regardless of which injector/
+# checkpoint gets attached afterward (that happens via a forward hook,
+# entirely downstream of the processor step this script does). Benefits
+# C1's still-pending uniform4/all full evals, any future C2/C3 ablation,
+# and job-90-style 4-benchmark sweeps going forward -- a one-time cost,
+# reused indefinitely. MVBench in particular (9207+ items, 11 source
+# datasets with widely varying resolution) was job-54's own original
+# idle-GPU trigger per build_eval_input_cache.py's docstring.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-cpu-precompute-own-model-caches
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      containers:
+        - name: cpu-precompute-own-model-caches
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+
+              echo "=== COIN precompute cache ==="
+              export VANS_WORK_ROOT=/data/vans_work
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+              "$PY" vans_qa/full_scale/build_eval_input_cache.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --split_part test \
+                --cache_dir /data/vans_work/eval_input_cache_coin \
+                --num_shards 1 --shard_idx 0
+
+              echo "=== TempCompass precompute cache ==="
+              export VANS_WORK_ROOT=/data/vans_work_tempcompass
+              "$PY" vans_qa/full_scale/build_eval_input_cache.py \
+                --qa_split /data/raw_data/qa_split_tempcompass.json \
+                --split_part test \
+                --cache_dir /data/vans_work_tempcompass/eval_input_cache_tempcompass \
+                --num_shards 1 --shard_idx 0
+
+              echo "=== MVBench precompute cache ==="
+              export VANS_WORK_ROOT=/data/vans_work_mvbench
+              "$PY" vans_qa/full_scale/build_eval_input_cache.py \
+                --qa_split /data/raw_data/qa_split_mvbench.json \
+                --split_part test \
+                --cache_dir /data/vans_work_mvbench/eval_input_cache_mvbench \
+                --num_shards 1 --shard_idx 0
+
+              echo "CPU_PRECOMPUTE_OWN_MODEL_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "7"
+              memory: "16Gi"
+              ephemeral-storage: "4Gi"
+            limits:
+              cpu: "7"
+              memory: "16Gi"
+              ephemeral-storage: "4800Mi"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-precompute
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-99-cpu-precompute-own-model-caches.yaml -n williamli-scvl

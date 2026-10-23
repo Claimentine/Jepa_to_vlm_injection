@@ -1,0 +1,29 @@
+# Dedicated conda-envs volume for CPU-only precompute-cache builds
+# (job-99: our own model's COIN/TempCompass/MVBench caches), cloned from
+# ruixin-conda-vol so it doesn't queue behind job-97 (A2's own CPU
+# precompute job, currently holding ruixin-conda-vol-baselines) or any of
+# the other three conda-vols, all of which are tied up right now.
+#
+# `dataSource` triggers a Ceph RBD clone (fast, copy-on-write -- ~15-30s
+# per prior experience) ONLY on first creation.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ruixin-conda-vol-precompute
+spec:
+  storageClassName: rook-ceph-block
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  dataSource:
+    kind: PersistentVolumeClaim
+    name: ruixin-conda-vol
+
+# Apply with:
+#   kubectl apply -f pvc-conda-rbd-precompute.yaml -n williamli-scvl
+#
+# Reminder (Golden Rule #2): this is active-computation storage, not archival.
+# A PVC untouched for 6 months can be purged without notice -- move final
+# results to lab-approved long-term storage when a project wraps up.
