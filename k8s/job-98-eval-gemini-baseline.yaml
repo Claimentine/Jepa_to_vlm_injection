@@ -1,0 +1,97 @@
+# Step 98: A2 -- Gemini 2.5 Flash zero-shot baseline, CrossTask + COIN,
+# 200-item subsample each (400 calls total) per the user's explicit
+# decision -- the full item counts (COIN 2846 + CrossTask 1558 = 4404)
+# would take multiple DAYS against the free tier's RPD budget
+# (500-1500/day, user-confirmed 2026-10-22). No GPU requested -- pure API
+# calls, rate-limited to 15 RPM inside the script itself.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-eval-gemini-baseline
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      containers:
+        - name: eval-gemini-baseline
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              "$PY" -m pip install --quiet google-genai
+
+              echo "=== COIN (Gemini 2.5 Flash, 200-item subsample) ==="
+              "$PY" vans_qa/full_scale/eval_gemini_baseline.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --split_part test \
+                --limit 200 \
+                --out_jsonl /data/raw_data/a2_baseline_gemini25flash_coin.jsonl
+
+              echo "=== CrossTask (Gemini 2.5 Flash, 200-item subsample) ==="
+              "$PY" vans_qa/full_scale/eval_gemini_baseline.py \
+                --qa_split /data/raw_data/qa_split_crosstask.json \
+                --split_part test \
+                --limit 200 \
+                --out_jsonl /data/raw_data/a2_baseline_gemini25flash_crosstask.jsonl
+
+              echo "A2_GEMINI_DONE"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gemini-api-key
+                  key: GEMINI_API_KEY
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "2Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "2400Mi"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-baselines
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-98-eval-gemini-baseline.yaml -n williamli-scvl
