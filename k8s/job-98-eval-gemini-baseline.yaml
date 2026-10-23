@@ -12,6 +12,23 @@ spec:
   backoffLimit: 2
   template:
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  # excluded 2026-10-23: 30+min stuck in D-state here even
+                  # after removing the transformers dependency -- stuck
+                  # reading a freshly pip-installed package's own .pyc file,
+                  # pointing at slow I/O on this specific node rather than
+                  # anything about our code. Already excluded in other job
+                  # templates (e.g. job-73) for the same reason; this
+                  # CPU-only manifest just never had a nodeAffinity block
+                  # to carry it before now.
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - dtn-gpu2.kreonet.net
       containers:
         - name: eval-gemini-baseline
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
