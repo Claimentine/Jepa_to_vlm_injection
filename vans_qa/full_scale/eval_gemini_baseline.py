@@ -59,6 +59,17 @@ def load_done_pids(out_jsonl):
     return done
 
 
+def clip_exists(path):
+    """Gemini only ever needs the raw video clip -- unlike our own model's
+    evaluate_logprob/evaluate_logprob_none, it never touches VJEPA
+    features, so fwd.has_features() (which checks for a VJEPA npz cache
+    entry, not the clip itself) is the wrong filter here: the first run
+    of this script used it and filtered out every single item (0/2866
+    usable) because this job's environment never set up the VJEPA_CACHE
+    symlink COIN's own eval needs, which is irrelevant to Gemini anyway."""
+    return os.path.exists(path) and os.path.getsize(path) > 1000
+
+
 def parse_letter(text):
     """Pulls a single A/B choice out of the model's free-text response --
     even with an explicit "respond with only the letter" instruction,
@@ -92,7 +103,7 @@ def main():
 
     with open(args.qa_split) as f:
         split = json.load(f)
-    items = [it for it in split[args.split_part] if fwd.has_features(it)]
+    items = [it for it in split[args.split_part] if clip_exists(it["in_clip"])]
     print(f"[INFO] {args.split_part} split: {len(items)} usable items "
           f"(of {len(split[args.split_part])} total)", flush=True)
 
