@@ -65,6 +65,15 @@ spec:
               MODEL_ID="Qwen/Qwen3.5-9B"
               cd "$REPO"
 
+              # First attempt hit: ValueError: model type `qwen3_5` not
+              # recognized -- our env's transformers (5.1.0, cloned from
+              # ruixin-conda-vol) predates Qwen3.5's architecture support.
+              # This PVC (ruixin-conda-vol-baselines) is a fully independent
+              # RBD clone used by no other job, so upgrading transformers
+              # here is isolated -- it cannot affect job-83/90/95's own
+              # copies on the other three conda-vols.
+              "$PY" -m pip install --quiet --upgrade transformers accelerate
+
               echo "=== COIN full-test (Qwen3.5-9B zero-shot) ==="
               export VANS_WORK_ROOT=/data/vans_work
               mkdir -p "$VANS_WORK_ROOT"
