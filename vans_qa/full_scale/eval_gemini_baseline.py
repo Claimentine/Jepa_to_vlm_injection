@@ -1,9 +1,14 @@
 """A2 baseline: Gemini 2.5 Flash, zero-shot, via the Google AI Studio API
 (free tier -- NOT Vertex AI, which has no free tier). Same "predict what
-happens next" 2-choice QA task as our other zero-shot VLM baselines
-(train_qa_full.py's own build_option_block/build_prompt_text, reused
-unmodified so the prompt text is identical across every baseline), but
-answered by direct generation ("respond with only the option letter")
+happens next" 2-choice QA task as our other zero-shot VLM baselines --
+build_option_block/build_prompt_text below are copied verbatim from
+train_qa_full.py (not imported -- importing that module drags in
+transformers as a side effect purely for its has_features()/
+AutoModelForImageTextToText use elsewhere in that file, which cost one
+real run a long stall importing it on a cold RBD-clone conda volume,
+for a script that otherwise makes zero use of any ML library), kept in
+sync by hand so the prompt text stays identical across every baseline.
+Answered by direct generation ("respond with only the option letter")
 and parsed, not by comparing token logprobs the way our LOCAL-model
 baselines do (candidate_logprob) -- the Gemini API does not expose raw
 next-token logprobs the way a locally-loaded HF model does, and direct
@@ -28,14 +33,7 @@ import argparse
 import json
 import os
 import random
-import sys
 import time
-
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
-import train_qa_full as fwd  # noqa: E402
 
 MODEL_ID = "gemini-2.5-flash"
 RPM_LIMIT = 15
@@ -57,6 +55,39 @@ def load_done_pids(out_jsonl):
             except json.JSONDecodeError:
                 continue  # a half-written final line from a killed run -- drop it, not trust it
     return done
+
+
+def build_option_block(item, rng):
+    """Copied verbatim from train_qa_full.py (NOT imported -- see module
+    docstring's own note on why: importing that module drags in
+    transformers as a side effect, needlessly slow on a cold RBD-clone
+    conda volume for a script that otherwise makes zero use of it).
+    Keep this in sync with train_qa_full.py's own copy by hand if either
+    changes -- the prompt text must stay identical across every A2
+    baseline for the comparison to mean anything."""
+    options = [item["correct_caption"], item["distractor_caption"]]
+    order = [0, 1]
+    rng.shuffle(order)
+    letters = ["A", "B"]
+    letter_to_is_correct = {}
+    lines = []
+    for i, letter in enumerate(letters):
+        opt_idx = order[i]
+        lines.append(f"{letter}. {options[opt_idx]}")
+        letter_to_is_correct[letter] = (opt_idx == 0)
+    correct_letter = "A" if letter_to_is_correct["A"] else "B"
+    return lines, correct_letter
+
+
+def build_prompt_text(question, option_lines):
+    """Copied verbatim from train_qa_full.py -- see build_option_block's
+    own docstring for why this is a copy, not an import."""
+    return (
+        "You are shown footage filmed from a first-person viewpoint.\n"
+        f"{question}\n\n"
+        + "\n".join(option_lines)
+        + "\n\nAnswer with only the option letter:"
+    )
 
 
 def clip_exists(path):
@@ -128,8 +159,8 @@ def main():
             if pid in done:
                 continue
 
-            option_lines, correct_letter = fwd.build_option_block(item, rng)
-            prompt_text = fwd.build_prompt_text(item["question"], option_lines)
+            option_lines, correct_letter = build_option_block(item, rng)
+            prompt_text = build_prompt_text(item["question"], option_lines)
 
             try:
                 # Pace to RPM_LIMIT regardless of how fast the API itself responds.
