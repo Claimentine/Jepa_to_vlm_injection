@@ -34,16 +34,11 @@ spec:
               REPO=/code/Jepa_to_vlm_injection
               cd "$REPO"
 
-              echo "=== COIN precompute cache ==="
-              export VANS_WORK_ROOT=/data/vans_work
-              mkdir -p "$VANS_WORK_ROOT"
-              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
-              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
-              "$PY" vans_qa/full_scale/build_eval_input_cache.py \
-                --qa_split /data/raw_data/qa_split_temporal.json \
-                --split_part test \
-                --cache_dir /data/vans_work/eval_input_cache_coin \
-                --num_shards 1 --shard_idx 0
+              # COIN stage temporarily skipped (2026-10-25): its storage
+              # subtree (vans_injection_backup) is still degraded while
+              # TempCompass/MVBench's own subtrees have both recovered
+              # (confirmed via direct read tests). Re-add once COIN is
+              # healthy again.
 
               echo "=== TempCompass precompute cache ==="
               export VANS_WORK_ROOT=/data/vans_work_tempcompass
@@ -104,7 +99,7 @@ spec:
           emptyDir: {}
         - name: conda-storage
           persistentVolumeClaim:
-            claimName: ruixin-conda-vol-precompute
+            claimName: ruixin-conda-vol-ddp
         - name: data-storage
           persistentVolumeClaim:
             claimName: jepa-vlm-injection-data-vol
