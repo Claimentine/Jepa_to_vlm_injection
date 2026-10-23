@@ -149,7 +149,20 @@ def main():
                 response = client.models.generate_content(
                     model=MODEL_ID,
                     contents=[uploaded, prompt_text],
-                    config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=16),
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        max_output_tokens=32,
+                        # Gemini 2.5 Flash thinks by default; thinking tokens
+                        # count against max_output_tokens, so the first run
+                        # (budget unset, 16-token cap) spent the entire
+                        # budget "thinking" and emitted zero visible text --
+                        # response.text came back None on every item, not
+                        # just unlucky ones (confirmed: first 2/2 items both
+                        # failed this way). thinking_budget=0 disables it --
+                        # appropriate for a plain forced-choice task, and
+                        # also cheaper per call under the free-tier TPM cap.
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    ),
                 )
                 last_call_time = time.monotonic()
 
@@ -160,7 +173,13 @@ def main():
 
                 pred_letter = parse_letter(response.text)
                 if pred_letter is None:
-                    raise ValueError(f"could not parse A/B from response: {response.text!r}")
+                    finish_reason = None
+                    try:
+                        finish_reason = response.candidates[0].finish_reason
+                    except Exception:
+                        pass
+                    raise ValueError(f"could not parse A/B from response: {response.text!r} "
+                                      f"(finish_reason={finish_reason})")
                 correct = (pred_letter == correct_letter)
                 n_correct += int(correct)
                 n_total += 1
