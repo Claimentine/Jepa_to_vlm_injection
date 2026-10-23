@@ -170,20 +170,35 @@ def main():
                           "trained against the ORIGINAL model's hidden_size/tokenizer, so loading "
                           "it onto a different --model_id is unsupported and will likely error or "
                           "silently produce meaningless results.")
-    ap.add_argument("--qa_split", default=os.path.join(fwd.BASE, "raw_data/qa_split_temporal.json"))
-    ap.add_argument("--split_part", default="test", choices=["val", "test", "train"])
+    ap.add_argument("--qa_split", action="append",
+                     default=None,
+                     help="repeatable -- one or more qa_split JSON files to evaluate in the SAME "
+                          "process, so the frozen VLM is loaded from disk only ONCE regardless of "
+                          "how many benchmarks run. Added after job-90 spent ~30-40min per "
+                          "benchmark reloading the IDENTICAL checkpoint from a slow CephFS mount, "
+                          "at ~0% GPU utilization each time -- the same idle-GPU pattern job-54's "
+                          "own incident (see build_eval_input_cache.py's docstring) was about, just "
+                          "from repeated weight loads instead of live CPU decode work. Defaults to "
+                          "a single-element list (qa_split_temporal.json) if omitted, preserving "
+                          "old single-benchmark-per-invocation behavior.")
+    ap.add_argument("--split_part", default="test", choices=["val", "test", "train"],
+                     help="applies to every --qa_split in this run")
     ap.add_argument("--layer_strategy", default="middle4", choices=["middle4", "last4", "uniform4", "all"])
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--out_path", default=None)
+    ap.add_argument("--out_path", action="append", default=None,
+                     help="repeatable, one per --qa_split IN THE SAME ORDER -- pass this flag the "
+                          "same number of times as --qa_split, or omit entirely")
     ap.add_argument("--limit", type=int, default=None,
-                     help="cap on the number of items evaluated per checkpoint -- for a quick "
-                          "smoke check (e.g. validating a change to evaluate_logprob's decode "
-                          "pipeline) before committing to a full multi-thousand-item run")
-    ap.add_argument("--precompute_cache_dir", default=None,
-                     help="directory of build_eval_input_cache.py output -- if given, "
-                          "evaluate_logprob loads each item's already-decoded-and-processed "
-                          "model inputs from here instead of doing that CPU-bound work live, "
-                          "falling back to live building on any per-item cache miss")
+                     help="cap on the number of items evaluated per checkpoint PER qa_split -- for "
+                          "a quick smoke check (e.g. validating a change to evaluate_logprob's "
+                          "decode pipeline) before committing to a full multi-thousand-item run")
+    ap.add_argument("--precompute_cache_dir", action="append", default=None,
+                     help="repeatable, one per --qa_split IN THE SAME ORDER (pass '' for a "
+                          "qa_split with no cache) -- directory of build_eval_input_cache.py "
+                          "output; if given for a split, evaluate_logprob loads each item's "
+                          "already-decoded-and-processed model inputs from here instead of doing "
+                          "that CPU-bound work live, falling back to live building on any "
+                          "per-item cache miss")
     ap.add_argument("--resume", action="store_true",
                      help="if --out_path already exists, load it first and skip any checkpoint "
                           "label already present with the same split_part -- lets a multi-checkpoint "
@@ -199,16 +214,20 @@ def main():
             raise ValueError(f"--checkpoint must be label=path, got {spec!r}")
         checkpoints.append((label, path))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    qa_splits = args.qa_split or [os.path.join(fwd.BASE, "raw_data/qa_split_temporal.json")]
+    out_paths = args.out_path or [None] * len(qa_splits)
+    cache_dirs = args.precompute_cache_dir or [None] * len(qa_splits)
+    if len(out_paths) != len(qa_splits):
+        ap.error(f"--out_path given {len(out_paths)} time(s) but --qa_split given {len(qa_splits)} "
+                  "time(s) -- pass one --out_path per --qa_split, in the same order, or omit both")
+    if len(cache_dirs) != len(qa_splits):
+        ap.error(f"--precompute_cache_dir given {len(cache_dirs)} time(s) but --qa_split given "
+                  f"{len(qa_splits)} time(s) -- pass one per --qa_split (use '' for none), in the "
+                  "same order, or omit entirely")
+    cache_dirs = [c if c else None for c in cache_dirs]
+    benchmarks = list(zip(qa_splits, out_paths, cache_dirs))
 
-    with open(args.qa_split) as f:
-        split = json.load(f)
-    items = [it for it in split[args.split_part] if fwd.has_features(it)]
-    print(f"[INFO] {args.split_part} split: {len(items)} usable items "
-          f"(of {len(split[args.split_part])} total)", flush=True)
-    if args.limit:
-        items = items[: args.limit]
-        print(f"[INFO] --limit {args.limit}: evaluating {len(items)} items", flush=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model_id = args.model_id or fwd.MODEL_ID
     print(f"[INFO] loading {model_id} (frozen) ...", flush=True)
@@ -220,55 +239,66 @@ def main():
     n_tokens = 64
     placeholder_id = processor.tokenizer.pad_token_id
 
-    results = {}
-    if args.resume and args.out_path and os.path.exists(args.out_path):
-        with open(args.out_path) as f:
-            results = json.load(f)
-        print(f"[INFO] --resume: loaded {len(results)} existing result(s) from {args.out_path}", flush=True)
+    for qa_split_path, out_path, cache_dir in benchmarks:
+        print(f"[INFO] === benchmark: {qa_split_path} ===", flush=True)
+        with open(qa_split_path) as f:
+            split = json.load(f)
+        items = [it for it in split[args.split_part] if fwd.has_features(it)]
+        print(f"[INFO] {args.split_part} split: {len(items)} usable items "
+              f"(of {len(split[args.split_part])} total)", flush=True)
+        if args.limit:
+            items = items[: args.limit]
+            print(f"[INFO] --limit {args.limit}: evaluating {len(items)} items", flush=True)
 
-    for label, checkpoint_path in checkpoints:
-        existing = results.get(label)
-        if args.resume and existing is not None and existing.get("split_part") == args.split_part:
-            print(f"[SKIP] {label} {args.split_part}: already in {args.out_path} "
-                  f"(n={existing.get('n_total')} acc={existing.get('acc')})", flush=True)
-            continue
-        if checkpoint_path == NONE_SENTINEL:
-            rng = random.Random(args.seed)
-            tally = evaluate_logprob_none(
-                model, processor, items, device, rng,
-                precompute_cache_dir=args.precompute_cache_dir,
-            )
-        else:
-            injector = load_checkpoint_into_fresh_injector(checkpoint_path, model, hidden_size, args.layer_strategy, args.seed, device)
-            # A fresh hook per checkpoint (its pre_hook closures bake in this
-            # specific injector's own trained weights via self.injector.apply) --
-            # must remove() it before the next checkpoint's hook is created, or
-            # the old one's forward-pre-hooks stay registered on the same frozen
-            # decoder layers and stack on top of the new one.
-            hook = DecoderLayerInjectionHook(model, injector)
-            try:
+        results = {}
+        if args.resume and out_path and os.path.exists(out_path):
+            with open(out_path) as f:
+                results = json.load(f)
+            print(f"[INFO] --resume: loaded {len(results)} existing result(s) from {out_path}", flush=True)
+
+        for label, checkpoint_path in checkpoints:
+            existing = results.get(label)
+            if args.resume and existing is not None and existing.get("split_part") == args.split_part:
+                print(f"[SKIP] {label} {args.split_part}: already in {out_path} "
+                      f"(n={existing.get('n_total')} acc={existing.get('acc')})", flush=True)
+                continue
+            if checkpoint_path == NONE_SENTINEL:
                 rng = random.Random(args.seed)
-                tally = fwd.evaluate_logprob(
-                    model, processor, hook, injector, items, "cross_attn", n_tokens, placeholder_id, device, rng,
-                    precompute_cache_dir=args.precompute_cache_dir,
+                tally = evaluate_logprob_none(
+                    model, processor, items, device, rng,
+                    precompute_cache_dir=cache_dir,
                 )
-            finally:
-                hook.remove()
-        print(f"[RESULT] {label} {args.split_part} n={tally.n_total} val_acc(logprob)={tally.summary_str()}", flush=True)
-        results[label] = {
-            "checkpoint": checkpoint_path, "split_part": args.split_part,
-            "n_total": tally.n_total, "acc": tally.acc,
-            "acc_by_difficulty": tally.acc_by_difficulty,
-        }
-        # Write after EVERY checkpoint, not just at the end -- a crash
-        # (node eviction, CUDA fault) partway through a multi-checkpoint run
-        # must not lose already-finished results, or --resume above would
-        # have nothing to skip on the next attempt.
-        if args.out_path:
-            with open(args.out_path, "w") as f:
-                json.dump(results, f, indent=2)
+            else:
+                injector = load_checkpoint_into_fresh_injector(checkpoint_path, model, hidden_size, args.layer_strategy, args.seed, device)
+                # A fresh hook per checkpoint (its pre_hook closures bake in this
+                # specific injector's own trained weights via self.injector.apply) --
+                # must remove() it before the next checkpoint's hook is created, or
+                # the old one's forward-pre-hooks stay registered on the same frozen
+                # decoder layers and stack on top of the new one.
+                hook = DecoderLayerInjectionHook(model, injector)
+                try:
+                    rng = random.Random(args.seed)
+                    tally = fwd.evaluate_logprob(
+                        model, processor, hook, injector, items, "cross_attn", n_tokens, placeholder_id, device, rng,
+                        precompute_cache_dir=cache_dir,
+                    )
+                finally:
+                    hook.remove()
+            print(f"[RESULT] {label} {args.split_part} n={tally.n_total} val_acc(logprob)={tally.summary_str()}", flush=True)
+            results[label] = {
+                "checkpoint": checkpoint_path, "split_part": args.split_part,
+                "n_total": tally.n_total, "acc": tally.acc,
+                "acc_by_difficulty": tally.acc_by_difficulty,
+            }
+            # Write after EVERY checkpoint, not just at the end -- a crash
+            # (node eviction, CUDA fault) partway through a multi-checkpoint run
+            # must not lose already-finished results, or --resume above would
+            # have nothing to skip on the next attempt.
+            if out_path:
+                with open(out_path, "w") as f:
+                    json.dump(results, f, indent=2)
 
-    print(f"[SUMMARY] {json.dumps(results, indent=2)}", flush=True)
+        print(f"[SUMMARY] {qa_split_path}: {json.dumps(results, indent=2)}", flush=True)
 
 
 if __name__ == "__main__":
