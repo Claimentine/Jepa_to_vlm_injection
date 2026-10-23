@@ -26,15 +26,9 @@ spec:
               cd "$REPO"
               "$PY" -m pip install --quiet google-genai
 
-              echo "=== COIN (Gemini 2.5 Flash, 200-item subsample) ==="
-              export VANS_WORK_ROOT=/data/vans_work
-              mkdir -p "$VANS_WORK_ROOT"
-              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
-              "$PY" vans_qa/full_scale/eval_gemini_baseline.py \
-                --qa_split /data/raw_data/qa_split_temporal.json \
-                --split_part test \
-                --limit 200 \
-                --out_jsonl /data/raw_data/a2_baseline_gemini25flash_coin.jsonl
+              # COIN stage temporarily skipped (2026-10-25): see job-97's own
+              # matching change -- COIN's storage subtree still degraded,
+              # CrossTask's has recovered. Re-add once COIN is healthy again.
 
               echo "=== CrossTask (Gemini 2.5 Flash, 200-item subsample) ==="
               "$PY" vans_qa/full_scale/eval_gemini_baseline.py \

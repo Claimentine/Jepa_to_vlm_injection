@@ -34,17 +34,11 @@ spec:
               cd "$REPO"
               "$PY" -m pip install --quiet --upgrade transformers
 
-              echo "=== COIN precompute cache (Qwen3.5-9B) ==="
-              export VANS_WORK_ROOT=/data/vans_work
-              mkdir -p "$VANS_WORK_ROOT"
-              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
-              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
-              "$PY" vans_qa/full_scale/build_eval_input_cache.py \
-                --model_id "$MODEL_ID" \
-                --qa_split /data/raw_data/qa_split_temporal.json \
-                --split_part test \
-                --cache_dir /data/vans_work/eval_input_cache_coin_qwen35 \
-                --num_shards 1 --shard_idx 0
+              # COIN stage temporarily skipped (2026-10-25): its storage subtree
+              # (vans_injection_backup) is still badly degraded (~1/8 sampled
+              # files readable) while CrossTask's own subtree has recovered
+              # (8/8 readable) -- CrossTask-only for now, re-add COIN once
+              # confirmed healthy again (see job-98's own matching change).
 
               echo "=== CrossTask precompute cache (Qwen3.5-9B) ==="
               export VANS_WORK_ROOT=/data/vans_work_crosstask
