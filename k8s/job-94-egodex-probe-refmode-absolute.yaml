@@ -63,6 +63,15 @@ spec:
                       # different node -- confirms a stuck mount on this
                       # specific node, not a storage-wide problem this time
                       - hcc-nrp-shor-c5813.unl.edu
+                      # excluded 2026-10-23 (2nd): same pattern again, 3rd
+                      # distinct node/file combo -- a different pod read
+                      # the exact same stuck file instantly every time.
+                      # Starting to look like a cold-CephFS-mount cost on
+                      # THIS job's first access pattern specifically
+                      # (no other concurrent job has hit this), not purely
+                      # random bad nodes -- worth a real fix if a 4th
+                      # occurrence happens.
+                      - k8s-gen4-05.calit2.optiputer.net
                       # excluded 2026-10-22: first attempt hung 75+min in
                       # uninterruptible I/O wait (D-state) building the
                       # EgoDex dataloader, zero CPU progress -- looked like
