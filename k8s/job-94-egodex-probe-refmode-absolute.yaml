@@ -115,7 +115,17 @@ spec:
               echo "[INFO] pre-warming EgoDex cache tree (parallel)..."
               time find /data/raw_data/thinkjepa_egodex_iso/cache -name '*.npz' -print0 \
                 | xargs -0 -P 32 -I{} sh -c 'cat {} > /dev/null' || true
-              echo "[INFO] pre-warm done"
+              echo "[INFO] pre-warm (data) done"
+
+              # 5th attempt: data pre-warm alone wasn't enough -- this time
+              # it hung instead on a .pyc file inside the thinkjepa conda
+              # env itself (ruixin-conda-vol-vlm), same cold-fresh-mount
+              # cost, just on the OTHER PVC this job touches. Warm that
+              # tree too.
+              echo "[INFO] pre-warming thinkjepa conda env (parallel)..."
+              time find /home/jovyan/conda-envs/thinkjepa -type f -print0 \
+                | xargs -0 -P 32 -I{} sh -c 'cat {} > /dev/null' 2>/dev/null || true
+              echo "[INFO] pre-warm (conda env) done"
 
               "$PY" vans_qa/full_scale/probe_egodex_reverse_adapter.py \
                 --checkpoints job15_independent job42_bridge_mlp2048 job72_step4000 \
