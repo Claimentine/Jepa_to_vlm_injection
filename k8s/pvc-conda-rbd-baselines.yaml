@@ -1,0 +1,38 @@
+# Dedicated conda-envs/ThinkJEPA-checkout volume for the A2 VLM-baseline
+# eval work (Qwen3.5-VL / LLaVA-Next-Video / Gemini 2.5 Flash / InternVL
+# on CrossTask + COIN), cloned from ruixin-conda-vol so it doesn't have to
+# queue behind job-83 (uniform4, mid-training), job-90 (4-benchmark eval,
+# running unusually slowly today -- see pvc-conda-rbd-vlm.yaml's own
+# multi-attach-contention history for why queuing silently for hours is a
+# real risk worth avoiding here), or job-95 (Ego4D full-scale extraction,
+# expected to run for days).
+#
+# `dataSource` triggers a Ceph RBD clone (fast, copy-on-write -- ~15s per
+# pvc-conda-rbd-vlm.yaml's own prior experience) ONLY on first creation,
+# giving this volume the already-installed qwen3vl conda env for free
+# instead of a from-scratch environment build. If this PVC is ever deleted
+# and this file re-applied, it re-clones from whatever ruixin-conda-vol
+# contains AT THAT TIME.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ruixin-conda-vol-baselines
+spec:
+  storageClassName: rook-ceph-block
+  accessModes:
+    - ReadWriteOnce # same RWO constraint as the other conda-vols -- a
+                    # separate lock so this work doesn't fight the other
+                    # three directions over the same volume.
+  resources:
+    requests:
+      storage: 50Gi
+  dataSource:
+    kind: PersistentVolumeClaim
+    name: ruixin-conda-vol
+
+# Apply with:
+#   kubectl apply -f pvc-conda-rbd-baselines.yaml -n williamli-scvl
+#
+# Reminder (Golden Rule #2): this is active-computation storage, not archival.
+# A PVC untouched for 6 months can be purged without notice -- move final
+# results to lab-approved long-term storage when a project wraps up.
