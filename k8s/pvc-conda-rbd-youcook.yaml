@@ -1,0 +1,21 @@
+# Dedicated conda-envs volume for the YouCook2 eval-split precompute
+# cache job -- all five existing conda-vols (plain/-ddp/-vlm/-baselines/
+# -precompute) are occupied right now. RBD clone of ruixin-conda-vol
+# (fast, copy-on-write).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ruixin-conda-vol-youcook
+spec:
+  storageClassName: rook-ceph-block
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  dataSource:
+    kind: PersistentVolumeClaim
+    name: ruixin-conda-vol
+
+# Apply with:
+#   kubectl apply -f pvc-conda-rbd-youcook.yaml -n williamli-scvl

@@ -1,0 +1,90 @@
+# Step 100: CPU-ONLY precompute cache for our own model's YouCook2 eval
+# split (qa_split_youcook2.json's "test" key, 636 held-out items -- the
+# "Plan 2" video-level split from build_youcook2_qa_split.py). Same
+# rationale as job-99: this cache is reusable across every checkpoint we
+# ever evaluate against Qwen3-VL-2B-Thinking, a one-time cost. Storage
+# health confirmed directly (6/6 sampled clips readable, VJEPA feature
+# cache already populated with 5775 files from job-91).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-cpu-precompute-youcook2-cache
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      containers:
+        - name: cpu-precompute-youcook2-cache
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+
+              echo "=== YouCook2 precompute cache ==="
+              export VANS_WORK_ROOT=/data/vans_work_youcook
+              "$PY" vans_qa/full_scale/build_eval_input_cache.py \
+                --qa_split /data/raw_data/qa_split_youcook2.json \
+                --split_part test \
+                --cache_dir /data/vans_work_youcook/eval_input_cache_youcook2 \
+                --num_shards 1 --shard_idx 0
+
+              echo "CPU_PRECOMPUTE_YOUCOOK2_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "7"
+              memory: "16Gi"
+              ephemeral-storage: "4Gi"
+            limits:
+              cpu: "7"
+              memory: "16Gi"
+              ephemeral-storage: "4800Mi"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-youcook
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-100-cpu-precompute-youcook2-cache.yaml -n williamli-scvl
