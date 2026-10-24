@@ -11,6 +11,25 @@
 # Separate cache dirs from the existing Qwen3-VL-2B-Thinking caches --
 # Qwen3.5-9B's processor produces different tensors entirely, so sharing a
 # cache_dir between the two models would silently corrupt results.
+#
+# OOMKilled 2x in a row (2026-10-23/24) at the default --prefetch_depth 12:
+# each in-flight decode is a FRESH spawn()ed Python interpreter (torch +
+# transformers + decord/cv2 reimported from scratch per
+# train_qa_full.py's own _decode_video_worker, not a lightweight thread),
+# so 12 concurrent ones is real memory pressure even before any frame data
+# -- and the crosstask_91515_gahgP8ShgEI_9 item's repeated 60s decode
+# timeouts (several clips from the same source video, confirmed via the
+# [WARN]/BrokenPipeError pattern in both crash logs) meant several of
+# those heavy interpreters sat alive for the full timeout window
+# concurrently instead of finishing and freeing memory quickly. The
+# TimeoutError itself was already handled fine (caught, logged, skipped --
+# see build_eval_input_cache.py's own try/except) -- this isn't a
+# single-bad-clip crash, it's prefetch_depth 12's peak memory not fitting
+# in 16Gi. job-99/job-100 ran the same script at the same default fine, so
+# the default itself is kept as-is; overridden down to 4 (matches
+# train_qa_full.py's OWN other prefetch_depth default, used by its
+# GPU-pipelined caller) here specifically, plus headroom on the memory
+# limit.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -47,7 +66,8 @@ spec:
                 --qa_split /data/raw_data/qa_split_crosstask.json \
                 --split_part test \
                 --cache_dir /data/vans_work_crosstask/eval_input_cache_crosstask_qwen35 \
-                --num_shards 1 --shard_idx 0
+                --num_shards 1 --shard_idx 0 \
+                --prefetch_depth 4
 
               echo "CPU_PRECOMPUTE_QWEN35_DONE"
           env:
@@ -60,11 +80,11 @@ spec:
           resources:
             requests:
               cpu: "7"
-              memory: "16Gi"
+              memory: "24Gi"
               ephemeral-storage: "4Gi"
             limits:
               cpu: "7"
-              memory: "16Gi"
+              memory: "24Gi"
               ephemeral-storage: "4800Mi"
           volumeMounts:
             - name: git-repo-code
