@@ -289,6 +289,7 @@ def batch_to_samples(batch, device, joint_idx):
      img, lang_instruct, confs, extras, paths) = batch
     B = xyz_world.shape[0]
     vjepa_in = extras["vjepa_input_feats"]
+    vjepa_target = extras["vjepa_target_feats"]
     vlm_old = extras["vlm_old"]
     vlm_new = extras["vlm_new"]
     vlm_old_len = extras["vlm_old_len"]
@@ -305,6 +306,7 @@ def batch_to_samples(batch, device, joint_idx):
         last_pos = xyz_world[i, 31][joint_idx, :]              # (J, 3)
         samples.append({
             "in_feats": vjepa_in[i:i + 1].to(device),               # (1,16,256,1024)
+            "target_latent": vjepa_target[i:i + 1].to(device),      # (1,16,256,1024)
             "vlm_old": vlm_old[i, :, :old_len, :].to(device),       # (L,S_real,2048)
             "vlm_new": vlm_new[i, :, :new_len, :].to(device),       # (L,S_real,2048)
             "target": target.to(device),                             # (32,J,3), absolute
@@ -322,6 +324,29 @@ def ade_fde(pred, target, thr=0.05):
     final_dist = err[:, -1, :].mean(dim=1)                # (B,)
     acc = (err < thr).float().mean()
     return float(avg_dist.mean().item()), float(final_dist.mean().item()), float(acc.item())
+
+
+def latent_metrics(pred_latent, target_latent):
+    """FD/SL1/CD -- ThinkJEPA's own compute_predicted_latent_metrics formula
+    (confirmed by reading cache_train/thinker_train.py directly), computed
+    on the predicted VJEPA latent (y_future) vs. the ground-truth future
+    latent (vjepa_target_feats) -- BEFORE the probe head decodes either one
+    to xyz. Decode-independent: measures how good the frozen predictor's
+    own latent forecast is, which ADE/FDE/acc@0.05 can't isolate on their
+    own since those also depend on how well the small probe head learned
+    to read that latent.
+    FD  (pred_latent_dist): mean L2 norm of pred-target, in latent space.
+    SL1 (pred_latent_smooth_l1): F.smooth_l1_loss(pred_latent, target_latent).
+    CD  (pred_latent_cosine_distance): 1 - mean cosine similarity."""
+    pred_latent = pred_latent.float()
+    target_latent = target_latent.float()
+    cosine_sim = torch.nn.functional.cosine_similarity(
+        pred_latent, target_latent, dim=-1, eps=1e-8
+    ).mean()
+    fd = torch.linalg.norm(pred_latent - target_latent, dim=-1).mean()
+    sl1 = torch.nn.functional.smooth_l1_loss(pred_latent, target_latent)
+    cd = 1.0 - cosine_sim
+    return float(fd.item()), float(sl1.item()), float(cd.item())
 
 
 def static_baseline_ade_fde(loader, joint_idx, max_batches=None, thr=0.05):
@@ -435,6 +460,7 @@ def run_probe(label, predictor, train_loader, test_loader, device, args, joint_i
 
     probe.eval()
     all_pred, all_target = [], []
+    all_pred_latent, all_target_latent = [], []
     with torch.no_grad():
         for bi, batch in enumerate(test_loader):
             if args.max_test_batches and bi >= args.max_test_batches:
@@ -451,17 +477,22 @@ def run_probe(label, predictor, train_loader, test_loader, device, args, joint_i
                     pred_abs = pred  # already absolute, no reference offset to add back
                 all_pred.append(pred_abs)
                 all_target.append(s["target"])  # already absolute
+                all_pred_latent.append(y_future)
+                all_target_latent.append(s["target_latent"])
     pred_stack = torch.stack(all_pred)
     target_stack = torch.stack(all_target)
     ade, fde, acc = ade_fde(pred_stack.unsqueeze(0), target_stack.unsqueeze(0))
+    fd, sl1, cd = latent_metrics(torch.cat(all_pred_latent, dim=0), torch.cat(all_target_latent, dim=0))
     # NOTE: ade_fde expects (B,T,J,3); stacking all test samples into one
     # pseudo-batch (unsqueeze(0)) and averaging over all of them at once
     # matches "mean over the whole test set" exactly as job-61's own
     # per-epoch test-set mean does (its batch-mean IS the test-set mean
     # whenever it evaluates in one pass), so these numbers are directly
     # comparable to job-61's ADE=0.0683/FDE=0.0733.
-    print(f"[{label}] TEST n={len(all_pred)} ADE={ade:.6f} FDE={fde:.6f} acc@0.05={acc:.4f}", flush=True)
-    return {"label": label, "n_test": len(all_pred), "ADE": ade, "FDE": fde, "acc_at_0.05": acc}
+    print(f"[{label}] TEST n={len(all_pred)} ADE={ade:.6f} FDE={fde:.6f} acc@0.05={acc:.4f} "
+          f"FD={fd:.6f} SL1={sl1:.6f} CD={cd:.6f}", flush=True)
+    return {"label": label, "n_test": len(all_pred), "ADE": ade, "FDE": fde, "acc_at_0.05": acc,
+            "FD": fd, "SL1": sl1, "CD": cd}
 
 
 def main():
@@ -543,12 +574,18 @@ def main():
 
     print("[SUMMARY]", flush=True)
     for r in results:
-        print(f"  {r['label']}: ADE={r['ADE']:.6f} FDE={r['FDE']:.6f} acc@0.05={r['acc_at_0.05']:.4f} n={r['n_test']}", flush=True)
+        print(f"  {r['label']}: ADE={r['ADE']:.6f} FDE={r['FDE']:.6f} acc@0.05={r['acc_at_0.05']:.4f} "
+              f"FD={r['FD']:.6f} SL1={r['SL1']:.6f} CD={r['CD']:.6f} n={r['n_test']}", flush=True)
     print(f"  static_baseline (stay-put, must-beat bar): ADE={base_ade:.6f} FDE={base_fde:.6f} "
           f"acc@0.05={base_acc:.4f} n={base_n}", flush=True)
     print(f"  constant_velocity_baseline (linear extrapolation, must-beat bar): ADE={cv_ade:.6f} FDE={cv_fde:.6f} "
           f"acc@0.05={cv_acc:.4f} n={cv_n}", flush=True)
     print("  job61_thinkjepa_official_recipe (reference): ADE=0.068294 FDE=0.073280", flush=True)
+    # FD/SL1/CD are not in job61's own reference line above -- those are latent-space
+    # metrics (compute_predicted_latent_metrics in thinker_train.py) that ThinkJEPA
+    # reports for the FORWARD prediction task (predicted vs. target VJEPA latent) at
+    # training time, not alongside their own EgoDex ADE/FDE reference number, so there
+    # is no equivalent reference value to print here -- only our own checkpoints' rows.
 
     if args.out_json:
         with open(args.out_json, "w") as f:
