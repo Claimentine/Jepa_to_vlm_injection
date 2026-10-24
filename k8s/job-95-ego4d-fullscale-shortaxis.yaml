@@ -1,11 +1,19 @@
 # Step 95: full-scale shortaxis extraction for BOTH Ego4D annotation
 # sources, validated by job-92 (narration: 197/200 pairs, 98.5% yield) and
-# job-93 (goalstep: 196/200 pairs, 98% yield). Runs narration then goalstep
-# sequentially in one job (one GPU reservation, one conda-vol hold, avoids
-# a second job queuing behind this one for the same RWO volume).
+# job-93 (goalstep: 196/200 pairs, 98% yield).
+#
+# UPDATED 2026-10-24: narration is DONE (6000/6000 train + 900/900 eval,
+# confirmed via the prior pod's own [DONE] log lines) -- the narration
+# extraction call is removed below so every restart goes straight to
+# goalstep instead of re-running the full script from scratch (which
+# re-skip-checked all ~6900 already-done narration items, 2-4+ hours of
+# pure disk I/O, on every single retry -- also what triggered the repeated
+# NRP idle-GPU warnings; see extract_ego4d_longaxis.py's lazy-model-load
+# fix, commit 7f05bcb). The ego4d CLI download call is kept since it also
+# fetches goalstep_train.json, which the goalstep extraction still needs.
 #
 # Targets (per the user's explicit decision): narration ~6000 training +
-# ~900 eval pairs; goalstep ~5000 training + ~750 eval pairs. Both use the
+# ~900 eval pairs (DONE); goalstep ~5000 training + ~750 eval pairs. Both use the
 # new --eval_frac 0.15 VIDEO-level split (not pair-level, to avoid
 # same-video leakage between train and eval) and gap filtering
 # (--min_gap_seconds/--max_gap_seconds) per the user's explicit requirement
@@ -96,31 +104,24 @@ spec:
 
               cd "$REPO"
 
-              echo "=== [1/2] NARRATION shortaxis, target 6000 train / 900 eval ==="
+              # NARRATION phase REMOVED 2026-10-24: confirmed complete (train
+              # 6000/6000 + eval 900/900, both is_valid_output()-clean) by the
+              # previous pod's own [DONE] log line before it crashed entering
+              # the goalstep phase. Every restart since then was re-running
+              # the FULL script from scratch, which meant re-skip-checking
+              # all ~6900 already-done narration items (2-4+ hours of pure
+              # disk I/O) before ever reaching goalstep -- wasteful, and
+              # also the root cause of the repeated NRP idle-GPU warnings on
+              # this job (see extract_ego4d_longaxis.py's lazy-model-load
+              # fix, commit 7f05bcb). Narration is done; go straight to
+              # goalstep.
               mkdir -p /data/raw_data/ego4d_annotations
               "$PY" -m ego4d.cli.cli -o /data/raw_data/ego4d_annotations \
                 --datasets annotations --annotations narration -y \
                 >/tmp/ego4d_annotations_dl.log 2>&1
               tail -5 /tmp/ego4d_annotations_dl.log
-              NARRATION=$(find /data/raw_data/ego4d_annotations -iname "narration.json" | head -1)
-              echo "narration file: $NARRATION"
 
-              "$PY" vans_qa/full_scale/extract_ego4d_longaxis.py \
-                --annotation_source narration \
-                --narration_json "$NARRATION" \
-                --pair_mode shortaxis \
-                --min_gap_seconds 10 \
-                --max_gap_seconds 60 \
-                --pairs_per_video 3 \
-                --window_seconds 8.0 \
-                --limit 6000 \
-                --eval_frac 0.15 \
-                --eval_limit 900 \
-                --eval_output_dir /data/raw_data/ego4d_shortaxis_narration_eval \
-                --output_dir /data/raw_data/ego4d_shortaxis_narration_train \
-                --video_cache_dir /data/vans_work/ego4d_raw_videos_shortaxis
-
-              echo "=== [2/2] GOALSTEP shortaxis, target 5000 train / 750 eval ==="
+              echo "=== GOALSTEP shortaxis, target 5000 train / 750 eval ==="
               GOALSTEP=$(find /data/raw_data/ego4d_annotations -iname "goalstep_train.json" | head -1)
               echo "goalstep file: $GOALSTEP"
 
