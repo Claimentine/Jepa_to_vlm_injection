@@ -460,7 +460,6 @@ def run_probe(label, predictor, train_loader, test_loader, device, args, joint_i
 
     probe.eval()
     all_pred, all_target = [], []
-    all_pred_latent, all_target_latent = [], []
     with torch.no_grad():
         for bi, batch in enumerate(test_loader):
             if args.max_test_batches and bi >= args.max_test_batches:
@@ -477,22 +476,40 @@ def run_probe(label, predictor, train_loader, test_loader, device, args, joint_i
                     pred_abs = pred  # already absolute, no reference offset to add back
                 all_pred.append(pred_abs)
                 all_target.append(s["target"])  # already absolute
-                all_pred_latent.append(y_future)
-                all_target_latent.append(s["target_latent"])
     pred_stack = torch.stack(all_pred)
     target_stack = torch.stack(all_target)
     ade, fde, acc = ade_fde(pred_stack.unsqueeze(0), target_stack.unsqueeze(0))
-    fd, sl1, cd = latent_metrics(torch.cat(all_pred_latent, dim=0), torch.cat(all_target_latent, dim=0))
     # NOTE: ade_fde expects (B,T,J,3); stacking all test samples into one
     # pseudo-batch (unsqueeze(0)) and averaging over all of them at once
     # matches "mean over the whole test set" exactly as job-61's own
     # per-epoch test-set mean does (its batch-mean IS the test-set mean
     # whenever it evaluates in one pass), so these numbers are directly
     # comparable to job-61's ADE=0.0683/FDE=0.0733.
-    print(f"[{label}] TEST n={len(all_pred)} ADE={ade:.6f} FDE={fde:.6f} acc@0.05={acc:.4f} "
-          f"FD={fd:.6f} SL1={sl1:.6f} CD={cd:.6f}", flush=True)
-    return {"label": label, "n_test": len(all_pred), "ADE": ade, "FDE": fde, "acc_at_0.05": acc,
-            "FD": fd, "SL1": sl1, "CD": cd}
+    print(f"[{label}] TEST n={len(all_pred)} ADE={ade:.6f} FDE={fde:.6f} acc@0.05={acc:.4f}", flush=True)
+    return {"label": label, "n_test": len(all_pred), "ADE": ade, "FDE": fde, "acc_at_0.05": acc}
+
+
+def compute_predictor_latent_metrics(label, predictor, loader, device, max_batches=None):
+    """FD/SL1/CD on the FROZEN predictor's raw latent forecast, with NO probe
+    head involved at all -- unlike ADE/FDE/acc, which need a trained probe to
+    decode the latent into xyz, these compare predict_future_latent()'s
+    output directly against vjepa_target_feats, so they cost one no-grad
+    forward pass per sample and require zero probe training epochs."""
+    all_pred_latent, all_target_latent = [], []
+    with torch.no_grad():
+        for bi, batch in enumerate(loader):
+            if max_batches and bi >= max_batches:
+                break
+            samples = batch_to_samples(batch, device, ALL_JOINT_IDX)  # joint subset is irrelevant: latents don't depend on it
+            for s in samples:
+                y_future = predict_future_latent(
+                    predictor, s["in_feats"], {"vlm_old": s["vlm_old"], "vlm_new": s["vlm_new"]}, device,
+                )
+                all_pred_latent.append(y_future)
+                all_target_latent.append(s["target_latent"])
+    fd, sl1, cd = latent_metrics(torch.cat(all_pred_latent, dim=0), torch.cat(all_target_latent, dim=0))
+    print(f"[{label}] LATENT n={len(all_pred_latent)} FD={fd:.6f} SL1={sl1:.6f} CD={cd:.6f}", flush=True)
+    return {"FD": fd, "SL1": sl1, "CD": cd}
 
 
 def main():
@@ -564,7 +581,14 @@ def main():
     results = []
     for label in args.checkpoints:
         predictor = load_frozen_predictor(label, device)
-        results.append(run_probe(label, predictor, train_loader, test_loader, device, args, joint_idx))
+        # FD/SL1/CD first -- no probe training needed, just a no-grad pass of
+        # the frozen predictor over the test set (see the function's own
+        # docstring). Computed before run_probe so a result is available even
+        # if probe training is later skipped/fails for this checkpoint.
+        latent_result = compute_predictor_latent_metrics(label, predictor, test_loader, device,
+                                                           max_batches=args.max_test_batches)
+        probe_result = run_probe(label, predictor, train_loader, test_loader, device, args, joint_idx)
+        results.append({**probe_result, **latent_result})
         del predictor
         if device.type == "cuda":
             torch.cuda.empty_cache()
