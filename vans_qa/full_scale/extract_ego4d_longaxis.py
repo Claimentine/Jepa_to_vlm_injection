@@ -630,9 +630,22 @@ def main():
               f"(annotation_source={args.annotation_source})", flush=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] loading V-JEPA2 checkpoint {args.vjepa_checkpoint} ...", flush=True)
     vjepa_checkpoint_sha = sha256_file(Path(args.vjepa_checkpoint))
-    vjepa_model = load_vjepa_encoder(Path(args.vjepa_checkpoint), device)
+    # Loaded lazily, on first pair that actually needs encoding -- not here.
+    # A resumed run can spend hours re-validating thousands of already-saved
+    # npz files (pure disk I/O, no GPU work) before reaching any new pair;
+    # loading the model eagerly held a GPU reserved-but-0%-utilized for that
+    # whole skip-check phase, which is exactly what tripped job-95's NRP
+    # "idle GPU" warning (confirmed 2026-10-23: the skip-check counter was
+    # still advancing normally, not stalled -- the job just legitimately had
+    # ~6900 already-done items to re-check before any GPU work began).
+    _model_holder = {}
+
+    def get_model():
+        if "model" not in _model_holder:
+            print(f"[INFO] loading V-JEPA2 checkpoint {args.vjepa_checkpoint} ...", flush=True)
+            _model_holder["model"] = load_vjepa_encoder(Path(args.vjepa_checkpoint), device)
+        return _model_holder["model"]
 
     def run_pairs(pairs, output_root):
         output_root.mkdir(parents=True, exist_ok=True)
@@ -681,6 +694,7 @@ def main():
 
                     past_clip, past_imgs = preprocess_vjepa_frames(past_frames)
                     target_clip, target_imgs = preprocess_vjepa_frames(target_frames)
+                    vjepa_model = get_model()
                     vjepa_input_feats = encode_vjepa_clip(vjepa_model, past_clip, device)
                     vjepa_target_feats = encode_vjepa_clip(vjepa_model, target_clip, device)
 
