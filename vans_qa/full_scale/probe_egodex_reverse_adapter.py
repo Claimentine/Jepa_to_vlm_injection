@@ -548,6 +548,13 @@ def main():
     ap.add_argument("--max_train_batches", type=int, default=None, help="smoke-test cap")
     ap.add_argument("--max_test_batches", type=int, default=None, help="smoke-test cap")
     ap.add_argument("--out_json", default=None)
+    ap.add_argument("--latent_metrics_only", action="store_true",
+                     help="compute FD/SL1/CD for --checkpoints and exit -- no probe training, no "
+                          "ADE/FDE/acc@0.05. Cheap (one no-grad pass per checkpoint over the test "
+                          "set): use this to get FD/SL1/CD for checkpoints whose ADE/FDE/acc probe "
+                          "was already trained/reported separately, without re-paying for "
+                          "--probe_epochs of training (see compute_predictor_latent_metrics's own "
+                          "docstring for why these don't depend on the probe head at all).")
     args = ap.parse_args()
     joint_idx = ALL_JOINT_IDX if args.joint_subset == "all" else WRIST_JOINT_IDX
     print(f"[INFO] joint_subset={args.joint_subset} ({len(joint_idx)} joints)", flush=True)
@@ -578,6 +585,26 @@ def main():
         return
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if args.latent_metrics_only:
+        results = []
+        for label in args.checkpoints:
+            predictor = load_frozen_predictor(label, device)
+            latent_result = compute_predictor_latent_metrics(label, predictor, test_loader, device,
+                                                               max_batches=args.max_test_batches)
+            results.append({"label": label, **latent_result})
+            del predictor
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        print("[SUMMARY]", flush=True)
+        for r in results:
+            print(f"  {r['label']}: FD={r['FD']:.6f} SL1={r['SL1']:.6f} CD={r['CD']:.6f}", flush=True)
+        if args.out_json:
+            with open(args.out_json, "w") as f:
+                json.dump(results, f, indent=2)
+        print("[DONE] latent_metrics_only -- stopping here", flush=True)
+        return
+
     results = []
     for label in args.checkpoints:
         predictor = load_frozen_predictor(label, device)
