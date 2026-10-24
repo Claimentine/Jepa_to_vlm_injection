@@ -1,0 +1,30 @@
+# Second dedicated clone of the thinkjepa-conda-env volume, specifically so
+# the cheap --latent_metrics_only job (FD/SL1/CD for job-94's checkpoints,
+# no probe training) doesn't have to queue behind job-94 itself, which is
+# actively holding ruixin-conda-vol-vlm (RWO) for hours of probe training.
+# Cloned from ruixin-conda-vol-vlm (not the qwen3vl-only base ruixin-conda-vol)
+# specifically because this job needs /home/jovyan/conda-envs/thinkjepa,
+# which is NOT confirmed present on ruixin-conda-vol's own clones
+# (ruixin-conda-vol-baselines/-precompute/-ddp/-youcook all only ever use
+# the qwen3vl env in their own job scripts).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ruixin-conda-vol-vlm2
+spec:
+  storageClassName: rook-ceph-block
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  dataSource:
+    kind: PersistentVolumeClaim
+    name: ruixin-conda-vol-vlm
+
+# Apply with:
+#   kubectl apply -f pvc-conda-rbd-vlm2.yaml -n williamli-scvl
+#
+# Reminder (Golden Rule #2): this is active-computation storage, not archival.
+# A PVC untouched for 6 months can be purged without notice -- move final
+# results to lab-approved long-term storage when a project wraps up.
