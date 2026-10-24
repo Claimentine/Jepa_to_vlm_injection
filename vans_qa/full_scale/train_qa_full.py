@@ -168,6 +168,9 @@ def _from_ipc_safe(obj):
     return obj
 
 
+DECODE_WORKER_MEMORY_LIMIT_BYTES = 4 * 1024 ** 3  # 4GB per worker
+
+
 def _decode_video_worker(conn, abs_path, requested_frames, prompt_text):
     # Runs in a throwaway child process (see build_inputs) so a hung native
     # call on a badly corrupted clip can be killed from outside -- both
@@ -181,6 +184,21 @@ def _decode_video_worker(conn, abs_path, requested_frames, prompt_text):
     # separate ~15min "Stream timeout triggered" hang from OpenCV's own
     # internal ffmpeg probe on a different corrupted clip -- so it's called
     # in here now, covered by the same DECODE_TIMEOUT_S deadline.
+    #
+    # RLIMIT_AS caps this process's own virtual memory: DECODE_TIMEOUT_S only
+    # bounds WALL-CLOCK time (finish_decode's parent_conn.poll), not what a
+    # malformed clip's decode can allocate before that deadline hits -- build_
+    # eval_input_cache.py's own job-97 was OOMKilled by two DIFFERENT
+    # malformed clips in a row (confirmed via /proc fd + cross-pod reads: the
+    # files themselves were fine, the decode of them wasn't), each one a
+    # fresh instance of this same class of bug, not a one-off. A worker that
+    # hits this limit raises MemoryError, caught by the except below exactly
+    # like any other decode failure -- the item gets skipped, not the pod.
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_AS, (DECODE_WORKER_MEMORY_LIMIT_BYTES, DECODE_WORKER_MEMORY_LIMIT_BYTES))
+    except Exception:
+        pass  # platforms without RLIMIT_AS (non-Linux) -- best-effort, not load-bearing elsewhere
     try:
         nframes = clamp_frame_count(abs_path, requested_frames)
         video_content = {
