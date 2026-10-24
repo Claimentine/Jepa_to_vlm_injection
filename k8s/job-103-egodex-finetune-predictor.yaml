@@ -65,9 +65,24 @@ spec:
               nvidia-smi --query-gpu=index,name,memory.total --format=csv
               mkdir -p /data/raw_data/egodex_finetuned_job72_step4000
 
-              echo "[INFO] pre-warming EgoDex cache tree (parallel)..."
-              time find /data/raw_data/thinkjepa_egodex_iso/cache -name '*.npz' -print0 \
-                | xargs -0 -P 32 -I{} sh -c 'cat {} > /dev/null' || true
+              # Targeted, not blanket: the full cache tree is ~95GB/tens of
+              # thousands of files, but build_egodex_dataloaders only ever
+              # touches the ~2000 files actually listed in the train/test
+              # manifests (1861 + 139, confirmed via `wc -l`) -- a blanket
+              # `find -name '*.npz' | xargs cat` over the whole tree dilutes
+              # the CephFS client cache across tens of thousands of
+              # irrelevant files and evicts the ones that matter before
+              # Python gets to them (confirmed: job-103's first attempt
+              # still hung in D-state on manifest-listed files 40+ min after
+              # a full blanket pre-warm had already "completed"). Reading
+              # the manifests directly and warming exactly those files is
+              # both correct and ~1000x fewer reads.
+              echo "[INFO] pre-warming EgoDex manifest files (parallel, targeted)..."
+              MANIFEST_DIR=/data/raw_data/thinkjepa_egodex_iso/manifests/portable_v1
+              CACHE_DIR=/data/raw_data/thinkjepa_egodex_iso/cache
+              time (cat "$MANIFEST_DIR/train_cache.txt" "$MANIFEST_DIR/test_cache.txt" \
+                    | sed "s#^#$CACHE_DIR/#" \
+                    | xargs -P 32 -I{} sh -c 'cat "{}" > /dev/null' 2>/dev/null) || true
               echo "[INFO] pre-warm (data) done"
 
               echo "[INFO] pre-warming thinkjepa conda env (parallel)..."
