@@ -11,6 +11,14 @@
 # Starts from job72_step4000 (our best full-architecture checkpoint, not
 # job15_independent/no-bridge) -- per explicit instruction, no guidance-
 # ablation control run this time, just the single fine-tune.
+#
+# UPDATED 2026-10-24: first real attempt OOM'd (22.10/22.11GiB) on epoch 1's
+# first training step at --batch_size 4 -- fine-tuning keeps the full
+# unfrozen predictor's activation graph per sample until one combined
+# backward(), far heavier than the frozen-predictor eval path. Fixed with
+# bf16 autocast (finetune_egodex_predictor.py) + --batch_size 1
+# --grad_accum_steps 16, reaching the same effective batch=16 ThinkJEPA's
+# own recipe uses without holding that many samples' graphs at once.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -94,7 +102,8 @@ spec:
                 --checkpoint job72_step4000 \
                 --epochs 8 \
                 --lr 1e-5 \
-                --batch_size 4 \
+                --batch_size 1 \
+                --grad_accum_steps 16 \
                 --num_workers 4 \
                 --save_path /data/raw_data/egodex_finetuned_job72_step4000/predictor.pt \
                 --out_json /data/raw_data/egodex_finetuned_job72_step4000/history.json \

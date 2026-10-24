@@ -117,14 +117,23 @@ def train_epoch(predictor, loader, device, optimizer, max_batches=None, grad_acc
             break
         samples = probe.batch_to_samples(batch, device, probe.ALL_JOINT_IDX)
         pred_list, target_list = [], []
-        for s in samples:
-            y_future = probe.predict_future_latent(
-                predictor, s["in_feats"], {"vlm_old": s["vlm_old"], "vlm_new": s["vlm_new"]}, device,
-            )
-            pred_list.append(y_future)
-            target_list.append(s["target_latent"])
-        pred_stack = torch.cat(pred_list, dim=0)
-        target_stack = torch.cat(target_list, dim=0)
+        # bf16 autocast: the first real attempt OOM'd at --batch_size 4 (22.10/
+        # 22.11GiB used) -- unlike the frozen-predictor eval path (no_grad,
+        # no graph retained), fine-tuning keeps the full unfrozen predictor's
+        # activation graph (every rollout/attention layer) for every sample in
+        # the batch until one combined backward() call, far heavier than a
+        # plain forward pass. No GradScaler needed -- bf16 has fp32's exponent
+        # range, just less mantissa precision, so it doesn't underflow the way
+        # fp16 can.
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+            for s in samples:
+                y_future = probe.predict_future_latent(
+                    predictor, s["in_feats"], {"vlm_old": s["vlm_old"], "vlm_new": s["vlm_new"]}, device,
+                )
+                pred_list.append(y_future)
+                target_list.append(s["target_latent"])
+            pred_stack = torch.cat(pred_list, dim=0)
+            target_stack = torch.cat(target_list, dim=0)
         # Exactly ThinkJEPA's own pred_loss term (thinker_train.py:
         # F.mse_loss(pred_latent, target_latent)) -- no SL1/cosine weighting
         # here, so the resulting FD/SL1/CD are judged under the identical
