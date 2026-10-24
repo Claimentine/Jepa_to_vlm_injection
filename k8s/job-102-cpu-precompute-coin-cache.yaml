@@ -1,0 +1,98 @@
+# Step 102: CPU-ONLY precompute cache for our OWN model's (Qwen3-VL-2B-
+# Thinking) COIN split -- the one benchmark job-99 had to skip (its own
+# storage subtree, vans_injection_backup, was badly degraded at the time:
+# ~1/8 sampled files readable). Re-checked 2026-10-24: 8/8 sampled files
+# now read instantly from a different, already-running pod -- storage
+# looks recovered. Only 19/2846 items were cached from before the outage,
+# so this is effectively a from-scratch build, not a resume.
+#
+# Needs COIN's own VANS_WORK_ROOT/clips + vjepa_cache_full symlinks (unlike
+# CrossTask/TempCompass/MVBench/YouCook2, which each have their own
+# already-persistent directories needing only the VANS_WORK_ROOT export) --
+# same setup as job-90's own COIN stage.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-cpu-precompute-coin-cache
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      containers:
+        - name: cpu-precompute-coin-cache
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+
+              echo "=== COIN precompute cache ==="
+              export VANS_WORK_ROOT=/data/vans_work
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+              "$PY" vans_qa/full_scale/build_eval_input_cache.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --split_part test \
+                --cache_dir /data/vans_work/eval_input_cache_coin \
+                --num_shards 1 --shard_idx 0
+
+              echo "CPU_PRECOMPUTE_COIN_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "7"
+              memory: "16Gi"
+              ephemeral-storage: "4Gi"
+            limits:
+              cpu: "7"
+              memory: "16Gi"
+              ephemeral-storage: "4800Mi"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-102-cpu-precompute-coin-cache.yaml -n williamli-scvl
