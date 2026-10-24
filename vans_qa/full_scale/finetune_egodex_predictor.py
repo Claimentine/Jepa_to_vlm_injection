@@ -96,9 +96,22 @@ def load_predictor_for_finetune(label, device):
     return predictor, bridge
 
 
-def train_epoch(predictor, loader, device, optimizer, max_batches=None):
+def train_epoch(predictor, loader, device, optimizer, max_batches=None, grad_accum_steps=1):
+    """One DataLoader batch (--batch_size samples) is the true effective
+    batch size for a single optimizer step -- all samples' forward passes
+    are concatenated into one pred_stack/target_stack before ONE loss/
+    backward/step, not accumulated per-sample. So --batch_size alone
+    already controls the effective batch size for gradient averaging
+    (ThinkJEPA's own recipe uses batch=16/GPU -- --batch_size 16 here is
+    the direct analogue). --grad_accum_steps > 1 is an ADDITIONAL lever on
+    top of that for when GPU memory can't hold --batch_size samples'
+    activations simultaneously: it accumulates (sums, scaled by
+    1/grad_accum_steps) gradients over multiple DataLoader batches before
+    stepping, reaching a larger EFFECTIVE batch (--batch_size *
+    grad_accum_steps) without that peak-memory cost."""
     predictor.train()
     total_loss, n_samples = 0.0, 0
+    optimizer.zero_grad(set_to_none=True)
     for bi, batch in enumerate(loader):
         if max_batches and bi >= max_batches:
             break
@@ -117,11 +130,15 @@ def train_epoch(predictor, loader, device, optimizer, max_batches=None):
         # here, so the resulting FD/SL1/CD are judged under the identical
         # objective their own reference number was optimized for.
         loss = F.mse_loss(pred_stack, target_stack)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+        (loss / grad_accum_steps).backward()
+        if (bi + 1) % grad_accum_steps == 0:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
         total_loss += float(loss.item()) * len(samples)
         n_samples += len(samples)
+    if (bi + 1) % grad_accum_steps != 0:
+        optimizer.step()  # flush a trailing partial accumulation window
+        optimizer.zero_grad(set_to_none=True)
     return total_loss / max(n_samples, 1)
 
 
@@ -150,7 +167,20 @@ def main():
                           "to initialize from -- fine-tunes ONE checkpoint per invocation, unlike the "
                           "probe script's --checkpoints list, since each run mutates its own optimizer "
                           "state over real weights, not just a small disposable probe head.")
-    ap.add_argument("--batch_size", type=int, default=4)
+    ap.add_argument("--batch_size", type=int, default=4,
+                     help="the true effective batch size for one optimizer step (all samples in a "
+                          "DataLoader batch are concatenated into one loss/backward/step, not "
+                          "accumulated per-sample) -- ThinkJEPA's own recipe uses batch=16/GPU, so "
+                          "--batch_size 16 is the direct analogue. Limited by GPU memory, since all "
+                          "of a batch's forward activations are held simultaneously until one "
+                          "backward() call; see --grad_accum_steps for a memory-cheaper way to reach "
+                          "a larger EFFECTIVE batch.")
+    ap.add_argument("--grad_accum_steps", type=int, default=1,
+                     help="accumulate gradients over this many DataLoader batches before each "
+                          "optimizer step, reaching an effective batch of --batch_size * "
+                          "--grad_accum_steps without needing that many samples' activations in "
+                          "memory at once. 1 (default) = no accumulation, matches the original "
+                          "per-DataLoader-batch step behavior.")
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--epochs", type=int, default=5,
                      help="fine-tuning epochs over EgoDex train split -- kept small since this "
@@ -185,7 +215,8 @@ def main():
 
     for epoch in range(args.epochs):
         train_loss = train_epoch(predictor, train_loader, device, optimizer,
-                                  max_batches=args.max_train_batches)
+                                  max_batches=args.max_train_batches,
+                                  grad_accum_steps=args.grad_accum_steps)
         fd, sl1, cd, n_test = evaluate_latent_metrics(predictor, test_loader, device,
                                                         max_batches=args.max_test_batches)
         print(f"[epoch {epoch+1}/{args.epochs}] train_pred_mse={train_loss:.6f} "
