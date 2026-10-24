@@ -10,6 +10,11 @@
 # CrossTask/TempCompass/MVBench/YouCook2, which each have their own
 # already-persistent directories needing only the VANS_WORK_ROOT export) --
 # same setup as job-90's own COIN stage.
+#
+# OOMKilled on the first attempt at the default --prefetch_depth 12 and
+# 16Gi -- same issue class fixed for job-97 (each in-flight decode is a
+# fresh spawn()ed Python interpreter, real memory pressure at depth 12).
+# Applying the same fix preemptively: --prefetch_depth 4 + 24Gi.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -40,7 +45,8 @@ spec:
                 --qa_split /data/raw_data/qa_split_temporal.json \
                 --split_part test \
                 --cache_dir /data/vans_work/eval_input_cache_coin \
-                --num_shards 1 --shard_idx 0
+                --num_shards 1 --shard_idx 0 \
+                --prefetch_depth 4
 
               echo "CPU_PRECOMPUTE_COIN_DONE"
           env:
@@ -53,11 +59,11 @@ spec:
           resources:
             requests:
               cpu: "7"
-              memory: "16Gi"
+              memory: "24Gi"
               ephemeral-storage: "4Gi"
             limits:
               cpu: "7"
-              memory: "16Gi"
+              memory: "24Gi"
               ephemeral-storage: "4800Mi"
           volumeMounts:
             - name: git-repo-code
