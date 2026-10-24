@@ -15,13 +15,19 @@ that script closely. Two differences from extract_crosstask_qa.py:
      span" selection, which is the right choice for *that* script's
      self-supervised objective but would waste most of a video's
      annotations here.
-  2. No download step. Ego4D videos require the official `ego4d` CLI
-     (private S3 bucket, license credentials) -- not re-usable the way
-     extract_crosstask_qa.py's plain yt-dlp call is, and those credentials
-     are currently expired (pending renewal at ego4d-data.org). This script
-     only uses videos ALREADY downloaded by job-50's earlier GoalStep run
-     (expected at --video_cache_dir/v2/full_scale/<video_uid>.mp4); any
-     video not already present is skipped, not re-downloaded.
+  2. Downloads on demand (UPDATED 2026-10-24: the original docstring here
+     said AWS credentials were expired -- they are not; job-95's own
+     full-scale shortaxis extraction has been downloading hundreds of
+     Ego4D videos successfully all session via the same ego4d-aws-
+     credentials Secret). Reuses extract_ego4d_longaxis.py's own
+     download_video()/write_aws_credentials() rather than duplicating that
+     logic. Each video is deleted once every pair for it has been trimmed
+     (same reasoning as extract_ego4d_longaxis.py's own delete-after-use:
+     full_scale Ego4D videos can run tens of minutes, keeping them all
+     around at QA-benchmark scale would exhaust disk). --no_download
+     restores the original read-only-cache behavior for a quick rerun
+     against whatever's already present (e.g. job-50/job-95's own
+     video_cache_dir), skipping any video not already there.
 
 Mirrors extract_crosstask_qa.py's two-phase structure otherwise: Phase 1
 trims per-step clips with ffmpeg, Phase 2 encodes V-JEPA2 features once per
@@ -30,6 +36,7 @@ distractor_caption/difficulty) is identical, so it plugs into
 eval_forward_checkpoint.py unmodified.
 """
 import argparse
+import collections
 import json
 import os
 import random
@@ -46,6 +53,11 @@ WORK_BASE = os.environ.get("VANS_WORK_ROOT", "/data/vans_work_ego4d_qa")
 THINKJEPA_ROOT = os.environ.get("THINKJEPA_ROOT", "/home/jovyan/ThinkJEPA")
 if THINKJEPA_ROOT not in sys.path:
     sys.path.insert(0, THINKJEPA_ROOT)
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+
+from extract_ego4d_longaxis import download_video, write_aws_credentials  # noqa: E402
 
 CLIP_TRIM_TIMEOUT_S = 60
 
@@ -56,25 +68,40 @@ def load_goalstep_annotations(goalstep_json_path):
     return data["videos"]
 
 
-def select_qa_pairs(videos, video_cache_dir, min_segments=2, limit_videos=None, seed=42):
-    """Every consecutive (step i, step i+1) pair, for videos whose raw mp4
-    is already downloaded locally -- no new download attempted."""
+def select_qa_pairs(videos, video_cache_dir, min_segments=2, limit_videos=None, seed=42, download=True):
+    """Every consecutive (step i, step i+1) pair. Picks which videos to use
+    FIRST (shuffled, capped at limit_videos, independent of local download
+    status), THEN downloads each selected one that isn't already present --
+    the reverse of the old read-only-cache order, which could only ever
+    draw from whatever job-50 happened to leave behind. download=False
+    restores that old behavior (skip anything not already local)."""
+    eligible = [v for v in videos if v.get("video_uid") and len(v.get("segments") or []) >= min_segments]
+    rng = random.Random(seed)
+    rng.shuffle(eligible)
+    if limit_videos:
+        eligible = eligible[:limit_videos]
+
     raw_root = Path(video_cache_dir) / "v2" / "full_scale"
     candidates = []
-    n_missing_video = 0
-    for video in videos:
-        video_uid = video.get("video_uid")
-        if not video_uid:
-            continue
+    n_download_failed = n_skipped = 0
+    for vi, video in enumerate(eligible, start=1):
+        video_uid = video["video_uid"]
         video_path = raw_root / f"{video_uid}.mp4"
         if not video_path.exists():
-            n_missing_video += 1
-            continue
-        segments = video.get("segments") or []
-        if len(segments) < min_segments:
+            if not download:
+                n_skipped += 1
+                continue
+            try:
+                download_video(video_uid, Path(video_cache_dir))
+            except Exception as e:
+                n_download_failed += 1
+                print(f"[WARN] download failed for {video_uid}: {type(e).__name__}: {e}", flush=True)
+                continue
+        if not video_path.exists():
+            n_download_failed += 1
             continue
         goal_category = video.get("goal_category") or "this activity"
-        segs_sorted = sorted(segments, key=lambda s: s["start_time"])
+        segs_sorted = sorted(video["segments"], key=lambda s: s["start_time"])
         for i in range(len(segs_sorted) - 1):
             cur, nxt = segs_sorted[i], segs_sorted[i + 1]
             correct = nxt.get("step_description") or nxt.get("step_category")
@@ -89,18 +116,13 @@ def select_qa_pairs(videos, video_cache_dir, min_segments=2, limit_videos=None, 
                 "future_segment": [nxt["start_time"], nxt["end_time"]],
                 "correct_caption": correct,
             })
-    print(f"[INFO] {n_missing_video} videos skipped (not downloaded locally)", flush=True)
-    rng = random.Random(seed)
+        if vi % 50 == 0:
+            print(f"[{vi}/{len(eligible)} videos] candidates={len(candidates)} "
+                  f"download_failed={n_download_failed} skipped={n_skipped}", flush=True)
+    print(f"[INFO] {n_download_failed} video(s) failed to download, {n_skipped} skipped "
+          f"(--no_download), {len(candidates)} candidate pairs across "
+          f"{len({c['video_uid'] for c in candidates})} videos", flush=True)
     rng.shuffle(candidates)
-    if limit_videos:
-        seen_videos = set()
-        kept = []
-        for c in candidates:
-            if len(seen_videos) >= limit_videos and c["video_uid"] not in seen_videos:
-                continue
-            seen_videos.add(c["video_uid"])
-            kept.append(c)
-        candidates = kept
     all_captions_by_video = {}
     for c in candidates:
         all_captions_by_video.setdefault(c["video_uid"], []).append(c["correct_caption"])
@@ -132,8 +154,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--goalstep_json", required=True, help="path to goalstep_train.json")
     ap.add_argument("--video_cache_dir", default="/data/vans_work/ego4d_raw_videos",
-                     help="where job-50's earlier run already downloaded videos "
-                          "(expects <this>/v2/full_scale/<uid>.mp4); never writes here, read-only")
+                     help="videos are downloaded here on demand (see module docstring) unless "
+                          "--no_download is passed, in which case this is read-only, matching the "
+                          "old job-50-cache-only behavior")
+    ap.add_argument("--no_download", action="store_true",
+                     help="skip any video not already present at --video_cache_dir instead of "
+                          "downloading it")
     ap.add_argument("--output_qa_split", default=os.path.join(BASE, "raw_data/qa_split_ego4d.json"))
     ap.add_argument("--clips_root", default=os.path.join(WORK_BASE, "clips"))
     ap.add_argument("--vjepa_cache_dir", default=os.path.join(WORK_BASE, "vjepa_cache_full"))
@@ -145,16 +171,24 @@ def main():
     if args.num_frames is None:
         from cache_train.rebuild_causal_cache import NUM_PAST_FRAMES
         args.num_frames = NUM_PAST_FRAMES
+    if not args.no_download:
+        write_aws_credentials()
 
     videos = load_goalstep_annotations(args.goalstep_json)
-    pairs = select_qa_pairs(videos, args.video_cache_dir, limit_videos=args.limit_videos, seed=args.seed)
+    pairs = select_qa_pairs(videos, args.video_cache_dir, limit_videos=args.limit_videos, seed=args.seed,
+                             download=not args.no_download)
     print(f"[INFO] {len(pairs)} candidate QA pairs across "
-          f"{len({p['video_uid'] for p in pairs})} already-downloaded videos", flush=True)
+          f"{len({p['video_uid'] for p in pairs})} videos", flush=True)
 
     clips_root = Path(args.clips_root)
     vjepa_cache_root = Path(args.vjepa_cache_dir)
 
-    # Phase 1: trim per-step clips (no download -- video_path already exists).
+    # Phase 1: trim per-step clips. pairs is shuffled (see select_qa_pairs),
+    # not grouped by video_uid, so "last pair for this video" is tracked via
+    # a remaining-count map rather than extract_ego4d_longaxis.py's own
+    # next-entry-lookahead trick -- delete each downloaded video once every
+    # one of ITS pairs has had its turn, same disk-usage reasoning.
+    remaining_for_video = collections.Counter(p["video_uid"] for p in pairs)
     items = []
     trimmed_count = failed_count = 0
     seen_exc = set()
@@ -178,6 +212,12 @@ def main():
             if exc_name not in seen_exc:
                 seen_exc.add(exc_name)
                 traceback.print_exc()
+        remaining_for_video[p["video_uid"]] -= 1
+        if not args.no_download and remaining_for_video[p["video_uid"]] <= 0:
+            try:
+                Path(p["video_path"]).unlink()
+            except FileNotFoundError:
+                pass
         if pi % 200 == 0:
             print(f"[{pi}/{len(pairs)} pairs] trimmed={trimmed_count} failed={failed_count}", flush=True)
 

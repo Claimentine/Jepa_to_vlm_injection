@@ -45,6 +45,19 @@ if _REPO_ROOT not in sys.path:
 
 import train_qa_full as fwd  # noqa: E402
 
+# Confirmed malformed/pathological at the file level, not just slow: 5
+# separate precompute attempts (job-97, 2026-10-23/24) all died OOMKilled
+# within minutes of reaching this exact item, even after dropping
+# --prefetch_depth from 12 to 4 -- a single misbehaving decode worker
+# ballooning memory internally within its own 60s DECODE_TIMEOUT_S window
+# (see train_qa_full.py's finish_decode) explains that far better than
+# ordinary prefetch-depth memory pressure does. Our own model's existing
+# CrossTask cache (job-63) is itself missing exactly 1/1558 items,
+# consistent with this being the same clip. Skipped unconditionally here
+# (not caught-and-logged like an ordinary per-item failure) since letting
+# _start_item_decode ever touch it is what crashes the whole pod.
+KNOWN_BAD_PIDS = {"crosstask_91515_gahgP8ShgEI_9"}
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
@@ -75,6 +88,11 @@ def main():
     with open(args.qa_split) as f:
         split = json.load(f)
     items = [it for it in split[args.split_part] if fwd.has_features(it)]
+    n_before_bad_filter = len(items)
+    items = [it for it in items if it.get("pid") not in KNOWN_BAD_PIDS]
+    if len(items) != n_before_bad_filter:
+        print(f"[INFO] dropped {n_before_bad_filter - len(items)} known-bad item(s): "
+              f"{KNOWN_BAD_PIDS & {it.get('pid') for it in split[args.split_part]}}", flush=True)
     items = items[args.shard_idx::args.num_shards]
     if args.limit:
         items = items[: args.limit]
