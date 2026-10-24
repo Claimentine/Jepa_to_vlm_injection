@@ -1,0 +1,140 @@
+# Step 103: fine-tunes job72_step4000's predictor (+ CrossModalBridge)
+# end-to-end on EgoDex, using ThinkJEPA's own pred_loss formula
+# (F.mse_loss(pred_latent, target_latent)) as the training objective --
+# see finetune_egodex_predictor.py's own module docstring for the full
+# motivation: job-101's FD/SL1/CD numbers were zero-shot (predictor never
+# saw EgoDex), not a fair same-training-regime comparison against
+# ThinkJEPA's own reference, which trains end-to-end on EgoDex with that
+# exact loss term. This closes that gap on our side while keeping the
+# VLM-guidance injection pathway active throughout.
+#
+# Starts from job72_step4000 (our best full-architecture checkpoint, not
+# job15_independent/no-bridge) -- per explicit instruction, no guidance-
+# ablation control run this time, just the single fine-tune.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-egodex-finetune-predictor
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-01.laccd.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - dtn-gpu2.kreonet.net
+                      - hcc-chase-shor-c4705.unl.edu
+                      - k8s-chase-ci-01.calit2.optiputer.net
+                      - hcc-nrp-shor-c5813.unl.edu
+                      - k8s-gpu-01.calit2.optiputer.net
+                      - k8s-chase-ci-03.calit2.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+      containers:
+        - name: egodex-finetune-predictor
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/thinkjepa/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/egodex_finetuned_job72_step4000
+
+              echo "[INFO] pre-warming EgoDex cache tree (parallel)..."
+              time find /data/raw_data/thinkjepa_egodex_iso/cache -name '*.npz' -print0 \
+                | xargs -0 -P 32 -I{} sh -c 'cat {} > /dev/null' || true
+              echo "[INFO] pre-warm (data) done"
+
+              echo "[INFO] pre-warming thinkjepa conda env (parallel)..."
+              time find /home/jovyan/conda-envs/thinkjepa -type f -print0 \
+                | xargs -0 -P 32 -I{} sh -c 'cat {} > /dev/null' 2>/dev/null || true
+              echo "[INFO] pre-warm (conda env) done"
+
+              "$PY" vans_qa/full_scale/finetune_egodex_predictor.py \
+                --checkpoint job72_step4000 \
+                --epochs 8 \
+                --lr 1e-5 \
+                --batch_size 4 \
+                --num_workers 4 \
+                --save_path /data/raw_data/egodex_finetuned_job72_step4000/predictor.pt \
+                --out_json /data/raw_data/egodex_finetuned_job72_step4000/history.json \
+                2>&1 | tee /data/raw_data/egodex_finetuned_job72_step4000/full_run.log
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests: {cpu: "4", memory: "20Gi", ephemeral-storage: "2Gi", nvidia.com/gpu: "1"}
+            limits: {cpu: "4", memory: "20Gi", ephemeral-storage: "4Gi", nvidia.com/gpu: "1"}
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+            - name: shm
+              mountPath: /dev/shm
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-103-egodex-finetune-predictor.yaml -n williamli-scvl
