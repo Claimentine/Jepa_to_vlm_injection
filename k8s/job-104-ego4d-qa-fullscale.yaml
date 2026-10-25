@@ -27,6 +27,15 @@
 # time regardless. Run this overnight as a CPU-only pod; rerun WITHOUT
 # --skip_phase2 (and WITH a GPU request again) tomorrow to do the VJEPA
 # encoding over the already-downloaded/trimmed clips, no re-download.
+#
+# UPDATED 2026-10-25 (round 2): --video_cache_dir now points at job-109's
+# own goalstep raw_videos directory (shared, not job-104's own separate
+# one) -- both scripts use the identical download_video()/directory
+# layout (<dir>/v2/full_scale/<uid>.mp4) for the SAME GoalStep video
+# pool, so every future download by EITHER pipeline now benefits both
+# instead of each downloading its own separate copy. --limit_videos
+# bumped 20->60 to pull more forward QA data now that there's a shared
+# pool to draw from.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -82,8 +91,8 @@ spec:
               mkdir -p /data/vans_work_ego4d_qa
               "$PY" vans_qa/full_scale/extract_ego4d_qa.py \
                 --goalstep_json "$GOALSTEP" \
-                --video_cache_dir /data/vans_work_ego4d_qa/raw_videos \
-                --limit_videos 20 \
+                --video_cache_dir /data/vans_work_ego4d_reverse_guided/raw_videos_goalstep \
+                --limit_videos 60 \
                 --skip_phase2 \
                 --output_qa_split /data/raw_data/qa_split_ego4d.json \
                 --clips_root /data/vans_work_ego4d_qa/clips \
