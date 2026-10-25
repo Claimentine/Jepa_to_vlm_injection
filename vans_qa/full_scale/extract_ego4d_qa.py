@@ -69,22 +69,28 @@ def load_goalstep_annotations(goalstep_json_path):
 
 
 def select_qa_pairs(videos, video_cache_dir, min_segments=2, limit_videos=None, seed=42, download=True):
-    """Every consecutive (step i, step i+1) pair. Picks which videos to use
-    FIRST (shuffled, capped at limit_videos, independent of local download
-    status), THEN downloads each selected one that isn't already present --
-    the reverse of the old read-only-cache order, which could only ever
-    draw from whatever job-50 happened to leave behind. download=False
-    restores that old behavior (skip anything not already local)."""
+    """Every consecutive (step i, step i+1) pair. Walks the FULL shuffled
+    eligible-video pool (not just its first limit_videos entries) and stops
+    once limit_videos have been SUCCESSFULLY downloaded -- a failed
+    download doesn't eat into the target count, it just moves on to the
+    next candidate. Videos with more segments (what min_segments selects
+    for, since more steps = more QA pairs) skew longer in duration too, so
+    a naive "take the first limit_videos, whatever happens to them" cap
+    risks ending up with very few usable videos if several in a row hit
+    download_video's own DOWNLOAD_TIMEOUT_S (confirmed in practice: job-104
+    failed its first 5 draws in a row). download=False restores the old
+    read-only-cache behavior (skip anything not already local, still
+    stopping at limit_videos successes)."""
     eligible = [v for v in videos if v.get("video_uid") and len(v.get("segments") or []) >= min_segments]
     rng = random.Random(seed)
     rng.shuffle(eligible)
-    if limit_videos:
-        eligible = eligible[:limit_videos]
 
     raw_root = Path(video_cache_dir) / "v2" / "full_scale"
     candidates = []
-    n_download_failed = n_skipped = 0
+    n_download_failed = n_skipped = n_succeeded = 0
     for vi, video in enumerate(eligible, start=1):
+        if limit_videos and n_succeeded >= limit_videos:
+            break
         video_uid = video["video_uid"]
         video_path = raw_root / f"{video_uid}.mp4"
         if not video_path.exists():
@@ -100,6 +106,7 @@ def select_qa_pairs(videos, video_cache_dir, min_segments=2, limit_videos=None, 
         if not video_path.exists():
             n_download_failed += 1
             continue
+        n_succeeded += 1
         goal_category = video.get("goal_category") or "this activity"
         segs_sorted = sorted(video["segments"], key=lambda s: s["start_time"])
         for i in range(len(segs_sorted) - 1):
@@ -116,11 +123,12 @@ def select_qa_pairs(videos, video_cache_dir, min_segments=2, limit_videos=None, 
                 "future_segment": [nxt["start_time"], nxt["end_time"]],
                 "correct_caption": correct,
             })
-        if vi % 50 == 0:
-            print(f"[{vi}/{len(eligible)} videos] candidates={len(candidates)} "
-                  f"download_failed={n_download_failed} skipped={n_skipped}", flush=True)
-    print(f"[INFO] {n_download_failed} video(s) failed to download, {n_skipped} skipped "
-          f"(--no_download), {len(candidates)} candidate pairs across "
+        if vi % 10 == 0:
+            print(f"[tried {vi} videos, succeeded={n_succeeded}/{limit_videos or '?'}] "
+                  f"candidates={len(candidates)} download_failed={n_download_failed} "
+                  f"skipped={n_skipped}", flush=True)
+    print(f"[INFO] tried {vi} videos total: {n_succeeded} succeeded, {n_download_failed} failed to "
+          f"download, {n_skipped} skipped (--no_download), {len(candidates)} candidate pairs across "
           f"{len({c['video_uid'] for c in candidates})} videos", flush=True)
     rng.shuffle(candidates)
     all_captions_by_video = {}
