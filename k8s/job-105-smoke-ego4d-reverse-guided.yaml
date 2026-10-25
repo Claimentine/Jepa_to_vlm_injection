@@ -7,6 +7,14 @@
 # captioning in the same pass as the download. --limit 10 before
 # committing to a full-scale run, same discipline as job-92/job-59's own
 # smoke tests.
+#
+# UPDATED 2026-10-24: first attempt failed with "Could not infer the
+# resolved Qwen checkpoint commit SHA" (rebuild_causal_cache.py's
+# _infer_hf_checkpoint_sha couldn't find a resolvable commit hash this
+# time) -- passing --qwen_checkpoint_sha explicitly (the commit `main`
+# currently resolves to per huggingface.co's own API) works around it;
+# this field is only stored as npz provenance metadata, not used for
+# anything functional.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -67,6 +75,7 @@ spec:
               "$PY" vans_qa/full_scale/extract_ego4d_reverse_guided.py \
                 --annotation_source goalstep \
                 --goalstep_json "$GOALSTEP" \
+                --qwen_checkpoint_sha 33e0ad94c327808ebc7d3bbc97e78e600f1eeecd \
                 --limit 10 \
                 --video_cache_dir /data/vans_work_ego4d_reverse_guided_smoke/raw_videos \
                 --cache_dir /data/vans_work_ego4d_reverse_guided_smoke/cache \

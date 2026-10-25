@@ -5,6 +5,10 @@
 # docstring. COIN videos are YouTube (yt-dlp), much faster/more reliable
 # to redownload this session than Ego4D's S3 CLI has been.
 # --limit 10 before a full-scale run, same discipline as job-105/job-92.
+#
+# --qwen_checkpoint_sha passed explicitly (see job-105's own note) -- the
+# auto-infer path failed with "Could not infer the resolved Qwen
+# checkpoint commit SHA" this session.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -66,6 +70,7 @@ spec:
               cd "$REPO"
               mkdir -p /data/vans_work_coin_reverse_guided_smoke
               "$PY" vans_qa/full_scale/extract_coin_reverse_guided.py \
+                --qwen_checkpoint_sha 33e0ad94c327808ebc7d3bbc97e78e600f1eeecd \
                 --limit 10 \
                 --min_span_seconds 30 \
                 --video_cache_dir /data/vans_work_coin_reverse_guided_smoke/raw_videos \
