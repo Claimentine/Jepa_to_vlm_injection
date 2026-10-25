@@ -55,6 +55,14 @@ spec:
                       - k8s-chase-ci-03.calit2.optiputer.net
                       - k8s-gen4-05.calit2.optiputer.net
                       - hcc-nrp-shor-c6017.unl.edu
+                      # excluded 2026-10-25: 6 consecutive ego4d CLI download
+                      # timeouts in a row (fresh video_uids each time, not a
+                      # repeat of the same few slow ones) -- looks like a
+                      # degraded network path from this node to Ego4D's S3
+                      # bucket specifically, not the videos themselves
+                      # (job-95, on a different node, keeps succeeding at a
+                      # normal rate concurrently)
+                      - hcc-nrp-shor-c5805.unl.edu
       containers:
         - name: ego4d-qa-fullscale
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
