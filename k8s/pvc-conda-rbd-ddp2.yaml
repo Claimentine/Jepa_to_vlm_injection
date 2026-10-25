@@ -1,0 +1,28 @@
+# Second dedicated clone of the qwen3vl-conda-env volume, specifically so
+# job-107 (merged VANS/COIN+YouCook2 training, job-72's own recipe) doesn't
+# have to queue behind every other conda-vol currently in use (ddp: job-104,
+# vlm: job-106, baselines: job-105, vlm2: job-103, base: job-95) -- all five
+# existing conda-vols were busy simultaneously when this job needed to start
+# tonight. Cloned from ruixin-conda-vol-ddp (already has the qwen3vl env
+# job-72's own recipe used).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ruixin-conda-vol-ddp2
+spec:
+  storageClassName: rook-ceph-block
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  dataSource:
+    kind: PersistentVolumeClaim
+    name: ruixin-conda-vol-ddp
+
+# Apply with:
+#   kubectl apply -f pvc-conda-rbd-ddp2.yaml -n williamli-scvl
+#
+# Reminder (Golden Rule #2): this is active-computation storage, not archival.
+# A PVC untouched for 6 months can be purged without notice -- move final
+# results to lab-approved long-term storage when a project wraps up.
