@@ -106,6 +106,12 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="cap candidate pairs")
     ap.add_argument("--eval_frac", type=float, default=0.1, help="video-level held-out fraction -> val split")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--download_only", action="store_true",
+                     help="download each pair's video and stop -- no Qwen/VJEPA load, no GPU touched "
+                          "or requested at all (unlike lazy loading, a pod that merely holds a GPU "
+                          "reservation it never uses still trips NRP's idle-GPU policy, so this is for "
+                          "running as a genuinely GPU-less pod). Rerun without this flag tomorrow to "
+                          "do the extraction -- download_video() no-ops for videos already present.")
     ap.add_argument("--video_cache_dir", default=os.path.join(WORK_BASE, "raw_videos"))
     ap.add_argument("--cache_dir", default=os.path.join(WORK_BASE, "cache"))
     ap.add_argument("--split_out", default=os.path.join(BASE, "raw_data/qa_split_ego4d_reverse_guided.json"))
@@ -173,7 +179,7 @@ def main():
         return _model_holder["qwen"] + (_model_holder["vjepa"],)
 
     n = len(pairs)
-    saved_count = skipped_count = failed_count = 0
+    saved_count = skipped_count = failed_count = downloaded_count = 0
     seen_exc_types = set()
     split_membership = {"train": [], "val": [], "test": []}
     with torch.no_grad():
@@ -195,6 +201,15 @@ def main():
                     download_video(video_uid, video_cache_root)
                 if not video_path.exists():
                     raise RuntimeError(f"ego4d CLI reported success but {video_path} is missing")
+                if args.download_only:
+                    # No GPU touched or requested at all -- not just lazy
+                    # model loading, but skipping Qwen/VJEPA entirely.
+                    # Rerun without --download_only tomorrow to do the
+                    # actual extraction; video_path already exists at that
+                    # point so download_video() is a no-op for this pair.
+                    downloaded_count += 1
+                    print(f"[DOWNLOADED {i}/{n}] {video_path}", flush=True)
+                    continue
                 qwen_model, qwen_processor, qwen_saved, qwen_sha, vjepa_model = get_models()
 
                 past_frames, past_times = extract_window_frames(
@@ -265,13 +280,23 @@ def main():
                     traceback.print_exc()
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
-            if is_last_pair_for_video:
+            if is_last_pair_for_video and not args.download_only:
+                # Keep the video around in download_only mode -- tomorrow's
+                # extraction run over the same (deterministic, seed=42)
+                # pair order needs it still present.
                 try:
                     video_path.unlink()
                 except FileNotFoundError:
                     pass
             if i % 20 == 0:
-                print(f"[{i}/{n}] saved={saved_count} skipped={skipped_count} failed={failed_count}", flush=True)
+                print(f"[{i}/{n}] saved={saved_count} skipped={skipped_count} failed={failed_count} "
+                      f"downloaded={downloaded_count}", flush=True)
+
+    if args.download_only:
+        print(f"[DONE] download_only -- downloaded={downloaded_count} skipped_valid={skipped_count} "
+              f"failed={failed_count} video_cache_dir={video_cache_root} -- rerun without "
+              f"--download_only tomorrow to do the VJEPA/Qwen extraction", flush=True)
+        return 1 if (failed_count and not downloaded_count and not skipped_count) else 0
 
     out_path = Path(args.split_out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

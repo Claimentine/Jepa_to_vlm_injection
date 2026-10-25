@@ -168,6 +168,11 @@ def main():
     ap.add_argument("--no_download", action="store_true",
                      help="skip any video not already present at --video_cache_dir instead of "
                           "downloading it")
+    ap.add_argument("--skip_phase2", action="store_true",
+                     help="stop after Phase 1 (download+trim) -- no VJEPA2 load, no GPU touched or "
+                          "requested at all. For a long CPU-only overnight download run: rerun the "
+                          "same command without this flag tomorrow to do the VJEPA encoding, picking "
+                          "up from the already-trimmed clips with no re-download needed.")
     ap.add_argument("--output_qa_split", default=os.path.join(BASE, "raw_data/qa_split_ego4d.json"))
     ap.add_argument("--clips_root", default=os.path.join(WORK_BASE, "clips"))
     ap.add_argument("--vjepa_cache_dir", default=os.path.join(WORK_BASE, "vjepa_cache_full"))
@@ -230,6 +235,21 @@ def main():
             print(f"[{pi}/{len(pairs)} pairs] trimmed={trimmed_count} failed={failed_count}", flush=True)
 
     print(f"[PHASE1 DONE] trimmed={trimmed_count} failed={failed_count}", flush=True)
+
+    if args.skip_phase2:
+        # Download+trim only, no GPU touched at all -- not just lazy model
+        # loading (which still leaves the pod HOLDING a GPU reservation the
+        # whole time regardless of when the code gets around to using it,
+        # exactly what trips NRP's idle-GPU policy), but genuinely never
+        # requesting one. Re-running this same script tomorrow WITHOUT
+        # --skip_phase2 resumes cleanly: already-trimmed in_clip/out_clip
+        # files are skipped (see the `if not in_clip.exists()` checks
+        # above), already-downloaded source videos were already deleted
+        # right after their trim (by design, no longer needed), and
+        # select_qa_pairs's own already-local-video short-circuit means a
+        # full target count reached tonight costs ~nothing to re-derive.
+        print("[DONE] skip_phase2 -- stopping here, rerun without --skip_phase2 to do VJEPA encoding", flush=True)
+        return 0
 
     # Phase 2: V-JEPA2 feature extraction for every unique clip.
     from cache_train.rebuild_causal_cache import load_vjepa_encoder, preprocess_vjepa_frames, encode_vjepa_clip, uniform_indices
