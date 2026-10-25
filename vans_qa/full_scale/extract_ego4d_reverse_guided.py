@@ -112,6 +112,12 @@ def main():
                           "reservation it never uses still trips NRP's idle-GPU policy, so this is for "
                           "running as a genuinely GPU-less pod). Rerun without this flag tomorrow to "
                           "do the extraction -- download_video() no-ops for videos already present.")
+    ap.add_argument("--download_concurrency", type=int, default=16,
+                     help="--download_only mode only: concurrent download_video() calls (thread pool "
+                          "-- pure I/O, no GIL contention). Serial downloads at Ego4D's ~50% "
+                          "per-attempt failure rate (confirmed in practice, job-109's first attempt) "
+                          "are on the order of weeks for a several-thousand-video target; this is the "
+                          "actual fix, not a tuning knob to leave at 1.")
     ap.add_argument("--video_cache_dir", default=os.path.join(WORK_BASE, "raw_videos"))
     ap.add_argument("--cache_dir", default=os.path.join(WORK_BASE, "cache"))
     ap.add_argument("--split_out", default=os.path.join(BASE, "raw_data/qa_split_ego4d_reverse_guided.json"))
@@ -158,6 +164,50 @@ def main():
     cache_root = Path(args.cache_dir)
     cache_root.mkdir(parents=True, exist_ok=True)
 
+    if args.download_only:
+        # Concurrent, not the serial per-pair loop below: downloading is
+        # pure network I/O (no GPU, no shared model state to worry about),
+        # and at Ego4D's observed ~50% per-attempt failure rate (up to 600s
+        # each), serial downloads are catastrophically slow -- confirmed in
+        # practice, job-109's first overnight attempt did only ~76 unique
+        # videos in 11 hours (serial), on pace for ~2 WEEKS to reach the
+        # full narration+goalstep target. A thread pool is fine here (no
+        # GIL-bound work, each download_video() call just blocks on a
+        # subprocess) and lets successful downloads finish without being
+        # stuck behind a slow/timing-out one ahead of them in a queue.
+        import concurrent.futures
+        unique_video_uids = sorted({p["video_uid"] for p in pairs})
+        print(f"[INFO] download_only: {len(unique_video_uids)} unique videos needed "
+              f"({args.download_concurrency} concurrent)", flush=True)
+        n_dl_ok = n_dl_fail = n_dl_skip = 0
+
+        def _dl_one(video_uid):
+            video_path = video_cache_root / "v2" / "full_scale" / f"{video_uid}.mp4"
+            if video_path.exists():
+                return video_uid, "skip", None
+            try:
+                download_video(video_uid, video_cache_root)
+                return video_uid, "ok", None
+            except Exception as e:
+                return video_uid, "fail", f"{type(e).__name__}: {e}"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.download_concurrency) as pool:
+            for i, (video_uid, status, err) in enumerate(pool.map(_dl_one, unique_video_uids), start=1):
+                if status == "skip":
+                    n_dl_skip += 1
+                elif status == "ok":
+                    n_dl_ok += 1
+                else:
+                    n_dl_fail += 1
+                    print(f"[FAIL download {i}/{len(unique_video_uids)}] {video_uid}: {err}", flush=True)
+                if i % 20 == 0:
+                    print(f"[{i}/{len(unique_video_uids)} videos] ok={n_dl_ok} skip={n_dl_skip} "
+                          f"fail={n_dl_fail}", flush=True)
+        print(f"[DONE] download_only -- ok={n_dl_ok} skip={n_dl_skip} fail={n_dl_fail} "
+              f"video_cache_dir={video_cache_root} -- rerun without --download_only tomorrow to do "
+              f"the VJEPA/Qwen extraction", flush=True)
+        return 1 if (n_dl_fail and not n_dl_ok and not n_dl_skip) else 0
+
     import torch
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Loaded lazily, on first pair whose download actually succeeds -- not
@@ -179,7 +229,7 @@ def main():
         return _model_holder["qwen"] + (_model_holder["vjepa"],)
 
     n = len(pairs)
-    saved_count = skipped_count = failed_count = downloaded_count = 0
+    saved_count = skipped_count = failed_count = 0
     seen_exc_types = set()
     split_membership = {"train": [], "val": [], "test": []}
     with torch.no_grad():
@@ -201,15 +251,6 @@ def main():
                     download_video(video_uid, video_cache_root)
                 if not video_path.exists():
                     raise RuntimeError(f"ego4d CLI reported success but {video_path} is missing")
-                if args.download_only:
-                    # No GPU touched or requested at all -- not just lazy
-                    # model loading, but skipping Qwen/VJEPA entirely.
-                    # Rerun without --download_only tomorrow to do the
-                    # actual extraction; video_path already exists at that
-                    # point so download_video() is a no-op for this pair.
-                    downloaded_count += 1
-                    print(f"[DOWNLOADED {i}/{n}] {video_path}", flush=True)
-                    continue
                 qwen_model, qwen_processor, qwen_saved, qwen_sha, vjepa_model = get_models()
 
                 past_frames, past_times = extract_window_frames(
@@ -280,23 +321,14 @@ def main():
                     traceback.print_exc()
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
-            if is_last_pair_for_video and not args.download_only:
-                # Keep the video around in download_only mode -- tomorrow's
-                # extraction run over the same (deterministic, seed=42)
-                # pair order needs it still present.
+            if is_last_pair_for_video:
                 try:
                     video_path.unlink()
                 except FileNotFoundError:
                     pass
             if i % 20 == 0:
-                print(f"[{i}/{n}] saved={saved_count} skipped={skipped_count} failed={failed_count} "
-                      f"downloaded={downloaded_count}", flush=True)
-
-    if args.download_only:
-        print(f"[DONE] download_only -- downloaded={downloaded_count} skipped_valid={skipped_count} "
-              f"failed={failed_count} video_cache_dir={video_cache_root} -- rerun without "
-              f"--download_only tomorrow to do the VJEPA/Qwen extraction", flush=True)
-        return 1 if (failed_count and not downloaded_count and not skipped_count) else 0
+                print(f"[{i}/{n}] saved={saved_count} skipped={skipped_count} failed={failed_count}",
+                      flush=True)
 
     out_path = Path(args.split_out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
