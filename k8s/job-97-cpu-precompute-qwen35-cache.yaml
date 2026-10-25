@@ -30,6 +30,15 @@
 # train_qa_full.py's OWN other prefetch_depth default, used by its
 # GPU-pipelined caller) here specifically, plus headroom on the memory
 # limit.
+#
+# UPDATED 2026-10-24 (3rd/4th attempts): the acute "one malformed clip
+# blows up a worker" cause is fixed now (RLIMIT_AS in train_qa_full.py's
+# _decode_video_worker, confirmed: this run survived the
+# crosstask_91515_JzSpcN2MAwY_1 clip that previously OOMKilled it within
+# minutes) -- but it still OOMKilled after 26 minutes with zero progress-
+# line output (prints every 200 items), pointing at a slower cumulative
+# memory creep across many items rather than one bad clip. Dropping
+# --prefetch_depth to 2 as a further precaution.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -67,7 +76,7 @@ spec:
                 --split_part test \
                 --cache_dir /data/vans_work_crosstask/eval_input_cache_crosstask_qwen35 \
                 --num_shards 1 --shard_idx 0 \
-                --prefetch_depth 4
+                --prefetch_depth 2
 
               echo "CPU_PRECOMPUTE_QWEN35_DONE"
           env:
