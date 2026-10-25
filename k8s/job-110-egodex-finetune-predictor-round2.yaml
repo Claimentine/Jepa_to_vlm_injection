@@ -1,0 +1,150 @@
+# Step 110: continues job-103's fine-tune for 15 more epochs. No native
+# checkpoint-resume in finetune_egodex_predictor.py, but --checkpoint
+# accepts a label=path override (same lookup load_frozen_predictor/
+# load_predictor_for_finetune already use for CHECKPOINTS labels), so
+# pointing it at job-103's own saved predictor.pt picks up the already
+# fine-tuned weights (predictor + bridge_state, both present since
+# job72_step4000 is a bridge checkpoint) and continues training from
+# there -- NOT from job72_step4000's original zero-shot state again.
+#
+# job-103's own loss curve was still improving at epoch 8 with no
+# plateau (FD 84.90->79.19, SL1 1.443->1.338, CD 0.476->0.391 over 8
+# epochs) -- this run picks up from that improved state for 15 more
+# (per explicit instruction).
+# Note: the AdamW optimizer state (momentum/variance) is NOT saved/
+# restored, so this restarts with a fresh optimizer on top of the
+# continued weights -- a brief re-warm-up wobble is possible but minor
+# given the already-small lr=1e-5. The script's own per-run epoch
+# counter resets to 1/8 again in this run's logs -- epoch "1" here
+# starts from job-103's final FD=79.19, not the original 84.90.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-egodex-finetune-predictor-round2
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-01.laccd.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - dtn-gpu2.kreonet.net
+                      - hcc-chase-shor-c4705.unl.edu
+                      - k8s-chase-ci-01.calit2.optiputer.net
+                      - hcc-nrp-shor-c5813.unl.edu
+                      - k8s-gpu-01.calit2.optiputer.net
+                      - k8s-chase-ci-03.calit2.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+      containers:
+        - name: egodex-finetune-predictor-round2
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/thinkjepa/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/egodex_finetuned_job72_step4000_round2
+
+              echo "[INFO] pre-warming EgoDex manifest files (parallel, targeted)..."
+              MANIFEST_DIR=/data/raw_data/thinkjepa_egodex_iso/manifests/portable_v1
+              CACHE_DIR=/data/raw_data/thinkjepa_egodex_iso/cache
+              time (cat "$MANIFEST_DIR/train_cache.txt" "$MANIFEST_DIR/test_cache.txt" \
+                    | sed "s#^#$CACHE_DIR/#" \
+                    | xargs -P 32 -I{} sh -c 'cat "{}" > /dev/null' 2>/dev/null) || true
+              echo "[INFO] pre-warm (data) done"
+
+              echo "[INFO] pre-warming thinkjepa conda env (parallel)..."
+              time find /home/jovyan/conda-envs/thinkjepa -type f -print0 \
+                | xargs -0 -P 32 -I{} sh -c 'cat {} > /dev/null' 2>/dev/null || true
+              echo "[INFO] pre-warm (conda env) done"
+
+              "$PY" vans_qa/full_scale/finetune_egodex_predictor.py \
+                --checkpoint "job103_round1=/data/raw_data/egodex_finetuned_job72_step4000/predictor.pt" \
+                --epochs 15 \
+                --lr 1e-5 \
+                --batch_size 1 \
+                --grad_accum_steps 16 \
+                --num_workers 4 \
+                --save_path /data/raw_data/egodex_finetuned_job72_step4000_round2/predictor.pt \
+                --out_json /data/raw_data/egodex_finetuned_job72_step4000_round2/history.json \
+                2>&1 | tee /data/raw_data/egodex_finetuned_job72_step4000_round2/full_run.log
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests: {cpu: "4", memory: "20Gi", ephemeral-storage: "2Gi", nvidia.com/gpu: "1"}
+            limits: {cpu: "4", memory: "20Gi", ephemeral-storage: "4Gi", nvidia.com/gpu: "1"}
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+            - name: shm
+              mountPath: /dev/shm
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-110-egodex-finetune-predictor-round2.yaml -n williamli-scvl
