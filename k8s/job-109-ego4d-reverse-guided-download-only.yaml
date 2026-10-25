@@ -1,0 +1,179 @@
+# Step 109: full-scale overnight DOWNLOAD-ONLY pass for Ego4D's
+# reverse-guided pairs (both annotation sources, narration then goalstep,
+# same sequential-in-one-job pattern job-95 used). --download_only: no
+# Qwen/VJEPA load, no GPU requested at all -- see
+# extract_ego4d_reverse_guided.py's own --download_only docstring for why
+# lazy model loading alone wasn't enough (a pod that merely HOLDS a GPU
+# reservation still trips NRP's idle-GPU policy, regardless of when/
+# whether the code inside ever touches it, and Ego4D's ~50%
+# per-download-attempt failure rate at up to 600s each means this phase
+# can run for hours).
+#
+# Targets approximate job-95's own original scale (the user's explicit
+# choice): narration ~6000 train + ~900 eval (limit=6900, eval_frac
+# tuned so the natural video-level split lands near that ratio -- unlike
+# job-95's own extract_ego4d_longaxis.py, this script doesn't support
+# separately-capped train/eval limits, so this is an approximation, not
+# an exact 6000/900 split), goalstep ~5000 train + ~750 eval
+# (limit=5750, same approximation).
+#
+# Tomorrow: rerun the SAME commands below with --download_only removed
+# (and a GPU request added back) to do the actual VJEPA/Qwen extraction
+# -- download_video() no-ops for every video already on disk.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-ego4d-reverse-guided-download-only
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - k8s-chase-ci-01.calit2.optiputer.net
+                      - nrp-g1.nysernet.org
+                      - hcc-nrp-shor-c5813.unl.edu
+                      - k8s-gpu-01.calit2.optiputer.net
+                      - k8s-chase-ci-03.calit2.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c5805.unl.edu
+      containers:
+        - name: ego4d-reverse-guided-download-only
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+
+              "$PY" -m pip install --quiet ego4d
+              export PATH="$(dirname "$PY"):$PATH"
+
+              GOALSTEP=$(find /data/raw_data/ego4d_annotations -iname "goalstep_train.json" 2>/dev/null | head -1)
+              NARRATION=$(find /data/raw_data/ego4d_annotations -iname "narration.json" 2>/dev/null | head -1)
+              if [ -z "$GOALSTEP" ] || [ -z "$NARRATION" ]; then
+                echo "[INFO] annotations missing locally, downloading ..."
+                mkdir -p /data/raw_data/ego4d_annotations
+                "$PY" -m ego4d.cli.cli -o /data/raw_data/ego4d_annotations \
+                  --datasets annotations --annotations narration -y \
+                  >/tmp/ego4d_annotations_dl.log 2>&1
+                tail -5 /tmp/ego4d_annotations_dl.log
+                GOALSTEP=$(find /data/raw_data/ego4d_annotations -iname "goalstep_train.json" | head -1)
+                NARRATION=$(find /data/raw_data/ego4d_annotations -iname "narration.json" | head -1)
+              fi
+              echo "goalstep: $GOALSTEP"
+              echo "narration: $NARRATION"
+
+              mkdir -p /data/vans_work_ego4d_reverse_guided
+
+              echo "=== [1/2] NARRATION, target ~6000 train / ~900 eval ==="
+              "$PY" vans_qa/full_scale/extract_ego4d_reverse_guided.py \
+                --annotation_source narration \
+                --narration_json "$NARRATION" \
+                --min_gap_seconds 10 \
+                --max_gap_seconds 60 \
+                --window_seconds 8.0 \
+                --pairs_per_video 3 \
+                --limit 6900 \
+                --eval_frac 0.13 \
+                --download_only \
+                --video_cache_dir /data/vans_work_ego4d_reverse_guided/raw_videos_narration \
+                --cache_dir /data/vans_work_ego4d_reverse_guided/cache_narration \
+                --split_out /data/raw_data/qa_split_ego4d_reverse_guided_narration.json
+
+              echo "=== [2/2] GOALSTEP, target ~5000 train / ~750 eval ==="
+              "$PY" vans_qa/full_scale/extract_ego4d_reverse_guided.py \
+                --annotation_source goalstep \
+                --goalstep_json "$GOALSTEP" \
+                --min_gap_seconds 0 \
+                --max_gap_seconds 60 \
+                --pairs_per_video 3 \
+                --limit 5750 \
+                --eval_frac 0.13 \
+                --download_only \
+                --video_cache_dir /data/vans_work_ego4d_reverse_guided/raw_videos_goalstep \
+                --cache_dir /data/vans_work_ego4d_reverse_guided/cache_goalstep \
+                --split_out /data/raw_data/qa_split_ego4d_reverse_guided_goalstep.json
+
+              echo "EGO4D_REVERSE_GUIDED_DOWNLOAD_ONLY_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: VJEPA2_CKPT
+              value: /data/checkpoints/vjepa2/vitl.pt
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_DEFAULT_REGION
+          resources:
+            requests:
+              cpu: "4"
+              memory: "12Gi"
+              ephemeral-storage: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "12Gi"
+              ephemeral-storage: "6Gi"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-109-ego4d-reverse-guided-download-only.yaml -n williamli-scvl

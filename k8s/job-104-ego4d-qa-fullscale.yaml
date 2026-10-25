@@ -17,6 +17,16 @@
 # (goalstep videos average ~92 consecutive-step pairs each) -- 20 videos
 # lands in the same ballpark as the other 5 benchmarks (CrossTask ~1558,
 # COIN ~2846, YouCook2 636), not an order of magnitude bigger.
+#
+# UPDATED 2026-10-25: switched to --skip_phase2 (download+trim only, no
+# VJEPA load) and dropped the GPU request entirely -- Ego4D's ~50%
+# per-download-attempt failure rate (confirmed this session, up to 600s
+# each) meant this pod was holding a GPU reservation for hours at 0%
+# utilization even with lazy loading, since lazy loading only controls
+# WHEN code touches the GPU, not whether the pod holds one the whole
+# time regardless. Run this overnight as a CPU-only pod; rerun WITHOUT
+# --skip_phase2 (and WITH a GPU request again) tomorrow to do the VJEPA
+# encoding over the already-downloaded/trimmed clips, no re-download.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -30,19 +40,6 @@ spec:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
               - matchExpressions:
-                  - key: nvidia.com/gpu.product
-                    operator: NotIn
-                    values:
-                      - NVIDIA-TITAN-Xp
-                      - NVIDIA-TITAN-X-Pascal
-                      - NVIDIA-GeForce-GTX-1080
-                      - NVIDIA-GeForce-GTX-1080-Ti
-                      - Quadro-M4000
-                      - Tesla-V100-PCIE-16GB
-                      - Tesla-V100-SXM2-16GB
-                      - Tesla-V100-SXM2-32GB
-                      - NVIDIA-GeForce-RTX-2080-Ti
-                      - NVIDIA-TITAN-RTX
                   - key: kubernetes.io/hostname
                     operator: NotIn
                     values:
@@ -87,11 +84,12 @@ spec:
                 --goalstep_json "$GOALSTEP" \
                 --video_cache_dir /data/vans_work_ego4d_qa/raw_videos \
                 --limit_videos 20 \
+                --skip_phase2 \
                 --output_qa_split /data/raw_data/qa_split_ego4d.json \
                 --clips_root /data/vans_work_ego4d_qa/clips \
                 --vjepa_cache_dir /data/vans_work_ego4d_qa/vjepa_cache_full
 
-              echo "EGO4D_QA_FULLSCALE_DONE"
+              echo "EGO4D_QA_DOWNLOAD_ONLY_DONE"
           env:
             - name: VANS_ROOT
               value: /data
@@ -121,12 +119,10 @@ spec:
               cpu: "5"
               memory: "16Gi"
               ephemeral-storage: "4Gi"
-              nvidia.com/gpu: "1"
             limits:
               cpu: "6"
               memory: "16Gi"
               ephemeral-storage: "6Gi"
-              nvidia.com/gpu: "1"
           volumeMounts:
             - name: git-repo-code
               mountPath: /code
@@ -153,7 +149,7 @@ spec:
           emptyDir: {}
         - name: conda-storage
           persistentVolumeClaim:
-            claimName: ruixin-conda-vol-ddp
+            claimName: ruixin-conda-vol-baselines
         - name: data-storage
           persistentVolumeClaim:
             claimName: jepa-vlm-injection-data-vol
