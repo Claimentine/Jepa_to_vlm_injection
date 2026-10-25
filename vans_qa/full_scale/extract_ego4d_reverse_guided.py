@@ -154,11 +154,23 @@ def main():
 
     import torch
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] loading {args.pretrained} + hooks on layers {args.layers} ...", flush=True)
-    qwen_model, qwen_processor, qwen_saved, qwen_sha = load_qwen(args, device)
-    print(f"[INFO] loading V-JEPA2 checkpoint {args.vjepa_checkpoint} ...", flush=True)
+    # Loaded lazily, on first pair whose download actually succeeds -- not
+    # here. Ego4D downloads have a ~50% failure rate at up to 600s/attempt
+    # (confirmed this session, job-104); loading both models eagerly would
+    # hold the GPU reserved-but-idle through however many failed downloads
+    # happen before the first success, exactly the pattern that tripped
+    # job-95's own NRP idle-GPU warning (fixed there the same way, see
+    # extract_ego4d_longaxis.py's get_model()).
     vjepa_checkpoint_sha = sha256_file(Path(args.vjepa_checkpoint))
-    vjepa_model = load_vjepa_encoder(Path(args.vjepa_checkpoint), device)
+    _model_holder = {}
+
+    def get_models():
+        if "qwen" not in _model_holder:
+            print(f"[INFO] loading {args.pretrained} + hooks on layers {args.layers} ...", flush=True)
+            _model_holder["qwen"] = load_qwen(args, device)
+            print(f"[INFO] loading V-JEPA2 checkpoint {args.vjepa_checkpoint} ...", flush=True)
+            _model_holder["vjepa"] = load_vjepa_encoder(Path(args.vjepa_checkpoint), device)
+        return _model_holder["qwen"] + (_model_holder["vjepa"],)
 
     n = len(pairs)
     saved_count = skipped_count = failed_count = 0
@@ -183,6 +195,7 @@ def main():
                     download_video(video_uid, video_cache_root)
                 if not video_path.exists():
                     raise RuntimeError(f"ego4d CLI reported success but {video_path} is missing")
+                qwen_model, qwen_processor, qwen_saved, qwen_sha, vjepa_model = get_models()
 
                 past_frames, past_times = extract_window_frames(
                     video_path, pair["past_segment"][0], pair["past_segment"][1], NUM_PAST_FRAMES,
