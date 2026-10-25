@@ -4,12 +4,16 @@ correct_caption/distractor_caption) into one combined file, for a single
 --qa_split argument to point train_qa_full.py/train_joint_coupled_
 normalized.py at multiple data sources at once.
 
-Checks pid uniqueness across ALL inputs combined (not just within one
-file) before writing anything -- a silent pid collision would make two
+Checks pid uniqueness ACROSS INPUT FILES (not within one) before writing
+anything -- a pid shared by two different source files would make two
 different items indistinguishable to anything that indexes by pid (e.g.
 the reverse side's cache lookup), which is exactly the kind of bug that
 stays invisible until a training run's numbers look wrong for no visible
-reason.
+reason. Deliberately does NOT flag a pid repeated within a single input
+file -- qa_split_temporal.json's own val/test rows intentionally repeat
+each anchor's pid twice (difficulty="easy"/"hard" variants, see
+build_qa_pairs_temporal.py's docstring), which is a legitimate existing
+convention, not a bug to catch here.
 """
 import argparse
 import json
@@ -24,8 +28,7 @@ def main():
     args = ap.parse_args()
 
     merged = {"train": [], "val": [], "test": []}
-    all_pids = Counter()
-    per_file_counts = []
+    pid_source_files = {}  # pid -> set of input file paths it appeared in
     for path in args.inputs:
         with open(path) as f:
             split = json.load(f)
@@ -34,14 +37,15 @@ def main():
             items = split.get(part, [])
             counts[part] = len(items)
             merged[part].extend(items)
-            all_pids.update(item["pid"] for item in items)
-        per_file_counts.append((path, counts))
+            for item in items:
+                pid_source_files.setdefault(item["pid"], set()).add(path)
         print(f"[INFO] {path}: {counts}", flush=True)
 
-    dupes = {pid: n for pid, n in all_pids.items() if n > 1}
-    if dupes:
-        print(f"[ERROR] {len(dupes)} pid(s) appear in more than one input file -- refusing to write a "
-              f"merged file with ambiguous pids. First few: {list(dupes.items())[:10]}", file=sys.stderr)
+    cross_file_dupes = {pid: paths for pid, paths in pid_source_files.items() if len(paths) > 1}
+    if cross_file_dupes:
+        print(f"[ERROR] {len(cross_file_dupes)} pid(s) appear in more than one INPUT FILE -- refusing to "
+              f"write a merged file with ambiguous pids. First few: "
+              f"{[(pid, sorted(paths)) for pid, paths in list(cross_file_dupes.items())[:10]]}", file=sys.stderr)
         sys.exit(1)
 
     with open(args.out, "w") as f:
