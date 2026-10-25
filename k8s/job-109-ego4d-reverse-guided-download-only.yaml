@@ -20,6 +20,13 @@
 # Tomorrow: rerun the SAME commands below with --download_only removed
 # (and a GPU request added back) to do the actual VJEPA/Qwen extraction
 # -- download_video() no-ops for every video already on disk.
+#
+# UPDATED 2026-10-25: first overnight attempt (serial downloads) did only
+# ~76 unique videos in 11 hours -- on pace for ~2 weeks to reach this
+# target. extract_ego4d_reverse_guided.py's --download_only now downloads
+# --download_concurrency (16) videos at once; bumped cpu/memory requests
+# accordingly. Already-downloaded videos from the first attempt are
+# skipped (video_path.exists() check), not re-fetched.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -133,13 +140,13 @@ spec:
                   key: AWS_DEFAULT_REGION
           resources:
             requests:
-              cpu: "4"
-              memory: "12Gi"
-              ephemeral-storage: "4Gi"
-            limits:
-              cpu: "4"
-              memory: "12Gi"
+              cpu: "8"
+              memory: "16Gi"
               ephemeral-storage: "6Gi"
+            limits:
+              cpu: "8"
+              memory: "16Gi"
+              ephemeral-storage: "8Gi"
           volumeMounts:
             - name: git-repo-code
               mountPath: /code
