@@ -1,0 +1,149 @@
+# Step 111: Ego4D NARRATION-based forward QA data -- a 7th forward
+# benchmark/training-data source alongside job-104's GoalStep version.
+# Points --video_cache_dir at job-109's own narration raw_videos
+# directory (reverse-guided pipeline, ~266GB already downloaded) so this
+# reuses that pool directly instead of downloading its own separate
+# copy -- the whole reason extract_ego4d_qa.py gained narration support
+# (see its own module docstring). --no_download is NOT set, so this can
+# still grow the shared pool for any video not already there, up to
+# --limit_videos.
+#
+# --pairs_per_video 5 (narration-specific default) keeps a few
+# heavily-narrated videos from dominating the candidate pool --
+# narration is dense (dozens to hundreds of points per video) unlike
+# GoalStep's handful of high-level steps.
+#
+# --skip_phase2, no GPU requested -- same reasoning as job-104/job-109
+# (Ego4D's ~50% per-download-attempt failure rate means a GPU-holding
+# pod would sit idle for hours; see their own docstrings). Rerun without
+# --skip_phase2 (and with a GPU request) tomorrow to do the VJEPA
+# encoding over the already-downloaded/trimmed clips.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-ego4d-qa-narration
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - k8s-chase-ci-01.calit2.optiputer.net
+                      - nrp-g1.nysernet.org
+                      - hcc-nrp-shor-c5813.unl.edu
+                      - k8s-gpu-01.calit2.optiputer.net
+                      - k8s-chase-ci-03.calit2.optiputer.net
+                      - k8s-gen4-05.calit2.optiputer.net
+                      - hcc-nrp-shor-c6017.unl.edu
+                      - hcc-nrp-shor-c5805.unl.edu
+      containers:
+        - name: ego4d-qa-narration
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+
+              "$PY" -m pip install --quiet ego4d
+              export PATH="$(dirname "$PY"):$PATH"
+
+              NARRATION=$(find /data/raw_data/ego4d_annotations -iname "narration.json" | head -1)
+              echo "using narration annotations: $NARRATION"
+
+              mkdir -p /data/vans_work_ego4d_qa_narration
+              "$PY" vans_qa/full_scale/extract_ego4d_qa.py \
+                --annotation_source narration \
+                --narration_json "$NARRATION" \
+                --video_cache_dir /data/vans_work_ego4d_reverse_guided/raw_videos_narration \
+                --min_gap_seconds 10 \
+                --max_gap_seconds 60 \
+                --window_seconds 8.0 \
+                --pairs_per_video 5 \
+                --limit_videos 60 \
+                --skip_phase2 \
+                --output_qa_split /data/raw_data/qa_split_ego4d_narration.json \
+                --clips_root /data/vans_work_ego4d_qa_narration/clips \
+                --vjepa_cache_dir /data/vans_work_ego4d_qa_narration/vjepa_cache_full
+
+              echo "EGO4D_QA_NARRATION_DOWNLOAD_ONLY_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: VJEPA2_CKPT
+              value: /data/checkpoints/vjepa2/vitl.pt
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_DEFAULT_REGION
+          resources:
+            requests:
+              cpu: "5"
+              memory: "16Gi"
+              ephemeral-storage: "4Gi"
+            limits:
+              cpu: "6"
+              memory: "16Gi"
+              ephemeral-storage: "6Gi"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-111-ego4d-qa-narration.yaml -n williamli-scvl
