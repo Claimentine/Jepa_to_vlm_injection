@@ -33,10 +33,28 @@
 # 3 times before ever scheduling, and A100/H100 are the most contended cards
 # on this cluster; narrowing to them for a memory fix that the namespace caps
 # at 32Gi regardless of node size would only add queue risk for zero benefit.
+#
+# UPDATED 2026-10-26 (round 3): round 2 ALSO failed 3/3 pods, each killed by
+# genuine system-level ENOMEM (OpenCV/decord/ffmpeg failing to even read a
+# file header with "Cannot allocate memory" / std::bad_alloc -- not the
+# worker's own RLIMIT_AS tripping, since these failures happen before a
+# worker gets anywhere near real decode work). Root cause: torchrun
+# --nproc_per_node=2 makes EACH DDP rank independently
+# AutoModelForImageTextToText.from_pretrained() its own full copy of
+# Qwen3-VL-2B (train_joint_coupled_normalized.py has no model sharding --
+# freezing its params saves optimizer memory, not the weights themselves),
+# so two full model copies are already resident before a single decode
+# worker ever spawns, leaving ~no headroom under the hard 32Gi/pod cap.
+# train_joint_coupled_normalized.py explicitly supports single-process mode
+# (falls back cleanly when WORLD_SIZE is unset/1 -- see its own docstring),
+# so this round drops to --nproc_per_node=1 / nvidia.com/gpu: "1" to
+# eliminate the duplicate model copy entirely, at the cost of ~2x wall
+# time (no inter-GPU data parallelism). Reliability over speed, given two
+# full failed attempts (22h then ~2h) with zero forward-branch progress.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: ruixin-train-merged-vans-youcook2-round2
+  name: ruixin-train-merged-vans-youcook2-round3
 spec:
   backoffLimit: 2
   template:
@@ -74,7 +92,7 @@ spec:
                       - k8s-gen4-05.calit2.optiputer.net
                       - hcc-nrp-shor-c6017.unl.edu
       containers:
-        - name: train-merged-vans-youcook2-round2
+        - name: train-merged-vans-youcook2-round3
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
           command:
             - "bash"
@@ -94,8 +112,8 @@ spec:
 
               cd "$REPO"
               nvidia-smi --query-gpu=index,name,memory.total --format=csv
-              mkdir -p /data/raw_data/joint_coupled_merged_v1_runs_round2
-              torchrun --standalone --nproc_per_node=2 \
+              mkdir -p /data/raw_data/joint_coupled_merged_v1_runs_round3
+              torchrun --standalone --nproc_per_node=1 \
                 vans_qa/full_scale/train_joint_coupled_normalized.py \
                 --qa_split /data/raw_data/qa_split_merged_v1.json \
                 --disable_norm \
@@ -105,8 +123,8 @@ spec:
                 --val_every_steps 500 \
                 --save_every_steps 1000 \
                 --max_val_items 100 \
-                --out_dir /data/raw_data/joint_coupled_merged_v1_runs_round2 2>&1 \
-                | tee /data/raw_data/joint_coupled_merged_v1_runs_round2/full_run.log
+                --out_dir /data/raw_data/joint_coupled_merged_v1_runs_round3 2>&1 \
+                | tee /data/raw_data/joint_coupled_merged_v1_runs_round3/full_run.log
           env:
             - name: VANS_ROOT
               value: /data
@@ -124,15 +142,15 @@ spec:
               value: expandable_segments:True
           resources:
             requests:
-              cpu: "10"
+              cpu: "6"
               memory: "28Gi"
               ephemeral-storage: "2Gi"
-              nvidia.com/gpu: "2"
+              nvidia.com/gpu: "1"
             limits:
-              cpu: "12"
+              cpu: "8"
               memory: "32Gi"
               ephemeral-storage: "2400Mi"
-              nvidia.com/gpu: "2"
+              nvidia.com/gpu: "1"
           volumeMounts:
             - name: git-repo-code
               mountPath: /code
@@ -177,4 +195,4 @@ spec:
 # Apply with:
 #   kubectl apply -f job-107-train-merged-vans-youcook2.yaml -n williamli-scvl
 # Watch it:
-#   kubectl logs -f job/ruixin-train-merged-vans-youcook2-round2 -n williamli-scvl
+#   kubectl logs -f job/ruixin-train-merged-vans-youcook2-round3 -n williamli-scvl

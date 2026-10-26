@@ -37,6 +37,15 @@
 # (vlm_old/vlm_new/vjepa_input_feats/vjepa_target_feats) that
 # train_joint_coupled_normalized.py's --cache_dir/--rev_qa_split actually
 # need -- the download-only pass deliberately produced none of these.
+#
+# UPDATED 2026-10-26 (round 3): round 2's 16Gi/16Gi memory was too tight for
+# this single-process Qwen3-VL-2B + VJEPA2 extraction load -- OOMKilled 3/3
+# pod attempts (confirmed via containerStatus.lastState.terminated.reason:
+# OOMKilled, exitCode 137), after reaching 826/6900 narration npz (resumable
+# via the existing npz-exists skip check -- no re-download, no re-encode of
+# already-cached pairs). Raised to 28Gi/32Gi, the namespace's hard
+# per-pod/per-container LimitRange ceiling (see job-107's own round-2/3
+# comments for how that ceiling was discovered).
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -164,12 +173,12 @@ spec:
           resources:
             requests:
               cpu: "5"
-              memory: "16Gi"
+              memory: "28Gi"
               ephemeral-storage: "6Gi"
               nvidia.com/gpu: "1"
             limits:
               cpu: "6"
-              memory: "16Gi"
+              memory: "32Gi"
               ephemeral-storage: "8Gi"
               nvidia.com/gpu: "1"
           volumeMounts:
