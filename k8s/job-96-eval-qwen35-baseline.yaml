@@ -31,6 +31,12 @@
 # ~230 items fall back to live decode automatically, same mechanism as any
 # other uncached item); COIN stage will come back once job-97's
 # newly-added COIN precompute stage has real coverage to test against.
+#
+# Also moved off ruixin-conda-vol-baselines onto its own clone
+# (ruixin-conda-vol-baselines2, see pvc-conda-rbd-baselines2.yaml): job-96
+# and job-97 both touch Qwen3.5-9B baseline data but need to run
+# concurrently, and sharing the original RWO PVC caused a real
+# Multi-Attach failure the first time this was tried.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -152,7 +158,7 @@ spec:
           emptyDir: {}
         - name: conda-storage
           persistentVolumeClaim:
-            claimName: ruixin-conda-vol-baselines
+            claimName: ruixin-conda-vol-baselines2
         - name: data-storage
           persistentVolumeClaim:
             claimName: jepa-vlm-injection-data-vol

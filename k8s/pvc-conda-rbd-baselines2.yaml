@@ -1,0 +1,30 @@
+# Second conda-envs clone for A2 baseline work, cloned from
+# ruixin-conda-vol (same source pvc-conda-rbd-baselines.yaml itself used).
+# job-96 (GPU eval) and job-97 (CPU precompute) both touch Qwen3.5-9B
+# baseline data but are genuinely separate workloads that need to run
+# concurrently (job-96 testing against job-97's current/in-progress cache
+# coverage, not waiting for it to finish) -- sharing one RWO
+# ruixin-conda-vol-baselines PVC between them caused a real Multi-Attach
+# failure (job-96's pod couldn't attach while job-97's pod already had it).
+# This gives job-96 its own lock, same ~15s RBD clone cost as the original.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ruixin-conda-vol-baselines2
+spec:
+  storageClassName: rook-ceph-block
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  dataSource:
+    kind: PersistentVolumeClaim
+    name: ruixin-conda-vol
+
+# Apply with:
+#   kubectl apply -f pvc-conda-rbd-baselines2.yaml -n williamli-scvl
+#
+# Reminder (Golden Rule #2): this is active-computation storage, not archival.
+# A PVC untouched for 6 months can be purged without notice -- move final
+# results to lab-approved long-term storage when a project wraps up.
