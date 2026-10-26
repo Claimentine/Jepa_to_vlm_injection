@@ -19,6 +19,18 @@
 # its own final benchmark; job-95: expected to run for days) -- confirmed
 # no PVC-count/storage-total quota blocks this (namespace ResourceQuota
 # has no such entry) and GPU quota has headroom (4/10 used).
+#
+# UPDATED 2026-10-26: this job never produced output -- root cause found:
+# the CrossTask stage's --precompute_cache_dir below pointed at
+# eval_input_cache_crosstask (the shared/own-model cache, job-63), NOT
+# job-97's own eval_input_cache_crosstask_qwen35 -- wrong processor's
+# tensors entirely, likely crashed or silently corrupted every item. Fixed
+# to point at the correct, qwen35-suffixed cache dir. COIN stage REMOVED
+# for this round -- per explicit user decision, test CrossTask first
+# against job-97's current cache coverage (1328/1558, 85% -- the remaining
+# ~230 items fall back to live decode automatically, same mechanism as any
+# other uncached item); COIN stage will come back once job-97's
+# newly-added COIN precompute stage has real coverage to test against.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -74,26 +86,13 @@ spec:
               # copies on the other three conda-vols.
               "$PY" -m pip install --quiet --upgrade transformers accelerate
 
-              echo "=== COIN full-test (Qwen3.5-9B zero-shot) ==="
-              export VANS_WORK_ROOT=/data/vans_work
-              mkdir -p "$VANS_WORK_ROOT"
-              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
-              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
-              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
-                --model_id "$MODEL_ID" \
-                --qa_split /data/raw_data/qa_split_temporal.json \
-                --split_part test \
-                --checkpoint zeroshot_qwen35=NONE \
-                --resume \
-                --out_path /data/raw_data/a2_baseline_qwen35_coin.json
-
               echo "=== CrossTask (Qwen3.5-9B zero-shot) ==="
               export VANS_WORK_ROOT=/data/vans_work_crosstask
               "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
                 --model_id "$MODEL_ID" \
                 --qa_split /data/raw_data/qa_split_crosstask.json \
                 --split_part test \
-                --precompute_cache_dir /data/vans_work_crosstask/eval_input_cache_crosstask \
+                --precompute_cache_dir /data/vans_work_crosstask/eval_input_cache_crosstask_qwen35 \
                 --checkpoint zeroshot_qwen35=NONE \
                 --resume \
                 --out_path /data/raw_data/a2_baseline_qwen35_crosstask.json

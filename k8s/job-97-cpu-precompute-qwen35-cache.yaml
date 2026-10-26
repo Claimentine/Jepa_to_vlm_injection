@@ -39,6 +39,17 @@
 # line output (prints every 200 items), pointing at a slower cumulative
 # memory creep across many items rather than one bad clip. Dropping
 # --prefetch_depth to 2 as a further precaution.
+#
+# UPDATED 2026-10-26 (round 2): CrossTask stalled at 1328/1558 (85%) -- per
+# explicit user decision, accepted as-is (eval_forward_checkpoint.py falls
+# back to live decode for any uncached item, same as job-63/job-99's
+# accepted CrossTask/MVBench progress), not resumed further here. COIN
+# stage re-added: storage subtree confirmed recovered (job-102's own
+# 2026-10-24 recheck, 8/8 readable; spot-checked again today, 16/16
+# readable), own-model COIN cache (job-102) also resuming in parallel.
+# Separate cache_dir (eval_input_cache_coin_qwen35) from job-102's own
+# COIN cache -- same reasoning as the CrossTask split: different processor,
+# different tensors, must not share a cache_dir.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -62,19 +73,26 @@ spec:
               cd "$REPO"
               "$PY" -m pip install --quiet --upgrade transformers
 
-              # COIN stage temporarily skipped (2026-10-25): its storage subtree
-              # (vans_injection_backup) is still badly degraded (~1/8 sampled
-              # files readable) while CrossTask's own subtree has recovered
-              # (8/8 readable) -- CrossTask-only for now, re-add COIN once
-              # confirmed healthy again (see job-98's own matching change).
-
-              echo "=== CrossTask precompute cache (Qwen3.5-9B) ==="
+              echo "=== CrossTask precompute cache (Qwen3.5-9B) -- top-up only ==="
               export VANS_WORK_ROOT=/data/vans_work_crosstask
               "$PY" vans_qa/full_scale/build_eval_input_cache.py \
                 --model_id "$MODEL_ID" \
                 --qa_split /data/raw_data/qa_split_crosstask.json \
                 --split_part test \
                 --cache_dir /data/vans_work_crosstask/eval_input_cache_crosstask_qwen35 \
+                --num_shards 1 --shard_idx 0 \
+                --prefetch_depth 2
+
+              echo "=== COIN precompute cache (Qwen3.5-9B) ==="
+              export VANS_WORK_ROOT=/data/vans_work
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+              "$PY" vans_qa/full_scale/build_eval_input_cache.py \
+                --model_id "$MODEL_ID" \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --split_part test \
+                --cache_dir /data/vans_work/eval_input_cache_coin_qwen35 \
                 --num_shards 1 --shard_idx 0 \
                 --prefetch_depth 2
 
