@@ -147,7 +147,7 @@ spec:
               ephemeral-storage: "2Gi"
               nvidia.com/gpu: "1"
             limits:
-              cpu: "8"
+              cpu: "7"
               memory: "32Gi"
               ephemeral-storage: "2400Mi"
               nvidia.com/gpu: "1"
