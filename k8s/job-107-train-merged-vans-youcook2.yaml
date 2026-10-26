@@ -11,10 +11,32 @@
 # No checkpoint-resume support exists in train_joint_coupled_normalized.py,
 # so this is a from-scratch run (same as job-72 itself was relative to
 # job-42), written to its own output dir.
+#
+# UPDATED 2026-10-26 (round 2): first attempt completed 22h/6688 steps with
+# ZERO forward-branch gradient the ENTIRE run (fwd_items_skipped ==
+# steps_completed from step 1 -- see train_log.jsonl, no fwd_loss field
+# ever) -- every forward item hit a decode failure. Root cause: each
+# decode runs in a fresh spawn()'d worker capped at
+# DECODE_WORKER_MEMORY_LIMIT_BYTES (train_qa_full.py), which was 4GB --
+# tuned against one malformed clip (job-97), not against this run's own
+# baseline overhead (importing torch+CUDA in a fresh interpreter alone
+# eats a few GB of virtual address space before any real decode work).
+# Raised that cap to 6GB.
+#
+# NOT raised further, and this pod's own memory request/limit only moved
+# 27Gi/31.5Gi -> 28Gi/32Gi (barely above before): this namespace enforces a
+# hard 32Gi per-pod/per-container memory LimitRange regardless of node
+# capacity (confirmed the hard way -- a first attempt at 96Gi/115Gi got every
+# pod-create rejected: "maximum memory usage per Pod is 32Gi"). GPU node
+# affinity deliberately left as a broad exclusion list (NOT narrowed to
+# A100/H100) -- job-107's own first attempt spent 4+ hours queued and failed
+# 3 times before ever scheduling, and A100/H100 are the most contended cards
+# on this cluster; narrowing to them for a memory fix that the namespace caps
+# at 32Gi regardless of node size would only add queue risk for zero benefit.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: ruixin-train-merged-vans-youcook2
+  name: ruixin-train-merged-vans-youcook2-round2
 spec:
   backoffLimit: 2
   template:
@@ -52,7 +74,7 @@ spec:
                       - k8s-gen4-05.calit2.optiputer.net
                       - hcc-nrp-shor-c6017.unl.edu
       containers:
-        - name: train-merged-vans-youcook2
+        - name: train-merged-vans-youcook2-round2
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
           command:
             - "bash"
@@ -72,7 +94,7 @@ spec:
 
               cd "$REPO"
               nvidia-smi --query-gpu=index,name,memory.total --format=csv
-              mkdir -p /data/raw_data/joint_coupled_merged_v1_runs
+              mkdir -p /data/raw_data/joint_coupled_merged_v1_runs_round2
               torchrun --standalone --nproc_per_node=2 \
                 vans_qa/full_scale/train_joint_coupled_normalized.py \
                 --qa_split /data/raw_data/qa_split_merged_v1.json \
@@ -83,8 +105,8 @@ spec:
                 --val_every_steps 500 \
                 --save_every_steps 1000 \
                 --max_val_items 100 \
-                --out_dir /data/raw_data/joint_coupled_merged_v1_runs 2>&1 \
-                | tee /data/raw_data/joint_coupled_merged_v1_runs/full_run.log
+                --out_dir /data/raw_data/joint_coupled_merged_v1_runs_round2 2>&1 \
+                | tee /data/raw_data/joint_coupled_merged_v1_runs_round2/full_run.log
           env:
             - name: VANS_ROOT
               value: /data
@@ -103,12 +125,12 @@ spec:
           resources:
             requests:
               cpu: "10"
-              memory: "27Gi"
+              memory: "28Gi"
               ephemeral-storage: "2Gi"
               nvidia.com/gpu: "2"
             limits:
               cpu: "12"
-              memory: "31500Mi"
+              memory: "32Gi"
               ephemeral-storage: "2400Mi"
               nvidia.com/gpu: "2"
           volumeMounts:
@@ -155,4 +177,4 @@ spec:
 # Apply with:
 #   kubectl apply -f job-107-train-merged-vans-youcook2.yaml -n williamli-scvl
 # Watch it:
-#   kubectl logs -f job/ruixin-train-merged-vans-youcook2 -n williamli-scvl
+#   kubectl logs -f job/ruixin-train-merged-vans-youcook2-round2 -n williamli-scvl

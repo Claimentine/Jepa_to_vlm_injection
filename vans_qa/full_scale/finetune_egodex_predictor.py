@@ -96,7 +96,8 @@ def load_predictor_for_finetune(label, device):
     return predictor, bridge
 
 
-def train_epoch(predictor, loader, device, optimizer, max_batches=None, grad_accum_steps=1):
+def train_epoch(predictor, loader, device, optimizer, max_batches=None, grad_accum_steps=1,
+                 sl1_weight=0.0, cd_weight=0.0):
     """One DataLoader batch (--batch_size samples) is the true effective
     batch size for a single optimizer step -- all samples' forward passes
     are concatenated into one pred_stack/target_stack before ONE loss/
@@ -134,11 +135,25 @@ def train_epoch(predictor, loader, device, optimizer, max_batches=None, grad_acc
                 target_list.append(s["target_latent"])
             pred_stack = torch.cat(pred_list, dim=0)
             target_stack = torch.cat(target_list, dim=0)
-        # Exactly ThinkJEPA's own pred_loss term (thinker_train.py:
-        # F.mse_loss(pred_latent, target_latent)) -- no SL1/cosine weighting
-        # here, so the resulting FD/SL1/CD are judged under the identical
-        # objective their own reference number was optimized for.
-        loss = F.mse_loss(pred_stack, target_stack)
+        # Base term is exactly ThinkJEPA's own pred_loss (thinker_train.py:
+        # F.mse_loss(pred_latent, target_latent)) -- rounds 1-2 used this
+        # alone, matching their training objective exactly. Round 3 (per
+        # user request, chasing a bigger drop in FD/SL1/CD rather than a
+        # clean apples-to-apples match to their formula) adds SL1 and
+        # cosine-distance directly into the loss at small weight: MSE's
+        # gradient geometry isn't identical to smooth-L1's (L1-like in its
+        # large-residual regime, unlike MSE's quadratic) or to cosine
+        # distance's (direction-only, magnitude-invariant), so optimizing
+        # MSE alone leaves some SL1/CD improvement on the table that
+        # directly including them can capture. Both default to 0.0 (off,
+        # reproduces rounds 1-2's exact loss) unless passed on the CLI.
+        mse = F.mse_loss(pred_stack, target_stack)
+        loss = mse
+        if sl1_weight:
+            loss = loss + sl1_weight * F.smooth_l1_loss(pred_stack, target_stack)
+        if cd_weight:
+            cos_sim = F.cosine_similarity(pred_stack, target_stack, dim=-1, eps=1e-8).mean()
+            loss = loss + cd_weight * (1.0 - cos_sim)
         (loss / grad_accum_steps).backward()
         if (bi + 1) % grad_accum_steps == 0:
             optimizer.step()
@@ -200,6 +215,21 @@ def main():
                           "random init -- a probe-head-scale LR (1e-3, see "
                           "probe_egodex_reverse_adapter.py's --probe_lr) would likely destroy the "
                           "pretrained weights in a few steps.")
+    ap.add_argument("--lr_min", type=float, default=None,
+                     help="when set, applies a CosineAnnealingLR schedule over --epochs from --lr "
+                          "down to --lr_min (stepped once per epoch). Rounds 1-2 used a constant "
+                          "--lr the whole time; per-epoch improvement visibly decelerated by the "
+                          "end of round 2 (consistent with a fixed step size overshooting near a "
+                          "local optimum), so round 3 decays it instead. Default None = constant LR, "
+                          "reproduces rounds 1-2's behavior exactly.")
+    ap.add_argument("--sl1_weight", type=float, default=0.0,
+                     help="weight on an added F.smooth_l1_loss(pred,target) term in the training "
+                          "loss, on top of the base MSE term -- see train_epoch's own comment for "
+                          "why. 0.0 (default) reproduces rounds 1-2's pure-MSE loss exactly.")
+    ap.add_argument("--cd_weight", type=float, default=0.0,
+                     help="weight on an added (1 - cosine_similarity) term in the training loss, "
+                          "on top of the base MSE term -- see train_epoch's own comment for why. "
+                          "0.0 (default) reproduces rounds 1-2's pure-MSE loss exactly.")
     ap.add_argument("--max_train_batches", type=int, default=None, help="smoke-test cap")
     ap.add_argument("--max_test_batches", type=int, default=None, help="smoke-test cap")
     ap.add_argument("--save_path", required=True,
@@ -217,20 +247,28 @@ def main():
     if bridge is not None:
         params += list(bridge.parameters())
     optimizer = torch.optim.AdamW(params, lr=args.lr)
+    scheduler = None
+    if args.lr_min is not None:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=args.lr_min)
 
     fd0, sl10, cd0, n0 = evaluate_latent_metrics(predictor, test_loader, device, max_batches=args.max_test_batches)
     print(f"[epoch 0/before fine-tune] TEST n={n0} FD={fd0:.6f} SL1={sl10:.6f} CD={cd0:.6f}", flush=True)
     history = [{"epoch": 0, "FD": fd0, "SL1": sl10, "CD": cd0, "n_test": n0}]
 
     for epoch in range(args.epochs):
+        cur_lr = optimizer.param_groups[0]["lr"]
         train_loss = train_epoch(predictor, train_loader, device, optimizer,
                                   max_batches=args.max_train_batches,
-                                  grad_accum_steps=args.grad_accum_steps)
+                                  grad_accum_steps=args.grad_accum_steps,
+                                  sl1_weight=args.sl1_weight, cd_weight=args.cd_weight)
+        if scheduler is not None:
+            scheduler.step()
         fd, sl1, cd, n_test = evaluate_latent_metrics(predictor, test_loader, device,
                                                         max_batches=args.max_test_batches)
-        print(f"[epoch {epoch+1}/{args.epochs}] train_pred_mse={train_loss:.6f} "
+        print(f"[epoch {epoch+1}/{args.epochs}] lr={cur_lr:.3e} train_loss={train_loss:.6f} "
               f"TEST n={n_test} FD={fd:.6f} SL1={sl1:.6f} CD={cd:.6f}", flush=True)
-        history.append({"epoch": epoch + 1, "train_pred_mse": train_loss,
+        history.append({"epoch": epoch + 1, "lr": cur_lr, "train_loss": train_loss,
                          "FD": fd, "SL1": sl1, "CD": cd, "n_test": n_test})
 
     save_payload = {"predictor_state": predictor.state_dict(), "checkpoint_source": args.checkpoint}

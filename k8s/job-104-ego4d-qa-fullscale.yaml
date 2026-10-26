@@ -36,10 +36,16 @@
 # instead of each downloading its own separate copy. --limit_videos
 # bumped 20->60 to pull more forward QA data now that there's a shared
 # pool to draw from.
+#
+# UPDATED 2026-10-26 (round 3, PHASE 2): --skip_phase2 removed, GPU
+# request restored. 3717 clips already trimmed on disk from round 2's
+# CPU-only pass -- phase 1 short-circuits on them (in_clip/out_clip
+# already exist) and this round only does the VJEPA encoding into
+# vjepa_cache_full, which round 2 deliberately left empty.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: ruixin-ego4d-qa-fullscale
+  name: ruixin-ego4d-qa-fullscale-extract
 spec:
   backoffLimit: 2
   template:
@@ -69,6 +75,19 @@ spec:
                       # (job-95, on a different node, keeps succeeding at a
                       # normal rate concurrently)
                       - hcc-nrp-shor-c5805.unl.edu
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
       containers:
         - name: ego4d-qa-fullscale
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
@@ -93,7 +112,6 @@ spec:
                 --goalstep_json "$GOALSTEP" \
                 --video_cache_dir /data/vans_work_ego4d_reverse_guided/raw_videos_goalstep \
                 --limit_videos 60 \
-                --skip_phase2 \
                 --output_qa_split /data/raw_data/qa_split_ego4d.json \
                 --clips_root /data/vans_work_ego4d_qa/clips \
                 --vjepa_cache_dir /data/vans_work_ego4d_qa/vjepa_cache_full
@@ -128,10 +146,12 @@ spec:
               cpu: "5"
               memory: "16Gi"
               ephemeral-storage: "4Gi"
+              nvidia.com/gpu: "1"
             limits:
               cpu: "6"
               memory: "16Gi"
               ephemeral-storage: "6Gi"
+              nvidia.com/gpu: "1"
           volumeMounts:
             - name: git-repo-code
               mountPath: /code

@@ -27,10 +27,20 @@
 # --download_concurrency (16) videos at once; bumped cpu/memory requests
 # accordingly. Already-downloaded videos from the first attempt are
 # skipped (video_path.exists() check), not re-fetched.
+#
+# UPDATED 2026-10-26 (round 2, PHASE 2): downloads done -- narration
+# 2371/2425 videos ok, goalstep 535/544 ok. --download_only removed, GPU
+# request restored, --qwen_checkpoint_sha added (same SHA job-105's smoke
+# test needed -- auto-detection fails in this environment). This pass
+# does the actual VJEPA encoding + Qwen teacher-forced guidance
+# captioning per pair, producing the {pid}.npz cache files
+# (vlm_old/vlm_new/vjepa_input_feats/vjepa_target_feats) that
+# train_joint_coupled_normalized.py's --cache_dir/--rev_qa_split actually
+# need -- the download-only pass deliberately produced none of these.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: ruixin-ego4d-reverse-guided-download-only
+  name: ruixin-ego4d-reverse-guided-extract
 spec:
   backoffLimit: 2
   template:
@@ -51,8 +61,21 @@ spec:
                       - k8s-gen4-05.calit2.optiputer.net
                       - hcc-nrp-shor-c6017.unl.edu
                       - hcc-nrp-shor-c5805.unl.edu
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
       containers:
-        - name: ego4d-reverse-guided-download-only
+        - name: ego4d-reverse-guided-extract
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
           command:
             - "bash"
@@ -94,7 +117,7 @@ spec:
                 --pairs_per_video 3 \
                 --limit 6900 \
                 --eval_frac 0.13 \
-                --download_only \
+                --qwen_checkpoint_sha 33e0ad94c327808ebc7d3bbc97e78e600f1eeecd \
                 --video_cache_dir /data/vans_work_ego4d_reverse_guided/raw_videos_narration \
                 --cache_dir /data/vans_work_ego4d_reverse_guided/cache_narration \
                 --split_out /data/raw_data/qa_split_ego4d_reverse_guided_narration.json
@@ -108,12 +131,12 @@ spec:
                 --pairs_per_video 3 \
                 --limit 5750 \
                 --eval_frac 0.13 \
-                --download_only \
+                --qwen_checkpoint_sha 33e0ad94c327808ebc7d3bbc97e78e600f1eeecd \
                 --video_cache_dir /data/vans_work_ego4d_reverse_guided/raw_videos_goalstep \
                 --cache_dir /data/vans_work_ego4d_reverse_guided/cache_goalstep \
                 --split_out /data/raw_data/qa_split_ego4d_reverse_guided_goalstep.json
 
-              echo "EGO4D_REVERSE_GUIDED_DOWNLOAD_ONLY_DONE"
+              echo "EGO4D_REVERSE_GUIDED_EXTRACT_DONE"
           env:
             - name: VANS_ROOT
               value: /data
@@ -140,13 +163,15 @@ spec:
                   key: AWS_DEFAULT_REGION
           resources:
             requests:
-              cpu: "8"
+              cpu: "5"
               memory: "16Gi"
               ephemeral-storage: "6Gi"
+              nvidia.com/gpu: "1"
             limits:
-              cpu: "8"
+              cpu: "6"
               memory: "16Gi"
               ephemeral-storage: "8Gi"
+              nvidia.com/gpu: "1"
           volumeMounts:
             - name: git-repo-code
               mountPath: /code
@@ -183,4 +208,4 @@ spec:
       restartPolicy: Never
 
 # Apply with:
-#   kubectl apply -f job-109-ego4d-reverse-guided-download-only.yaml -n williamli-scvl
+#   kubectl apply -f job-109-ego4d-reverse-guided-extract-round2.yaml -n williamli-scvl

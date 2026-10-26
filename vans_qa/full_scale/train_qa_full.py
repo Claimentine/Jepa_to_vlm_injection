@@ -168,7 +168,33 @@ def _from_ipc_safe(obj):
     return obj
 
 
-DECODE_WORKER_MEMORY_LIMIT_BYTES = 4 * 1024 ** 3  # 4GB per worker
+# Raised from 4GB -- job-107 (2-GPU DDP, the merged VANS/COIN/YouCook2/Ego4D
+# qa_split, larger than any prior run's) hit 100% forward-item decode
+# failure (every single item, from step 1) with the 4GB cap: decord failed
+# first with a raw ffmpeg "error reading header" (native mmap/malloc
+# hitting the RLIMIT_AS ceiling reads as a garbled native error, not a
+# catchable Python MemoryError, at that layer), then the torchvision
+# fallback also failed (unrelated: that fallback's legacy read_video
+# metadata path is broken outright on the now-installed torchvision
+# 0.25.0 -- removed in 0.24 -- so it was never a safety net here regardless
+# of the memory headroom). A fresh spawn()'d worker importing torch+CUDA
+# bindings alone can already use a few GB of virtual address space before
+# touching a single video frame, so 4GB -- tuned against job-97's one
+# malformed-clip OOM, not against normal-case overhead -- left ~0 room for
+# actual decode work.
+#
+# Only raised to 6GB, not more: this namespace enforces a hard 32Gi
+# per-pod/per-container memory LimitRange regardless of node capacity (confirmed
+# via a rejected pod-create: "maximum memory usage per Pod is 32Gi"), and this
+# script pipelines up to ~2 decode workers in flight per GPU rank (4 total for
+# job-107's 2-rank DDP) alongside the 2 training processes' own model/activation
+# memory in that SAME 32Gi ceiling -- 10GB x 4 concurrent workers alone would
+# already exceed it. 6GB is a deliberately conservative middle ground: meaningfully
+# more breathing room than the proven-insufficient 4GB, without being able to
+# push the total pod budget higher to compensate (see the matching job-107 yaml
+# comment -- its own memory ask only moved from 27Gi/31.5Gi to 28Gi/32Gi, right at
+# this same ceiling).
+DECODE_WORKER_MEMORY_LIMIT_BYTES = 6 * 1024 ** 3  # 6GB per worker
 
 
 def _decode_video_worker(conn, abs_path, requested_frames, prompt_text):
