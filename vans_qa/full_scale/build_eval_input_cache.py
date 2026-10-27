@@ -109,11 +109,31 @@ def main():
 
     next_to_start = 0
     queue = collections.deque()
+    # Sentinel for an item whose cache file already exists -- _top_up() used
+    # to unconditionally call _start_item_decode() (spawn a full decode
+    # worker: fresh interpreter, torch/cv2/decord/qwen_vl_utils re-imported)
+    # for EVERY upcoming item, including ones the main loop was about to
+    # skip anyway via the os.path.exists() check below. For a resumed run
+    # where most items are already cached (e.g. job-102's COIN top-up,
+    # 1427/2866 already on disk) this meant paying the full decode-worker
+    # cost for ~every already-done item just to throw the result away --
+    # with --prefetch_depth concurrent workers, that's several real decodes
+    # running at once for nothing, which is what was actually driving the
+    # repeated OOMKills (and, for job-97's CrossTask top-up, the near-zero
+    # visible progress: the first ~1328 already-cached items each still
+    # paid the full spawn cost before being discarded). Fixed: check
+    # existence BEFORE queueing a decode at all.
+    _ALREADY_CACHED = object()
 
     def _top_up():
         nonlocal next_to_start
         while next_to_start < len(items) and len(queue) < args.prefetch_depth:
-            queue.append(fwd._start_item_decode(items[next_to_start], rng))
+            next_item = items[next_to_start]
+            next_out_path = fwd.precomputed_input_path(args.cache_dir, next_item.get("pid"))
+            if os.path.exists(next_out_path):
+                queue.append((True, _ALREADY_CACHED))
+            else:
+                queue.append(fwd._start_item_decode(next_item, rng))
             next_to_start += 1
 
     n_saved = n_skipped_existing = n_failed = 0
@@ -123,8 +143,7 @@ def main():
         cur_ok, cur_payload = queue.popleft()
         _top_up()
         pid = item.get("pid")
-        out_path = fwd.precomputed_input_path(args.cache_dir, pid)
-        if os.path.exists(out_path):
+        if cur_payload is _ALREADY_CACHED:
             n_skipped_existing += 1
             if i % 200 == 0:
                 print(f"[{i}/{len(items)}] saved={n_saved} skipped={n_skipped_existing} failed={n_failed}",
