@@ -77,10 +77,29 @@
 # DDP-duplication theory that motivated dropping to 1 GPU is now known to
 # be unrelated to the actual bug, so there's no reason left to pay the ~2x
 # wall-time cost of single-GPU training.
+#
+# UPDATED 2026-10-27 (round 5): round 4 never got anywhere near that --
+# confirmed stuck via live kubectl exec (nvidia-smi: 0% util / 237MiB on
+# both GPUs, i.e. nothing actually on-GPU yet; HF from_pretrained's own
+# "Loading weights" progress frozen at 220/625 for 4.5+ hours; /proc/<pid>/stat
+# showed near-100% of a CPU core continuously in SYSTEM time, not user time,
+# over a fresh 15s sampling window -- i.e. not merely slow, genuinely
+# thrashing). Root cause: --nproc_per_node=2 makes BOTH DDP ranks
+# concurrently mmap-read the SAME multi-GB safetensors shards off the
+# CephFS-backed data-storage PVC during from_pretrained -- a completely
+# different failure mode from round 3's already-debunked
+# duplicate-weights-in-RAM theory (that was about post-load memory
+# footprint; this is about concurrent page-fault traffic against one
+# network-mounted file during the load itself), and one round 3 never hit
+# since it only ever had 1 rank loading at all. Reverted to
+# --nproc_per_node=1 / nvidia.com/gpu: "1" (round 3's own resource block --
+# cpu 6/7, memory 28Gi/32Gi) to eliminate the concurrent-read contention
+# entirely; accepting the known ~2x wall-time cost again since "runs
+# correctly but slower" beats "never gets past loading weights."
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: ruixin-train-merged-vans-youcook2-round4
+  name: ruixin-train-merged-vans-youcook2-round5
 spec:
   backoffLimit: 2
   template:
@@ -118,7 +137,7 @@ spec:
                       - k8s-gen4-05.calit2.optiputer.net
                       - hcc-nrp-shor-c6017.unl.edu
       containers:
-        - name: train-merged-vans-youcook2-round4
+        - name: train-merged-vans-youcook2-round5
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
           command:
             - "bash"
@@ -138,8 +157,8 @@ spec:
 
               cd "$REPO"
               nvidia-smi --query-gpu=index,name,memory.total --format=csv
-              mkdir -p /data/raw_data/joint_coupled_merged_v1_runs_round4
-              torchrun --standalone --nproc_per_node=2 \
+              mkdir -p /data/raw_data/joint_coupled_merged_v1_runs_round5
+              torchrun --standalone --nproc_per_node=1 \
                 vans_qa/full_scale/train_joint_coupled_normalized.py \
                 --qa_split /data/raw_data/qa_split_merged_v1.json \
                 --disable_norm \
@@ -149,8 +168,8 @@ spec:
                 --val_every_steps 500 \
                 --save_every_steps 1000 \
                 --max_val_items 100 \
-                --out_dir /data/raw_data/joint_coupled_merged_v1_runs_round4 2>&1 \
-                | tee /data/raw_data/joint_coupled_merged_v1_runs_round4/full_run.log
+                --out_dir /data/raw_data/joint_coupled_merged_v1_runs_round5 2>&1 \
+                | tee /data/raw_data/joint_coupled_merged_v1_runs_round5/full_run.log
           env:
             - name: VANS_ROOT
               value: /data
@@ -168,15 +187,15 @@ spec:
               value: expandable_segments:True
           resources:
             requests:
-              cpu: "10"
+              cpu: "6"
               memory: "28Gi"
               ephemeral-storage: "2Gi"
-              nvidia.com/gpu: "2"
+              nvidia.com/gpu: "1"
             limits:
-              cpu: "12"
+              cpu: "7"
               memory: "32Gi"
               ephemeral-storage: "2400Mi"
-              nvidia.com/gpu: "2"
+              nvidia.com/gpu: "1"
           volumeMounts:
             - name: git-repo-code
               mountPath: /code
@@ -221,4 +240,4 @@ spec:
 # Apply with:
 #   kubectl apply -f job-107-train-merged-vans-youcook2.yaml -n williamli-scvl
 # Watch it:
-#   kubectl logs -f job/ruixin-train-merged-vans-youcook2-round4 -n williamli-scvl
+#   kubectl logs -f job/ruixin-train-merged-vans-youcook2-round5 -n williamli-scvl
