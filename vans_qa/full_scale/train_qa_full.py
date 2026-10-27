@@ -385,6 +385,22 @@ def candidate_logprob(model, model_inputs, tokenizer, letter):
     call_inputs = dict(model_inputs)
     call_inputs["input_ids"] = input_ids
     call_inputs["attention_mask"] = attn_mask
+    # Qwen3.5 (modeling_qwen3_5.py's get_rope_index) indexes a SEPARATE
+    # mm_token_type_ids tensor with this same attention_mask to build its 3D
+    # RoPE position ids -- the processor only emits mm_token_type_ids sized
+    # to the ORIGINAL prefix, so appending the answer letter to
+    # input_ids/attention_mask without extending this tensor too left it 1
+    # shorter than attention_mask, causing a deterministic
+    # `input_token_type[attention_mask[batch_idx].bool()]` IndexError on
+    # EVERY item (confirmed via job-96's full traceback). Qwen3-VL-2B's own
+    # processor never emits this key, so this is a no-op for that model.
+    # 0 == text token type (matches the appended letter, never
+    # image/video), consistent with append_answer_tokens's own attention
+    # mask extension (torch.ones_like) immediately above.
+    if "mm_token_type_ids" in call_inputs and torch.is_tensor(call_inputs["mm_token_type_ids"]):
+        tt = call_inputs["mm_token_type_ids"]
+        pad = torch.zeros((tt.shape[0], suffix_ids.shape[1]), dtype=tt.dtype, device=tt.device)
+        call_inputs["mm_token_type_ids"] = torch.cat([tt, pad], dim=1)
     out = model(**call_inputs)
     positions = torch.arange(prefix_len - 1, prefix_len - 1 + suffix_ids.shape[1], device=out.logits.device)
     token_logprobs = out.logits[0, positions].float().log_softmax(dim=-1)
