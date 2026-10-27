@@ -10,10 +10,12 @@
 #   - job72_step4000_best: joint_coupled_bridge_mlp_2epoch_runs/step_4000.pt
 #     (README's documented "current best").
 #
-# No precompute cache exists yet for this split (unlike YouCook2's job-100)
-# -- decodes live, same as CrossTask's original pre-job-63 runs. 1829
-# items x 4 checkpoints is a meaningful amount of CPU-decode work, but not
-# worth building a separate cache job first for a one-shot comparison run.
+# Uses job-120's precompute cache (eval_input_cache_ego4d) so this stays
+# GPU-bound across all 4 checkpoints instead of paying live decode+
+# processor cost per item 4x over -- same pattern as job-117's YouCook2 run
+# (job-100's cache) and job-73/90/114/115's CrossTask runs (job-63's
+# cache). Falls back to live decode on any individual cache miss, so this
+# is safe to run even if job-120 hasn't fully finished.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -73,6 +75,7 @@ spec:
               "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
                 --qa_split /data/raw_data/qa_split_ego4d.json \
                 --split_part test \
+                --precompute_cache_dir /data/vans_work_ego4d_qa/eval_input_cache_ego4d \
                 --checkpoint "${CKPTS[0]}" --checkpoint "${CKPTS[1]}" \
                 --checkpoint "${CKPTS[2]}" --checkpoint "${CKPTS[3]}" \
                 --resume \
