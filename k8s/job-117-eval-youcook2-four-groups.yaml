@@ -1,0 +1,157 @@
+# Step 117: YouCook2-only forward QA eval across the four comparison groups
+# requested for the paper -- zero-shot frozen Qwen3-VL-2B-Thinking,
+# content-free injection (job-09's "random"/constant-condition control),
+# forward-only injection training (job-13, independent non-joint training),
+# and the project's current best checkpoint (job-72, joint 2-epoch recipe,
+# step_4000 -- see README.md's own "current best" label). Same four labels
+# job-77 already ran on COIN/TempCompass/MVBench/CrossTask, just never on
+# YouCook2 (job-91/job-100 only just finished building that split + its
+# precompute cache: qa_split_youcook2.json has train=3676/test=636, and
+# eval_input_cache_youcook2/ already has all 636 test items cached,
+# confirmed directly on the PVC -- so this can run CPU-decode-free from the
+# start, unlike job-77 which built its CrossTask cache separately).
+#
+# Checkpoint paths (same ones job-77/job-73 already used elsewhere, nothing
+# new trained here):
+#   - zeroshot_none=NONE: no injector, no hook at all.
+#   - content_free_random: qa_full_runs_temporal/random/best.pt (learned but
+#     content-free control, the same checkpoint job-77 used on the other 4
+#     benchmarks).
+#   - forward_only_job13: qa_full_runs_temporal_crossattn/jepa/best.pt
+#     (train_qa_full.py, independent/non-joint forward-only training).
+#   - job72_step4000_best: joint_coupled_bridge_mlp_2epoch_runs/step_4000.pt
+#     (job-72's exact recipe, --epochs 2 -- README's documented "current
+#     best" row).
+#
+# --resume (like job-77) so a partial/retried run never redoes an already-
+# scored item.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-eval-youcook2-four-groups
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-01.laccd.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - dtn-gpu2.kreonet.net
+                      - hcc-chase-shor-c4705.unl.edu
+      containers:
+        - name: eval-youcook2-four-groups
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              export VANS_WORK_ROOT=/data/vans_work_youcook
+              CKPTS=(
+                "zeroshot_none=NONE"
+                "content_free_random=/data/raw_data/qa_full_runs_temporal/random/best.pt"
+                "forward_only_job13=/data/raw_data/qa_full_runs_temporal_crossattn/jepa/best.pt"
+                "job72_step4000_best=/data/raw_data/joint_coupled_bridge_mlp_2epoch_runs/step_4000.pt"
+              )
+
+              echo "=== YouCook2 full-test, 4 comparison groups ==="
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_youcook2.json \
+                --split_part test \
+                --precompute_cache_dir /data/vans_work_youcook/eval_input_cache_youcook2 \
+                --checkpoint "${CKPTS[0]}" --checkpoint "${CKPTS[1]}" \
+                --checkpoint "${CKPTS[2]}" --checkpoint "${CKPTS[3]}" \
+                --resume \
+                --out_path /data/raw_data/youcook2_forward_comparison_four_groups.json
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "19200Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-youcook
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-117-eval-youcook2-four-groups.yaml -n williamli-scvl
