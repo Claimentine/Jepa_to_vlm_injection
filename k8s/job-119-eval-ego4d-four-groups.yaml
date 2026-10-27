@@ -1,0 +1,145 @@
+# Step 119: Ego4D GoalStep forward QA eval -- the 6th forward OOD
+# benchmark (qa_split_ego4d.json, job-104, test-only, 1829 items; VJEPA
+# features already populated: 3691 files in vjepa_cache_full, confirmed
+# directly on the PVC). Same four comparison groups job-77/job-117 already
+# ran on the other five benchmarks (COIN/TempCompass/MVBench/CrossTask/
+# YouCook2), just never on Ego4D yet:
+#   - zeroshot_none: no injector, no hook at all.
+#   - content_free_random: qa_full_runs_temporal/random/best.pt.
+#   - forward_only_job13: qa_full_runs_temporal_crossattn/jepa/best.pt.
+#   - job72_step4000_best: joint_coupled_bridge_mlp_2epoch_runs/step_4000.pt
+#     (README's documented "current best").
+#
+# No precompute cache exists yet for this split (unlike YouCook2's job-100)
+# -- decodes live, same as CrossTask's original pre-job-63 runs. 1829
+# items x 4 checkpoints is a meaningful amount of CPU-decode work, but not
+# worth building a separate cache job first for a one-shot comparison run.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-eval-ego4d-four-groups
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-01.laccd.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - dtn-gpu2.kreonet.net
+                      - hcc-chase-shor-c4705.unl.edu
+      containers:
+        - name: eval-ego4d-four-groups
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              export VANS_WORK_ROOT=/data/vans_work_ego4d_qa
+              CKPTS=(
+                "zeroshot_none=NONE"
+                "content_free_random=/data/raw_data/qa_full_runs_temporal/random/best.pt"
+                "forward_only_job13=/data/raw_data/qa_full_runs_temporal_crossattn/jepa/best.pt"
+                "job72_step4000_best=/data/raw_data/joint_coupled_bridge_mlp_2epoch_runs/step_4000.pt"
+              )
+
+              echo "=== Ego4D GoalStep full-test, 4 comparison groups ==="
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_ego4d.json \
+                --split_part test \
+                --checkpoint "${CKPTS[0]}" --checkpoint "${CKPTS[1]}" \
+                --checkpoint "${CKPTS[2]}" --checkpoint "${CKPTS[3]}" \
+                --resume \
+                --out_path /data/raw_data/ego4d_forward_comparison_four_groups.json
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "19200Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-precompute
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-119-eval-ego4d-four-groups.yaml -n williamli-scvl
