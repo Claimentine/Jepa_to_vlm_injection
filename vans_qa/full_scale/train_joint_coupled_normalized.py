@@ -238,6 +238,21 @@ def main():
                           "extra torch.autograd.grad calls on bridge-only parameters per step -- "
                           "cheap relative to the full forward/backward, safe to leave on for a "
                           "full run")
+    ap.add_argument("--precompute_cache_dir", default=None,
+                     help="dir of build_eval_input_cache.py-built forward items (see that script's "
+                          "own docstring) -- the training loop does a live video decode+processor "
+                          "call for EVERY forward item on EVERY step with no caching at all (unlike "
+                          "eval_forward_checkpoint.py, which has had --precompute_cache_dir since "
+                          "job-54's own analysis), confirmed as the dominant per-step cost in "
+                          "job-107 round4/5 (GPU sits near-idle most of each step; a single step "
+                          "took 3-6 minutes despite the model itself being small). On a cache hit, "
+                          "skips build_option_block/build_prompt_text/build_inputs entirely and uses "
+                          "the pre-baked correct_letter -- falls back to the old live-decode path on "
+                          "any miss, so a partially-built cache just degrades to the current behavior "
+                          "for whichever items aren't cached yet. Tradeoff: a cached item's A/B letter "
+                          "assignment is fixed at precompute time, not re-randomized per epoch like "
+                          "the live path -- considered safe at this data scale (10k+ items, no "
+                          "realistic risk of a position-bias shortcut), but is a real behavior change.")
     ap.add_argument("--val_every_steps", type=int, default=500)
     ap.add_argument("--save_every_steps", type=int, default=1000)
     ap.add_argument("--max_val_items", type=int, default=100)
@@ -386,9 +401,15 @@ def main():
             fwd_ok = False
             pooled_jepa = None
             try:
-                option_lines, correct_letter = fwd.build_option_block(fwd_item, rng)
-                prompt_text = fwd.build_prompt_text(fwd_item["question"], option_lines)
-                inputs = fwd.build_inputs(processor, fwd_item["in_clip"], prompt_text)
+                cached = None
+                if args.precompute_cache_dir is not None:
+                    cached = fwd.load_precomputed_inputs(args.precompute_cache_dir, fwd_item.get("pid"))
+                if cached is not None:
+                    inputs, correct_letter = cached
+                else:
+                    option_lines, correct_letter = fwd.build_option_block(fwd_item, rng)
+                    prompt_text = fwd.build_prompt_text(fwd_item["question"], option_lines)
+                    inputs = fwd.build_inputs(processor, fwd_item["in_clip"], prompt_text)
                 model_inputs = fwd.prepare_model_inputs(inputs, "cross_attn", n_tokens, placeholder_id)
                 model_inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in model_inputs.items()}
                 jepa_feats = torch.from_numpy(fwd.load_vjepa_in_feats(fwd_item["in_clip"])).unsqueeze(0).to(device)

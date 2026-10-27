@@ -1,0 +1,166 @@
+# Step 123 (job-107 round6): job-72/round5's exact recipe (--disable_norm
+# --cycle_loss_weight 0 --bridge_hidden_dim 2048 --epochs 2), with the full
+# data expansion requested 2026-10-27:
+#   - forward: unchanged qa_split_merged_v1.json (VANS/COIN+YouCook2,
+#     10366 train), but now reading from job-121's precompute cache
+#     (--precompute_cache_dir) so the per-step cost drops from a live
+#     decode+processor call to a cache read -- this was confirmed as the
+#     dominant bottleneck in round4/5 (GPU near-idle, 3-6 min/step despite
+#     a small model). train_joint_coupled_normalized.py was just given
+#     this flag (previously only the eval scripts had it).
+#   - reverse: job-122's merged split (qa_split_full_merged_ego4d.json)
+#     and merged cache dir (vlm_guidance_cache_paired_merged_ego4d) --
+#     adds job-109's Ego4D reverse-guided pairs (~5000-6000, all under
+#     "train" per explicit decision) on top of the existing ~10116
+#     EgoDex-sourced pairs, finally fulfilling job-107's own original
+#     header note ("Ego4D ... deliberately NOT included this run ...
+#     queued as a follow-up continuation once they [produce usable
+#     data] do").
+#
+# --nproc_per_node=2 (matches job-72's own recipe exactly, per 2026-10-27
+# discussion -- the round4 hang theory about concurrent 2-rank safetensors
+# loading was never confirmed and more likely a one-off node/storage
+# issue, not a reason to deviate from the established recipe).
+#
+# HOLD: do not submit until BOTH job-121 (forward precompute cache) AND
+# job-122 (Ego4D reverse-data merge, itself gated on job-109 finishing)
+# have completed -- this run depends on both of their outputs existing on
+# disk before torchrun even starts.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-train-merged-vans-youcook2-ego4d-round6
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-01.laccd.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - dtn-gpu2.kreonet.net
+      containers:
+        - name: train-merged-vans-youcook2-ego4d-round6
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet h5py
+              export PATH="$(dirname "$PY"):$PATH"
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/joint_coupled_merged_v1_ego4d_runs_round6
+              torchrun --standalone --nproc_per_node=2 \
+                vans_qa/full_scale/train_joint_coupled_normalized.py \
+                --qa_split /data/raw_data/qa_split_merged_v1.json \
+                --precompute_cache_dir /data/vans_work/eval_input_cache_merged_v1_train \
+                --rev_qa_split /data/raw_data/qa_split_full_merged_ego4d.json \
+                --cache_dir /data/vans_work/vlm_guidance_cache_paired_merged_ego4d \
+                --disable_norm \
+                --cycle_loss_weight 0 \
+                --bridge_hidden_dim 2048 \
+                --epochs 2 \
+                --val_every_steps 500 \
+                --save_every_steps 1000 \
+                --max_val_items 100 \
+                --out_dir /data/raw_data/joint_coupled_merged_v1_ego4d_runs_round6 2>&1 \
+                | tee /data/raw_data/joint_coupled_merged_v1_ego4d_runs_round6/full_run.log
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+            - name: PYTORCH_ALLOC_CONF
+              value: expandable_segments:True
+          resources:
+            requests:
+              cpu: "10"
+              memory: "27Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "2"
+            limits:
+              cpu: "12"
+              memory: "31500Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "2"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with (NOT YET -- hold until job-121 AND job-122 both complete):
+#   kubectl apply -f job-123-train-merged-vans-youcook2-ego4d-round6.yaml -n williamli-scvl

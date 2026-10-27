@@ -1,0 +1,168 @@
+# Step 121: CPU-ONLY precompute cache for qa_split_merged_v1.json's full
+# TRAIN split (10366 items) -- the forward-branch data job-107/round5 is
+# training on. train_joint_coupled_normalized.py was just given
+# --precompute_cache_dir support (same load_precomputed_inputs/
+# save_precomputed_inputs machinery the eval scripts already use) --
+# confirmed via round4/5's own live GPU/CPU sampling that the live
+# per-step video decode+processor call is THE dominant cost (GPU sits
+# near-idle, 3-6 minutes/step despite a small model). Building this cache
+# ahead of time lets the next full-data training run stay GPU-bound
+# instead of decode-bound.
+#
+# 2 parallel shards (--num_shards 2, one pod each) -- only 2 conda-storage
+# PVCs were actually free at submit time (ruixin-conda-vol-baselines2,
+# ruixin-conda-vol): every other PVC was already attached to a Running or
+# Pending pod (job-109/job-115/job-116/job-118/job-84b/round5), confirmed
+# via a live `kubectl get pods -o jsonpath` sweep before writing this --
+# reusing an in-use one risks the exact Multi-Attach conflict this project
+# has hit before. Still ~2x faster than a single pod.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-cpu-precompute-merged-train-cache-s0
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      containers:
+        - name: cpu-precompute-merged-train-cache-s0
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command: ["bash"]
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              export VANS_WORK_ROOT=/data/vans_work
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+              "$PY" vans_qa/full_scale/build_eval_input_cache.py \
+                --qa_split /data/raw_data/qa_split_merged_v1.json \
+                --split_part train \
+                --cache_dir /data/vans_work/eval_input_cache_merged_v1_train \
+                --num_shards 2 --shard_idx 0
+              echo "CPU_PRECOMPUTE_MERGED_TRAIN_S0_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests: {cpu: "7", memory: "16Gi", ephemeral-storage: "4Gi"}
+            limits: {cpu: "7", memory: "16Gi", ephemeral-storage: "4800Mi"}
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-baselines2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-cpu-precompute-merged-train-cache-s1
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      containers:
+        - name: cpu-precompute-merged-train-cache-s1
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command: ["bash"]
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              export VANS_WORK_ROOT=/data/vans_work
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+              "$PY" vans_qa/full_scale/build_eval_input_cache.py \
+                --qa_split /data/raw_data/qa_split_merged_v1.json \
+                --split_part train \
+                --cache_dir /data/vans_work/eval_input_cache_merged_v1_train \
+                --num_shards 2 --shard_idx 1
+              echo "CPU_PRECOMPUTE_MERGED_TRAIN_S1_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests: {cpu: "7", memory: "16Gi", ephemeral-storage: "4Gi"}
+            limits: {cpu: "7", memory: "16Gi", ephemeral-storage: "4800Mi"}
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-121-cpu-precompute-merged-train-cache.yaml -n williamli-scvl
