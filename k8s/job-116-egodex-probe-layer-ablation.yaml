@@ -1,16 +1,19 @@
 # Step 116: C1 layer-selection ablation -- EgoDex reverse-probe
 # (ADE/FDE/acc@0.05 + FD/SL1/CD, same default no-flag mode as job-76/113)
-# on all FOUR injection-position checkpoints in one job:
+# on THREE of the four injection-position checkpoints in one job:
 #   - middle4 (job-42):   already-registered CHECKPOINTS label
 #                         "job42_bridge_mlp2048" -> best_reverse.pt
 #   - last4   (job-82):   best_reverse.pt, --layer_strategy last4
 #   - uniform4 (job-83):  best_reverse.pt, --layer_strategy uniform4
-#   - all     (job-84):   best_reverse.pt, --layer_strategy all (reverse
-#                         branch genuinely OOM-contaminated during this
-#                         checkpoint's own training -- rev_items_skipped
-#                         3319/3344, confirmed via its full_run.log -- so
-#                         expect a correspondingly bad ADE/FDE here, not a
-#                         measurement bug)
+#
+# all (job-84) deliberately SKIPPED here (2026-10-27): its reverse branch
+# was genuinely OOM-contaminated during training (rev_items_skipped
+# 3319/3344, confirmed via its full_run.log) because --layer_strategy all's
+# much larger cross-attn footprint starved the reverse predictor's own VRAM
+# -- probing that checkpoint would just measure the OOM damage, not the
+# ablation itself. job-84 is being rerun with a higher GPU memory floor
+# (job-84b, >38000 MiB instead of >16000) to get a clean checkpoint; add
+# "all" back here once that finishes.
 #
 # Converts the layer-selection ablation table's "Reverse validation" column
 # from training-time MSE snapshots (job-42: none yet; job-82: 7.52;
@@ -22,15 +25,11 @@
 # just a predictor-latent MSE that's only meaningful within this one
 # ablation.
 #
-# --checkpoints takes all four in ONE process (one model load, one GPU
+# --checkpoints takes all three in ONE process (one model load, one GPU
 # pod) -- same multi-checkpoint-in-one-job pattern as job-73/90's forward
 # evals, just for the reverse probe script instead. Each checkpoint's own
 # probe (10 epochs) + latent-metrics pass runs sequentially; expect
-# roughly 4x a single-checkpoint job-76/113 run's wall time.
-#
-# WRITTEN BUT NOT SUBMITTED per explicit user instruction (2026-10-26):
-# hold until told to apply -- intended to go out together as one batch
-# once queued alongside other in-flight work, not immediately.
+# roughly 3x a single-checkpoint job-76/113 run's wall time.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -83,7 +82,6 @@ spec:
                   job42_bridge_mlp2048 \
                   "job82_last4=/data/raw_data/ablation_layer_last4_runs/best_reverse.pt" \
                   "job83_uniform4=/data/raw_data/ablation_layer_uniform4_runs/best_reverse.pt" \
-                  "job84_all=/data/raw_data/ablation_layer_all_runs/best_reverse.pt" \
                 --joint_subset all \
                 --batch_size 4 \
                 --probe_epochs 10 \
@@ -142,5 +140,5 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       restartPolicy: Never
 
-# Apply with (NOT YET -- hold for explicit go-ahead):
+# Apply with:
 #   kubectl apply -f job-116-egodex-probe-layer-ablation.yaml -n williamli-scvl
