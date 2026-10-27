@@ -196,6 +196,13 @@ def main():
     ap.add_argument("--cache_dir", default=os.path.join(rev.WORK_BASE, "vlm_guidance_cache_paired"))
     ap.add_argument("--rev_qa_split", default=os.path.join(rev.BASE, "raw_data/qa_split_full.json"))
     ap.add_argument("--epochs", type=int, default=1)
+    ap.add_argument("--max_steps", type=int, default=None,
+                     help="stop (and run the same end-of-training test/summary block early) once "
+                          "`step` reaches this value, instead of training the full --epochs budget. "
+                          "For ablations that only need a specific checkpoint (e.g. job-72's own "
+                          "step_4000.pt, the project's 'current best' reference point) and don't need "
+                          "the rest of the run -- cheaper than training the full 2 epochs just to "
+                          "discard everything past step 4000.")
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--lr_schedule", choices=["constant", "warmup_cosine"], default="constant",
                      help="'constant' (default, unchanged from job-22/42/60/72): --lr the whole "
@@ -565,6 +572,14 @@ def main():
             )
             if is_ddp() and did_rank0_only_work:
                 dist.barrier()
+
+            if args.max_steps and step >= args.max_steps:
+                # Identical on every rank (step is incremented in lockstep,
+                # see the comment above), so every rank breaks here together
+                # -- no DDP hang risk, same reasoning as the barrier above.
+                break
+        if args.max_steps and step >= args.max_steps:
+            break
 
     if is_main:
         best_reverse_path = os.path.join(run_dir, "best_reverse.pt")

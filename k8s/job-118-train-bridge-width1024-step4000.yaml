@@ -1,0 +1,155 @@
+# Step 118: C2-style ablation -- job-72's exact recipe (--qa_split
+# qa_split_temporal.json --disable_norm --cycle_loss_weight 0 --epochs 2
+# --val_every_steps 500 --save_every_steps 1000 --max_val_items 100),
+# changing ONLY --bridge_hidden_dim 2048 -> 1024 (half the MLP width of the
+# project's "current best" recipe). job-60 already tested the OTHER
+# direction (4096, wider) and found it hurt -- forward loss plateaued at
+# ~0.68-0.70 instead of dropping, a width/optimization mismatch, not a
+# capacity win -- so this fills in the narrower side of that same lever.
+#
+# --max_steps 4000 (new flag, added to train_joint_coupled_normalized.py
+# this same commit): job-72's own "current best" reference point is
+# specifically its step_4000.pt checkpoint (see README.md), not the full
+# 2-epoch/13376-step run -- training all the way out before throwing away
+# everything past step 4000 would be pure waste for a single-checkpoint
+# ablation comparison. Stops cleanly right after step_4000.pt is saved and
+# runs the same end-of-training reverse-test/summary block early, same as
+# a full run reaching the end of --epochs normally would.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-train-bridge-width1024-step4000
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-01.laccd.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - dtn-gpu2.kreonet.net
+      containers:
+        - name: train-bridge-width1024-step4000
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet h5py
+              export PATH="$(dirname "$PY"):$PATH"
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/joint_coupled_bridge_mlp_width1024_runs
+              torchrun --standalone --nproc_per_node=1 \
+                vans_qa/full_scale/train_joint_coupled_normalized.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --disable_norm \
+                --cycle_loss_weight 0 \
+                --bridge_hidden_dim 1024 \
+                --epochs 2 \
+                --max_steps 4000 \
+                --val_every_steps 500 \
+                --save_every_steps 1000 \
+                --max_val_items 100 \
+                --out_dir /data/raw_data/joint_coupled_bridge_mlp_width1024_runs 2>&1 \
+                | tee /data/raw_data/joint_coupled_bridge_mlp_width1024_runs/full_run.log
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+            - name: PYTORCH_ALLOC_CONF
+              value: expandable_segments:True
+          resources:
+            requests:
+              cpu: "6"
+              memory: "28Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "7"
+              memory: "32Gi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-baselines
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-118-train-bridge-width1024-step4000.yaml -n williamli-scvl
+# Watch it:
+#   kubectl logs -f job/ruixin-train-bridge-width1024-step4000 -n williamli-scvl
