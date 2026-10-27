@@ -1,0 +1,146 @@
+# Step 116: C1 layer-selection ablation -- EgoDex reverse-probe
+# (ADE/FDE/acc@0.05 + FD/SL1/CD, same default no-flag mode as job-76/113)
+# on all FOUR injection-position checkpoints in one job:
+#   - middle4 (job-42):   already-registered CHECKPOINTS label
+#                         "job42_bridge_mlp2048" -> best_reverse.pt
+#   - last4   (job-82):   best_reverse.pt, --layer_strategy last4
+#   - uniform4 (job-83):  best_reverse.pt, --layer_strategy uniform4
+#   - all     (job-84):   best_reverse.pt, --layer_strategy all (reverse
+#                         branch genuinely OOM-contaminated during this
+#                         checkpoint's own training -- rev_items_skipped
+#                         3319/3344, confirmed via its full_run.log -- so
+#                         expect a correspondingly bad ADE/FDE here, not a
+#                         measurement bug)
+#
+# Converts the layer-selection ablation table's "Reverse validation" column
+# from training-time MSE snapshots (job-42: none yet; job-82: 7.52;
+# job-83: 7.52 [the real full-test number is 7.560, n=1763, zero OOM];
+# job-84: 8.54 [full-test 8.598, n=1763, but the checkpoint itself is
+# OOM-contaminated]) into the SAME ADE/FDE/acc@0.05 metric already used
+# for the project's main EgoDex table (job-15/42/60/72, see README) --
+# a trajectory-task number directly comparable across both tables, not
+# just a predictor-latent MSE that's only meaningful within this one
+# ablation.
+#
+# --checkpoints takes all four in ONE process (one model load, one GPU
+# pod) -- same multi-checkpoint-in-one-job pattern as job-73/90's forward
+# evals, just for the reverse probe script instead. Each checkpoint's own
+# probe (10 epochs) + latent-metrics pass runs sequentially; expect
+# roughly 4x a single-checkpoint job-76/113 run's wall time.
+#
+# WRITTEN BUT NOT SUBMITTED per explicit user instruction (2026-10-26):
+# hold until told to apply -- intended to go out together as one batch
+# once queued alongside other in-flight work, not immediately.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-egodex-probe-layer-ablation
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-01.laccd.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - dtn-gpu2.kreonet.net
+                      - hcc-chase-shor-c4705.unl.edu
+      containers:
+        - name: probe-layer-ablation
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/thinkjepa/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/egodex_reverse_probe_layer_ablation_full
+              "$PY" vans_qa/full_scale/probe_egodex_reverse_adapter.py \
+                --checkpoints \
+                  job42_bridge_mlp2048 \
+                  "job82_last4=/data/raw_data/ablation_layer_last4_runs/best_reverse.pt" \
+                  "job83_uniform4=/data/raw_data/ablation_layer_uniform4_runs/best_reverse.pt" \
+                  "job84_all=/data/raw_data/ablation_layer_all_runs/best_reverse.pt" \
+                --joint_subset all \
+                --batch_size 4 \
+                --probe_epochs 10 \
+                --num_workers 4 \
+                --out_json /data/raw_data/egodex_reverse_probe_layer_ablation_full/results.json \
+                2>&1 | tee /data/raw_data/egodex_reverse_probe_layer_ablation_full/full_run.log
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests: {cpu: "4", memory: "20Gi", ephemeral-storage: "2Gi", nvidia.com/gpu: "1"}
+            limits: {cpu: "4.8", memory: "24Gi", ephemeral-storage: "4Gi", nvidia.com/gpu: "1"}
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+            - name: shm
+              mountPath: /dev/shm
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with (NOT YET -- hold for explicit go-ahead):
+#   kubectl apply -f job-116-egodex-probe-layer-ablation.yaml -n williamli-scvl
