@@ -168,33 +168,29 @@ def _from_ipc_safe(obj):
     return obj
 
 
-# Raised from 4GB -- job-107 (2-GPU DDP, the merged VANS/COIN/YouCook2/Ego4D
-# qa_split, larger than any prior run's) hit 100% forward-item decode
-# failure (every single item, from step 1) with the 4GB cap: decord failed
-# first with a raw ffmpeg "error reading header" (native mmap/malloc
-# hitting the RLIMIT_AS ceiling reads as a garbled native error, not a
-# catchable Python MemoryError, at that layer), then the torchvision
-# fallback also failed (unrelated: that fallback's legacy read_video
-# metadata path is broken outright on the now-installed torchvision
-# 0.25.0 -- removed in 0.24 -- so it was never a safety net here regardless
-# of the memory headroom). A fresh spawn()'d worker importing torch+CUDA
-# bindings alone can already use a few GB of virtual address space before
-# touching a single video frame, so 4GB -- tuned against job-97's one
-# malformed-clip OOM, not against normal-case overhead -- left ~0 room for
-# actual decode work.
-#
-# Only raised to 6GB, not more: this namespace enforces a hard 32Gi
-# per-pod/per-container memory LimitRange regardless of node capacity (confirmed
-# via a rejected pod-create: "maximum memory usage per Pod is 32Gi"), and this
-# script pipelines up to ~2 decode workers in flight per GPU rank (4 total for
-# job-107's 2-rank DDP) alongside the 2 training processes' own model/activation
-# memory in that SAME 32Gi ceiling -- 10GB x 4 concurrent workers alone would
-# already exceed it. 6GB is a deliberately conservative middle ground: meaningfully
-# more breathing room than the proven-insufficient 4GB, without being able to
-# push the total pod budget higher to compensate (see the matching job-107 yaml
-# comment -- its own memory ask only moved from 27Gi/31.5Gi to 28Gi/32Gi, right at
-# this same ceiling).
-DECODE_WORKER_MEMORY_LIMIT_BYTES = 6 * 1024 ** 3  # 6GB per worker
+# UPDATED 2026-10-27: raised 4GB -> 6GB -> 20GB. The first two attempts
+# (job-107 round1/round2) both misdiagnosed this as a real memory shortage
+# and both failed identically -- even round3 (single GPU, no DDP
+# duplication at all, so no reason left to suspect contention) STILL hit
+# 100% forward-item decode failure. Direct measurement settled it: a fresh
+# spawn()'d worker's VmSize (virtual address space) after just
+# `import torch, cv2, decord, qwen_vl_utils` -- before touching any video
+# file -- is already ~8.75GB, while its VmRSS (actual resident/physical
+# memory) is ~630MB. RLIMIT_AS bounds VmSize, not RSS: CUDA/PyTorch's
+# shared-library mmaps and lazily-reserved-but-untouched address ranges
+# count fully against it even though almost none of it is real memory
+# pressure. At 4GB or 6GB, EVERY worker was hitting this ceiling from the
+# import statements alone, before any actual decode attempt -- the
+# "malformed clip" (job-97) and "DDP memory contention" (job-107 round1/2)
+# theories were both describing a symptom (decord's native allocator
+# failing with a garbled error once already at the RLIMIT_AS wall), not
+# the cause. 20GB leaves >10GB of headroom above the measured ~8.75GB
+# baseline for whatever a real decode actually needs, while staying far
+# below the namespace's 32Gi per-pod hard cap even with several workers
+# in flight (RLIMIT_AS is virtual, not real, usage -- concurrent workers
+# don't each need 20GB of ACTUAL memory, their real RSS stays in the
+# hundreds-of-MB range per the same measurement).
+DECODE_WORKER_MEMORY_LIMIT_BYTES = 20 * 1024 ** 3  # 20GB per worker (virtual address space, not RSS)
 
 
 def _decode_video_worker(conn, abs_path, requested_frames, prompt_text):

@@ -51,10 +51,36 @@
 # eliminate the duplicate model copy entirely, at the cost of ~2x wall
 # time (no inter-GPU data parallelism). Reliability over speed, given two
 # full failed attempts (22h then ~2h) with zero forward-branch progress.
+#
+# UPDATED 2026-10-27 (round 4): round 3 (single GPU, no DDP at all) ALSO
+# hit 100% forward decode failure (628 steps, zero fwd_loss) -- which
+# disproves round 3's own DDP-duplicate-model theory (no DDP left to
+# duplicate anything, same failure regardless). Root-caused for real this
+# time via direct measurement on the live round-3 pod: picked one of the
+# actually-failing clips (HsxBw6ls7Z0/523.mp4), confirmed via ffprobe it is
+# a completely valid file (clean h264+aac, 286 frames, 9s) -- ruling out
+# "malformed clip" as the cause too. Then measured a fresh spawn()'d
+# worker's own memory directly: VmSize (virtual address space) after just
+# `import torch, cv2, decord, qwen_vl_utils` -- before opening any video --
+# is already ~8.75GB, while VmRSS (actual physical memory) is ~630MB.
+# DECODE_WORKER_MEMORY_LIMIT_BYTES's RLIMIT_AS bounds VmSize, not RSS: at
+# 4GB and then 6GB, EVERY worker was hitting this self-imposed ceiling from
+# the import statements alone, before ever touching a video file -- fully
+# independent of DDP, GPU count, or real system memory pressure, which is
+# exactly why rounds 1-3's fixes (raise to 6GB, then drop to 1 GPU) both
+# did nothing. Fixed in train_qa_full.py: raised to 20GB (plenty of
+# headroom above the measured ~8.75GB baseline; still cheap even with
+# several workers in flight since RLIMIT_AS is virtual, not real, usage --
+# see that file's own comment for the full writeup).
+#
+# Reverted to --nproc_per_node=2 / nvidia.com/gpu: "2" this round: the
+# DDP-duplication theory that motivated dropping to 1 GPU is now known to
+# be unrelated to the actual bug, so there's no reason left to pay the ~2x
+# wall-time cost of single-GPU training.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: ruixin-train-merged-vans-youcook2-round3
+  name: ruixin-train-merged-vans-youcook2-round4
 spec:
   backoffLimit: 2
   template:
@@ -92,7 +118,7 @@ spec:
                       - k8s-gen4-05.calit2.optiputer.net
                       - hcc-nrp-shor-c6017.unl.edu
       containers:
-        - name: train-merged-vans-youcook2-round3
+        - name: train-merged-vans-youcook2-round4
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
           command:
             - "bash"
@@ -112,8 +138,8 @@ spec:
 
               cd "$REPO"
               nvidia-smi --query-gpu=index,name,memory.total --format=csv
-              mkdir -p /data/raw_data/joint_coupled_merged_v1_runs_round3
-              torchrun --standalone --nproc_per_node=1 \
+              mkdir -p /data/raw_data/joint_coupled_merged_v1_runs_round4
+              torchrun --standalone --nproc_per_node=2 \
                 vans_qa/full_scale/train_joint_coupled_normalized.py \
                 --qa_split /data/raw_data/qa_split_merged_v1.json \
                 --disable_norm \
@@ -123,8 +149,8 @@ spec:
                 --val_every_steps 500 \
                 --save_every_steps 1000 \
                 --max_val_items 100 \
-                --out_dir /data/raw_data/joint_coupled_merged_v1_runs_round3 2>&1 \
-                | tee /data/raw_data/joint_coupled_merged_v1_runs_round3/full_run.log
+                --out_dir /data/raw_data/joint_coupled_merged_v1_runs_round4 2>&1 \
+                | tee /data/raw_data/joint_coupled_merged_v1_runs_round4/full_run.log
           env:
             - name: VANS_ROOT
               value: /data
@@ -142,15 +168,15 @@ spec:
               value: expandable_segments:True
           resources:
             requests:
-              cpu: "6"
+              cpu: "10"
               memory: "28Gi"
               ephemeral-storage: "2Gi"
-              nvidia.com/gpu: "1"
+              nvidia.com/gpu: "2"
             limits:
-              cpu: "7"
+              cpu: "12"
               memory: "32Gi"
               ephemeral-storage: "2400Mi"
-              nvidia.com/gpu: "1"
+              nvidia.com/gpu: "2"
           volumeMounts:
             - name: git-repo-code
               mountPath: /code
@@ -195,4 +221,4 @@ spec:
 # Apply with:
 #   kubectl apply -f job-107-train-merged-vans-youcook2.yaml -n williamli-scvl
 # Watch it:
-#   kubectl logs -f job/ruixin-train-merged-vans-youcook2-round3 -n williamli-scvl
+#   kubectl logs -f job/ruixin-train-merged-vans-youcook2-round4 -n williamli-scvl
