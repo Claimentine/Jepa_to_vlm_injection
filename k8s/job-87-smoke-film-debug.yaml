@@ -56,6 +56,18 @@ spec:
                       # "GPU is lost" device-plugin error, 2 consecutive
                       # attempts landed here
                       - k8s-haosu-12.sdsc.optiputer.net
+                  # Rerun 2026-10-28: first attempt landed on a 10.58GiB
+                  # card and OOM'd on every single item (fwd AND rev) --
+                  # confounds the hang diagnosis entirely, since we never
+                  # see a full step complete. It DID get past the exact
+                  # point job-85 hung at (video decode, first forward
+                  # call) before OOMing deep in SDPA attention, which is
+                  # itself informative -- but need a bigger card to see a
+                  # clean step.
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "16000"
       containers:
         - name: smoke-film-debug
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
