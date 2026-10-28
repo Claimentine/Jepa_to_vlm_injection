@@ -81,31 +81,39 @@ spec:
               "$PY" -m pip install --quiet h5py
               export PATH="$(dirname "$PY"):$PATH"
 
-              # Guard against $VANS_WORK_ROOT/{clips,vjepa_cache_full} still
-              # being plain symlinks from an older run (see job-121's
-              # 2026-10-27 "are the same file" crash note) -- mkdir -p alone
-              # is a silent no-op on an existing symlink-to-a-dir.
-              for p in "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"; do
-                [ -L "$p" ] && rm -f "$p"
-              done
-              mkdir -p "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"
-              # Merge in YouCook2's separately-stored clips+vjepa feats too
-              # (see job-121's 2026-10-27 rerun note -- has_features() was
-              # silently False for every YouCook2 item when only the
-              # VANS/COIN backup was linked in, since YouCook2's features
-              # live under /data/vans_work_youcook instead).
-              for d in /data/hf_data/vans_injection_backup/*/; do
-                ln -sfn "${d%/}" "$VANS_WORK_ROOT/clips/$(basename "${d%/}")"
-              done
-              for f in /data/hf_data/vans_injection_backup/*.npz; do
-                ln -sfn "$f" "$VANS_WORK_ROOT/vjepa_cache_full/$(basename "$f")"
-              done
-              for d in /data/vans_work_youcook/clips/*/; do
-                ln -sfn "${d%/}" "$VANS_WORK_ROOT/clips/$(basename "${d%/}")"
-              done
-              for f in /data/vans_work_youcook/vjepa_cache_full/*.npz; do
-                ln -sfn "$f" "$VANS_WORK_ROOT/vjepa_cache_full/$(basename "$f")"
-              done
+              # Same one-time marker guard as job-121 (which runs first) --
+              # if job-121 already built the merge, this is a free no-op;
+              # running the merge loop twice concurrently caused a 60+min
+              # stall via CephFS lock contention on 2026-10-28.
+              MARKER="$VANS_WORK_ROOT/.merged_youcook_done"
+              if [ ! -f "$MARKER" ]; then
+                # Guard against $VANS_WORK_ROOT/{clips,vjepa_cache_full} still
+                # being plain symlinks from an older run (see job-121's
+                # 2026-10-27 "are the same file" crash note) -- mkdir -p alone
+                # is a silent no-op on an existing symlink-to-a-dir.
+                for p in "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"; do
+                  [ -L "$p" ] && rm -f "$p"
+                done
+                mkdir -p "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"
+                # Merge in YouCook2's separately-stored clips+vjepa feats too
+                # (see job-121's 2026-10-27 rerun note -- has_features() was
+                # silently False for every YouCook2 item when only the
+                # VANS/COIN backup was linked in, since YouCook2's features
+                # live under /data/vans_work_youcook instead).
+                for d in /data/hf_data/vans_injection_backup/*/; do
+                  ln -sfn "${d%/}" "$VANS_WORK_ROOT/clips/$(basename "${d%/}")"
+                done
+                for f in /data/hf_data/vans_injection_backup/*.npz; do
+                  ln -sfn "$f" "$VANS_WORK_ROOT/vjepa_cache_full/$(basename "$f")"
+                done
+                for d in /data/vans_work_youcook/clips/*/; do
+                  ln -sfn "${d%/}" "$VANS_WORK_ROOT/clips/$(basename "${d%/}")"
+                done
+                for f in /data/vans_work_youcook/vjepa_cache_full/*.npz; do
+                  ln -sfn "$f" "$VANS_WORK_ROOT/vjepa_cache_full/$(basename "$f")"
+                done
+                touch "$MARKER"
+              fi
 
               cd "$REPO"
               nvidia-smi --query-gpu=index,name,memory.total --format=csv

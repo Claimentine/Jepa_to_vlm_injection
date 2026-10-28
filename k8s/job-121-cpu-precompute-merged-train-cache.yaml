@@ -52,30 +52,41 @@ spec:
               # would write INTO vans_injection_backup itself (same
               # underlying dir as both $VANS_WORK_ROOT/clips AND
               # $VANS_WORK_ROOT/vjepa_cache_full) and crash on
-              # "ln: ... are the same file" under set -e.
-              for p in "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"; do
-                [ -L "$p" ] && rm -f "$p"
-              done
-              mkdir -p "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"
-              # YouCook2's clips+vjepa feats live in a completely separate
-              # directory (/data/vans_work_youcook) from the VANS/COIN backup
-              # -- discovered 2026-10-27 via has_features() returning False
-              # for every one of qa_split_merged_v1.json's 3676 YouCook2
-              # train items (vs. 6688/6690 for VANS+COIN) when only the
-              # backup was linked in. Merge both sources in by symlink so
-              # has_features() (and this cache) covers YouCook2 too.
-              for d in /data/hf_data/vans_injection_backup/*/; do
-                ln -sfn "${d%/}" "$VANS_WORK_ROOT/clips/$(basename "${d%/}")"
-              done
-              for f in /data/hf_data/vans_injection_backup/*.npz; do
-                ln -sfn "$f" "$VANS_WORK_ROOT/vjepa_cache_full/$(basename "$f")"
-              done
-              for d in /data/vans_work_youcook/clips/*/; do
-                ln -sfn "${d%/}" "$VANS_WORK_ROOT/clips/$(basename "${d%/}")"
-              done
-              for f in /data/vans_work_youcook/vjepa_cache_full/*.npz; do
-                ln -sfn "$f" "$VANS_WORK_ROOT/vjepa_cache_full/$(basename "$f")"
-              done
+              # Marker file so this (slow, CephFS-metadata-heavy) merge
+              # only ever runs once total across ALL pods/reruns that share
+              # this PVC path -- 2 shards redoing it concurrently on
+              # 2026-10-28 caused enough lock contention that both stalled
+              # for 60+ min with near-zero CPU time (not just "slow", truly
+              # stuck). Built once by hand this run; left here so job-123
+              # (and any future rerun of this job) skips it for free.
+              MARKER="$VANS_WORK_ROOT/.merged_youcook_done"
+              if [ ! -f "$MARKER" ]; then
+                # "ln: ... are the same file" under set -e.
+                for p in "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"; do
+                  [ -L "$p" ] && rm -f "$p"
+                done
+                mkdir -p "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"
+                # YouCook2's clips+vjepa feats live in a completely separate
+                # directory (/data/vans_work_youcook) from the VANS/COIN backup
+                # -- discovered 2026-10-27 via has_features() returning False
+                # for every one of qa_split_merged_v1.json's 3676 YouCook2
+                # train items (vs. 6688/6690 for VANS+COIN) when only the
+                # backup was linked in. Merge both sources in by symlink so
+                # has_features() (and this cache) covers YouCook2 too.
+                for d in /data/hf_data/vans_injection_backup/*/; do
+                  ln -sfn "${d%/}" "$VANS_WORK_ROOT/clips/$(basename "${d%/}")"
+                done
+                for f in /data/hf_data/vans_injection_backup/*.npz; do
+                  ln -sfn "$f" "$VANS_WORK_ROOT/vjepa_cache_full/$(basename "$f")"
+                done
+                for d in /data/vans_work_youcook/clips/*/; do
+                  ln -sfn "${d%/}" "$VANS_WORK_ROOT/clips/$(basename "${d%/}")"
+                done
+                for f in /data/vans_work_youcook/vjepa_cache_full/*.npz; do
+                  ln -sfn "$f" "$VANS_WORK_ROOT/vjepa_cache_full/$(basename "$f")"
+                done
+                touch "$MARKER"
+              fi
               "$PY" vans_qa/full_scale/build_eval_input_cache.py \
                 --qa_split /data/raw_data/qa_split_merged_v1.json \
                 --split_part train \
@@ -155,30 +166,41 @@ spec:
               # would write INTO vans_injection_backup itself (same
               # underlying dir as both $VANS_WORK_ROOT/clips AND
               # $VANS_WORK_ROOT/vjepa_cache_full) and crash on
-              # "ln: ... are the same file" under set -e.
-              for p in "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"; do
-                [ -L "$p" ] && rm -f "$p"
-              done
-              mkdir -p "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"
-              # YouCook2's clips+vjepa feats live in a completely separate
-              # directory (/data/vans_work_youcook) from the VANS/COIN backup
-              # -- discovered 2026-10-27 via has_features() returning False
-              # for every one of qa_split_merged_v1.json's 3676 YouCook2
-              # train items (vs. 6688/6690 for VANS+COIN) when only the
-              # backup was linked in. Merge both sources in by symlink so
-              # has_features() (and this cache) covers YouCook2 too.
-              for d in /data/hf_data/vans_injection_backup/*/; do
-                ln -sfn "${d%/}" "$VANS_WORK_ROOT/clips/$(basename "${d%/}")"
-              done
-              for f in /data/hf_data/vans_injection_backup/*.npz; do
-                ln -sfn "$f" "$VANS_WORK_ROOT/vjepa_cache_full/$(basename "$f")"
-              done
-              for d in /data/vans_work_youcook/clips/*/; do
-                ln -sfn "${d%/}" "$VANS_WORK_ROOT/clips/$(basename "${d%/}")"
-              done
-              for f in /data/vans_work_youcook/vjepa_cache_full/*.npz; do
-                ln -sfn "$f" "$VANS_WORK_ROOT/vjepa_cache_full/$(basename "$f")"
-              done
+              # Marker file so this (slow, CephFS-metadata-heavy) merge
+              # only ever runs once total across ALL pods/reruns that share
+              # this PVC path -- 2 shards redoing it concurrently on
+              # 2026-10-28 caused enough lock contention that both stalled
+              # for 60+ min with near-zero CPU time (not just "slow", truly
+              # stuck). Built once by hand this run; left here so job-123
+              # (and any future rerun of this job) skips it for free.
+              MARKER="$VANS_WORK_ROOT/.merged_youcook_done"
+              if [ ! -f "$MARKER" ]; then
+                # "ln: ... are the same file" under set -e.
+                for p in "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"; do
+                  [ -L "$p" ] && rm -f "$p"
+                done
+                mkdir -p "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"
+                # YouCook2's clips+vjepa feats live in a completely separate
+                # directory (/data/vans_work_youcook) from the VANS/COIN backup
+                # -- discovered 2026-10-27 via has_features() returning False
+                # for every one of qa_split_merged_v1.json's 3676 YouCook2
+                # train items (vs. 6688/6690 for VANS+COIN) when only the
+                # backup was linked in. Merge both sources in by symlink so
+                # has_features() (and this cache) covers YouCook2 too.
+                for d in /data/hf_data/vans_injection_backup/*/; do
+                  ln -sfn "${d%/}" "$VANS_WORK_ROOT/clips/$(basename "${d%/}")"
+                done
+                for f in /data/hf_data/vans_injection_backup/*.npz; do
+                  ln -sfn "$f" "$VANS_WORK_ROOT/vjepa_cache_full/$(basename "$f")"
+                done
+                for d in /data/vans_work_youcook/clips/*/; do
+                  ln -sfn "${d%/}" "$VANS_WORK_ROOT/clips/$(basename "${d%/}")"
+                done
+                for f in /data/vans_work_youcook/vjepa_cache_full/*.npz; do
+                  ln -sfn "$f" "$VANS_WORK_ROOT/vjepa_cache_full/$(basename "$f")"
+                done
+                touch "$MARKER"
+              fi
               "$PY" vans_qa/full_scale/build_eval_input_cache.py \
                 --qa_split /data/raw_data/qa_split_merged_v1.json \
                 --split_part train \
