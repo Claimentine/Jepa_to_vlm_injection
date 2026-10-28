@@ -44,6 +44,18 @@ spec:
               REPO=/code/Jepa_to_vlm_injection
               cd "$REPO"
               export VANS_WORK_ROOT=/data/vans_work
+              # The first run (job-121 attempt 1) left these as plain
+              # symlinks straight to vans_injection_backup (ln -sfn TARGET
+              # "$VANS_WORK_ROOT/clips"), which persists on the shared PVC
+              # across pod restarts. mkdir -p on an existing symlink-to-a-dir
+              # is a silent no-op, so without this removal the loops below
+              # would write INTO vans_injection_backup itself (same
+              # underlying dir as both $VANS_WORK_ROOT/clips AND
+              # $VANS_WORK_ROOT/vjepa_cache_full) and crash on
+              # "ln: ... are the same file" under set -e.
+              for p in "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"; do
+                [ -L "$p" ] && rm -f "$p"
+              done
               mkdir -p "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"
               # YouCook2's clips+vjepa feats live in a completely separate
               # directory (/data/vans_work_youcook) from the VANS/COIN backup
@@ -135,6 +147,18 @@ spec:
               REPO=/code/Jepa_to_vlm_injection
               cd "$REPO"
               export VANS_WORK_ROOT=/data/vans_work
+              # The first run (job-121 attempt 1) left these as plain
+              # symlinks straight to vans_injection_backup (ln -sfn TARGET
+              # "$VANS_WORK_ROOT/clips"), which persists on the shared PVC
+              # across pod restarts. mkdir -p on an existing symlink-to-a-dir
+              # is a silent no-op, so without this removal the loops below
+              # would write INTO vans_injection_backup itself (same
+              # underlying dir as both $VANS_WORK_ROOT/clips AND
+              # $VANS_WORK_ROOT/vjepa_cache_full) and crash on
+              # "ln: ... are the same file" under set -e.
+              for p in "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"; do
+                [ -L "$p" ] && rm -f "$p"
+              done
               mkdir -p "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"
               # YouCook2's clips+vjepa feats live in a completely separate
               # directory (/data/vans_work_youcook) from the VANS/COIN backup

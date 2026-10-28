@@ -81,6 +81,13 @@ spec:
               "$PY" -m pip install --quiet h5py
               export PATH="$(dirname "$PY"):$PATH"
 
+              # Guard against $VANS_WORK_ROOT/{clips,vjepa_cache_full} still
+              # being plain symlinks from an older run (see job-121's
+              # 2026-10-27 "are the same file" crash note) -- mkdir -p alone
+              # is a silent no-op on an existing symlink-to-a-dir.
+              for p in "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"; do
+                [ -L "$p" ] && rm -f "$p"
+              done
               mkdir -p "$VANS_WORK_ROOT/clips" "$VANS_WORK_ROOT/vjepa_cache_full"
               # Merge in YouCook2's separately-stored clips+vjepa feats too
               # (see job-121's 2026-10-27 rerun note -- has_features() was
