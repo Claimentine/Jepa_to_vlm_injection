@@ -149,7 +149,9 @@ spec:
           emptyDir: {}
         - name: conda-storage
           persistentVolumeClaim:
-            claimName: ruixin-conda-vol-ddp
+            # ruixin-conda-vol-ddp is held by job-116; -precompute is free
+            # (job-120 completed) as of this 2026-10-28 rerun.
+            claimName: ruixin-conda-vol-precompute
         - name: data-storage
           persistentVolumeClaim:
             claimName: jepa-vlm-injection-data-vol
