@@ -114,12 +114,19 @@ spec:
           resources:
             requests:
               cpu: "4"
-              memory: "16Gi"
+              memory: "24Gi"
               ephemeral-storage: "2Gi"
               nvidia.com/gpu: "1"
             limits:
               cpu: "4.8"
-              memory: "19200Mi"
+              # Raised from 19200Mi after this job OOMKilled ~8h into the
+              # "all" layer-strategy's COIN full-test pass (2026-10-27) --
+              # --resume only skips checkpoints already DONE in the output
+              # JSON, not partial progress within one, so the OOM cost a
+              # full redo. 30Gi is close to the namespace's 32Gi pod ceiling
+              # (restriction-limit-range) while leaving headroom for the
+              # init container.
+              memory: "30Gi"
               ephemeral-storage: "2400Mi"
               nvidia.com/gpu: "1"
           volumeMounts:
