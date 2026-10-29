@@ -209,7 +209,11 @@ spec:
           emptyDir: {}
         - name: conda-storage
           persistentVolumeClaim:
-            claimName: ruixin-conda-vol-ddp2
+            # ddp2 is held by round5 (still training) as of this
+            # 2026-10-29 submission -- confirmed via a live PVC sweep
+            # across all pods first, same Multi-Attach risk this project
+            # has hit before.
+            claimName: ruixin-conda-vol-youcook
         - name: data-storage
           persistentVolumeClaim:
             claimName: jepa-vlm-injection-data-vol
@@ -218,5 +222,5 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       restartPolicy: Never
 
-# Apply with (NOT YET -- hold until job-121 AND job-122 both complete):
+# Apply with:
 #   kubectl apply -f job-123-train-merged-vans-youcook2-ego4d-round6.yaml -n williamli-scvl
