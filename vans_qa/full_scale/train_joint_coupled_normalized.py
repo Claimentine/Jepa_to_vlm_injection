@@ -76,12 +76,14 @@ after its default 10 minutes. Fixed with a barrier every rank hits right
 after the val/checkpoint block. A 30-minute process-group timeout covered
 that, but not the FINAL rev_test evaluation after the training loop ends
 (confirmed 2026-09-22, job-33's second DDP smoke test) -- that pass is
-also rank-0-only but uncapped by any --max_*_items flag, running over the
-full reverse test split (~1700+ items for this project's VANS cache), so
-it can itself take longer than periodic validation. The trailing
-dist.barrier() before dist.destroy_process_group() already synchronizes
-ranks there correctly, it just needed more timeout headroom -- bumped to
-3 hours.
+also rank-0-only, running over the full reverse test split (~1700+ items
+for this project's VANS cache), so it can itself take longer than
+periodic validation. The trailing dist.barrier() before
+dist.destroy_process_group() already synchronizes ranks there correctly;
+timeout headroom was bumped to 3 hours, which job-118 (2026-10-28) still
+blew through on a congested shared PVC -- see --max_test_items below,
+added after that crash so this eval can be capped like every other
+--max_*_items pass instead of relying on storage staying fast enough.
 """
 import argparse
 import datetime
@@ -257,6 +259,14 @@ def main():
     ap.add_argument("--save_every_steps", type=int, default=1000)
     ap.add_argument("--max_val_items", type=int, default=100)
     ap.add_argument("--max_train_items", type=int, default=None)
+    ap.add_argument("--max_test_items", type=int, default=None,
+                     help="cap on the FINAL rev_test eval (after the training loop ends, rank-0-only, "
+                          "uncapped by default). Uncapped + a congested shared PVC is what cost job-118 "
+                          "its run 2026-10-28: rank 0 took >3h reading rev_test's ~1800 cached pairs off "
+                          "a busy CephFS mount, so rank 1 timed out waiting on the trailing dist.barrier() "
+                          "right after training finished and saved its last checkpoint. Set this for any "
+                          "DDP run so a slow storage day degrades the final test number instead of killing "
+                          "the whole job after all the real training work is already done.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out_dir", default=os.path.join(fwd.BASE, "raw_data/joint_coupled_normalized_runs"))
     args = ap.parse_args()
@@ -606,7 +616,8 @@ def main():
         best_reverse_path = os.path.join(run_dir, "best_reverse.pt")
         if os.path.exists(best_reverse_path):
             predictor.load_state_dict(torch.load(best_reverse_path, map_location=device, weights_only=False)["predictor_state"])
-        rev_test_metrics, n_rev_test = rev.evaluate(predictor, args.cache_dir, rev_test, "crossattn", device)
+        rev_test_metrics, n_rev_test = rev.evaluate(
+            predictor, args.cache_dir, rev_test, "crossattn", device, max_items=args.max_test_items)
         print(f"[TEST] reverse n={n_rev_test} {rev_test_metrics}", flush=True)
         with open(os.path.join(run_dir, "rev_test_metrics.json"), "w") as f:
             json.dump({"n_test": n_rev_test, **rev_test_metrics}, f, indent=2)

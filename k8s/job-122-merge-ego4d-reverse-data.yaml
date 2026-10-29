@@ -1,6 +1,14 @@
-# Step 122: merges job-109's Ego4D reverse-guided pairs into the reverse
-# training pool, alongside the existing EgoDex-sourced pairs every joint
-# run (job-22 through round5) has used so far.
+# Step 122: merges job-109's Ego4D reverse-guided pairs (BOTH phases --
+# narration and goalstep) into the reverse training pool, alongside the
+# existing EgoDex-sourced pairs every joint run (job-22 through round5)
+# has used so far.
+#
+# RERUN 2026-10-28: job-109's goalstep phase finished after this job's
+# first run, which only merged the narration phase (6854 pairs). Rerun to
+# add goalstep's 1558 pairs too -- safe to just resubmit (every step is
+# idempotent: merge_qa_splits.py rewrites the whole output file, and the
+# symlink loops are ln -sfn into a dir that already has some of the same
+# links).
 #
 # Confirmed compatible with ZERO cache-format changes: extract_ego4d_
 # reverse_guided.py's own output schema is {pid, vlm_old, vlm_new,
@@ -8,26 +16,28 @@
 # train_latent_world_model_full.py's load_pair() expects (see that
 # script's own header comment referencing extract_vlm_guidance_paired.py's
 # format). Three steps:
-#   1. build_ego4d_reverse_split_stub.py: lists every pid job-109 cached,
-#      all under "train" (explicit decision 2026-10-27 -- no separate
-#      Ego4D val/test carve-out; EgoDex's own test split + the dedicated
-#      EgoDex probe jobs already cover reverse-direction evaluation).
-#   2. merge_qa_splits.py: combines that stub with the existing
+#   1. build_ego4d_reverse_split_stub.py: lists every pid job-109 cached
+#      in EACH phase's cache dir separately (it only takes one --cache_dir
+#      at a time), all under "train" (explicit decision 2026-10-27 -- no
+#      separate Ego4D val/test carve-out; EgoDex's own test split + the
+#      dedicated EgoDex probe jobs already cover reverse-direction eval).
+#   2. merge_qa_splits.py: combines both stubs with the existing
 #      qa_split_full.json (EgoDex's own train/val/test membership,
 #      untouched) into qa_split_full_merged_ego4d.json, for
 #      --rev_qa_split to point at.
-#   3. symlink-merge the two cache directories (EgoDex's
-#      vlm_guidance_cache_paired, 11777 files, and job-109's
-#      cache_narration) into one new dir -- load_pair()/list_cached_pids()
-#      both take a single --cache_dir, so this is simplest as a flat
-#      directory of symlinks (same ln -sfn pattern this project already
-#      uses for merging clip/vjepa-cache directories elsewhere) rather
-#      than a code change to accept multiple cache dirs.
+#   3. symlink-merge all three cache directories (EgoDex's
+#      vlm_guidance_cache_paired, 11777 files, plus job-109's
+#      cache_narration and cache_goalstep) into one new dir --
+#      load_pair()/list_cached_pids() both take a single --cache_dir, so
+#      this is simplest as a flat directory of symlinks (same ln -sfn
+#      pattern this project already uses for merging clip/vjepa-cache
+#      directories elsewhere) rather than a code change to accept
+#      multiple cache dirs.
 #
 # HOLD: do not submit until job-109 (ruixin-ego4d-reverse-guided-extract)
-# has fully completed -- this job globs whatever .npz files exist in
-# job-109's cache_narration dir at the moment it runs, so running it early
-# would silently miss every pair job-109 hadn't saved yet.
+# has fully completed BOTH phases -- this job globs whatever .npz files
+# exist in job-109's cache dirs at the moment it runs, so running it
+# early would silently miss every pair job-109 hadn't saved yet.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -48,33 +58,50 @@ spec:
               REPO=/code/Jepa_to_vlm_injection
               cd "$REPO"
 
-              EGO4D_CACHE=/data/vans_work_ego4d_reverse_guided/cache_narration
+              # RERUN 2026-10-28: job-109's goalstep phase finished AFTER this
+              # job's first run (which only merged the narration phase, 6854
+              # pairs). Both phases' filenames are unambiguously prefixed
+              # (ego4d_shortaxis_narration_* vs ego4d_shortaxis_goalstep_*),
+              # confirmed via a live `ls` of both cache dirs, so there's no
+              # pid-collision risk merging both in now.
+              EGO4D_NARR_CACHE=/data/vans_work_ego4d_reverse_guided/cache_narration
+              EGO4D_GOALSTEP_CACHE=/data/vans_work_ego4d_reverse_guided/cache_goalstep
               EGODEX_CACHE=/data/vans_work/vlm_guidance_cache_paired
               MERGED_CACHE=/data/vans_work/vlm_guidance_cache_paired_merged_ego4d
 
-              echo "=== 1. build Ego4D reverse pid stub (all-train) ==="
+              echo "=== 1. build Ego4D reverse pid stubs (all-train) ==="
               "$PY" vans_qa/full_scale/build_ego4d_reverse_split_stub.py \
-                --cache_dir "$EGO4D_CACHE" \
-                --out /data/raw_data/qa_split_ego4d_reverse_stub.json
+                --cache_dir "$EGO4D_NARR_CACHE" \
+                --out /data/raw_data/qa_split_ego4d_reverse_narration_stub.json
+              "$PY" vans_qa/full_scale/build_ego4d_reverse_split_stub.py \
+                --cache_dir "$EGO4D_GOALSTEP_CACHE" \
+                --out /data/raw_data/qa_split_ego4d_reverse_goalstep_stub.json
 
               echo "=== 2. merge with existing EgoDex reverse split membership ==="
               "$PY" vans_qa/full_scale/merge_qa_splits.py \
-                --inputs /data/raw_data/qa_split_full.json /data/raw_data/qa_split_ego4d_reverse_stub.json \
+                --inputs /data/raw_data/qa_split_full.json \
+                         /data/raw_data/qa_split_ego4d_reverse_narration_stub.json \
+                         /data/raw_data/qa_split_ego4d_reverse_goalstep_stub.json \
                 --out /data/raw_data/qa_split_full_merged_ego4d.json
 
-              echo "=== 3. symlink-merge the two cache directories ==="
+              echo "=== 3. symlink-merge all three cache directories ==="
               mkdir -p "$MERGED_CACHE"
               n_egodex=0
               for f in "$EGODEX_CACHE"/*.npz; do
                 ln -sfn "$f" "$MERGED_CACHE/$(basename "$f")"
                 n_egodex=$((n_egodex + 1))
               done
-              n_ego4d=0
-              for f in "$EGO4D_CACHE"/*.npz; do
+              n_narr=0
+              for f in "$EGO4D_NARR_CACHE"/*.npz; do
                 ln -sfn "$f" "$MERGED_CACHE/$(basename "$f")"
-                n_ego4d=$((n_ego4d + 1))
+                n_narr=$((n_narr + 1))
               done
-              echo "[INFO] symlinked egodex=$n_egodex ego4d=$n_ego4d -> $MERGED_CACHE"
+              n_goalstep=0
+              for f in "$EGO4D_GOALSTEP_CACHE"/*.npz; do
+                ln -sfn "$f" "$MERGED_CACHE/$(basename "$f")"
+                n_goalstep=$((n_goalstep + 1))
+              done
+              echo "[INFO] symlinked egodex=$n_egodex ego4d_narration=$n_narr ego4d_goalstep=$n_goalstep -> $MERGED_CACHE"
               echo "[INFO] total files in merged cache: $(ls "$MERGED_CACHE" | wc -l)"
               echo "MERGE_EGO4D_REVERSE_DONE"
           env:

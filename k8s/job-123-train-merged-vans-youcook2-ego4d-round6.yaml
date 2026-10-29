@@ -27,6 +27,16 @@
 # have completed -- this run depends on both of their outputs existing on
 # disk before torchrun even starts.
 #
+# STATUS 2026-10-28: job-109 fully complete (both narration + goalstep
+# phases). job-122 reran to merge both phases in (train=16834, val=1805,
+# test=1805 in qa_split_full_merged_ego4d.json) -- done. job-121 is
+# resubmitted and filling in the remaining ~3723 YouCook2 precompute-cache
+# entries now (has_features() itself already confirmed 100% for all 3676
+# YouCook2 train items via a live check, independent of job-121's own
+# cache-completeness). Still wait for job-121's own DONE marker before
+# submitting this, so the forward branch stays cache-bound instead of
+# falling back to live decode for whichever items aren't cached yet.
+#
 # FIX 2026-10-27: job-121's first run revealed YouCook2 items all fail
 # has_features() when only the VANS/COIN backup is linked into
 # $VANS_WORK_ROOT -- YouCook2's own clips+vjepa feats live under the
@@ -34,6 +44,13 @@
 # fix, fwd_train (line ~280 of train_joint_coupled_normalized.py) would
 # have silently excluded all ~3676 YouCook2 train items, defeating much of
 # the point of this round. job-121 was rerun with the same merge fix first.
+#
+# FIX 2026-10-28: added --max_test_items 300 -- job-118 crashed exactly 3h
+# after its training loop ended because the FINAL rev_test eval (rank-0
+# only, previously uncapped, ~1800 items read off a congested shared PVC)
+# outran even the bumped 3h NCCL barrier timeout while rank 1 waited on
+# the trailing dist.barrier(). See train_joint_coupled_normalized.py's
+# --max_test_items docstring for the full diagnosis.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -131,6 +148,7 @@ spec:
                 --val_every_steps 500 \
                 --save_every_steps 1000 \
                 --max_val_items 100 \
+                --max_test_items 300 \
                 --out_dir /data/raw_data/joint_coupled_merged_v1_ego4d_runs_round6 2>&1 \
                 | tee /data/raw_data/joint_coupled_merged_v1_ego4d_runs_round6/full_run.log
           env:

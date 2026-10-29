@@ -1,0 +1,182 @@
+# Step 125: C2 conditioning-mechanism ablation, RERUN of job-85
+# (--injection_mode film) under full 2-GPU DDP -- job-85 itself hung
+# 4.5+ hours with zero step output and was killed undiagnosed.
+#
+# job-87's isolated single-process debug repro (2026-10-28, 3 escalating
+# attempts) narrowed the diagnosis but did NOT find a FiLM- or
+# DDP-specific bug: its first attempt got PAST job-85's exact hang point
+# (video decode -> first forward call) and instead OOM'd on a small
+# 10.58GiB card; its second attempt (with a >16000MiB GPU memory floor
+# added) got further still -- loaded forward/reverse items fine, began
+# loading the frozen VLM -- but then stalled during plain weight loading
+# itself (tqdm frozen at 47% for ~30min until the 1800s timeout killed
+# it). Weight loading is identical regardless of --injection_mode, so
+# that specific hang is attributable to general cluster/CephFS storage
+# congestion from our own concurrently-running job fleet, not FiLM or
+# DDP. Conclusion: no reproducible FiLM-specific defect was found: the
+# right next step is to just retry the real thing (full DDP, full data)
+# rather than keep narrowing an inconclusive isolated repro.
+#
+# Carries forward both fixes job-87's reruns established, plus a third
+# found while reviewing this script for job-123's full-data run:
+#   - >16000MiB GPU memory nodeAffinity floor (job-85 never had this;
+#     job-79's own OOM precedent is what originally added it elsewhere)
+#   - a free conda-storage PVC at submit time (ddp, vacated when
+#     job-116's egodex probe completed)
+#   - --max_test_items 300 (new flag, train_joint_coupled_normalized.py):
+#     job-118 crashed 2026-10-28 exactly 3h after its training loop ended
+#     -- rank 0's uncapped FINAL rev_test eval (~1800 items, read off a
+#     congested shared PVC) outran even the bumped 3h NCCL barrier
+#     timeout while rank 1 sat waiting on the trailing dist.barrier().
+#     Capping it here avoids the same fate.
+# Otherwise identical to job-85's own recipe (job-42's exact hyperparams:
+# --disable_norm --cycle_loss_weight 0 --bridge_hidden_dim 2048, 1 epoch,
+# middle4 layers -- --injection_mode film is the only variable).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-ablation-film-rerun
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nrp-01.laccd.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - hcc-nrp-shor-c5809.unl.edu
+                      - dtn-gpu2.kreonet.net
+                      - hcc-chase-shor-c4705.unl.edu
+                  # job-85 never set this; job-87's debug rerun showed it
+                  # matters (first attempt OOM'd on every item on a
+                  # 10.58GiB card and confounded the hang diagnosis).
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "16000"
+      containers:
+        - name: ablation-film-rerun
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+
+              "$PY" -m pip install --quiet h5py
+              export PATH="$(dirname "$PY"):$PATH"
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/ablation_film_rerun_runs
+              torchrun --standalone --nproc_per_node=2 \
+                vans_qa/full_scale/train_joint_coupled_normalized.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --disable_norm \
+                --cycle_loss_weight 0 \
+                --bridge_hidden_dim 2048 \
+                --injection_mode film \
+                --epochs 1 \
+                --val_every_steps 500 \
+                --save_every_steps 1000 \
+                --max_val_items 100 \
+                --max_test_items 300 \
+                --out_dir /data/raw_data/ablation_film_rerun_runs 2>&1 \
+                | tee /data/raw_data/ablation_film_rerun_runs/full_run.log
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+            - name: PYTORCH_ALLOC_CONF
+              value: expandable_segments:True
+          resources:
+            requests:
+              cpu: "10"
+              memory: "27Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "2"
+            limits:
+              cpu: "12"
+              memory: "31500Mi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "2"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1200Mi"
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            # freed by job-116 (egodex probe layer ablation, now terminal)
+            # as of this 2026-10-28 submission.
+            claimName: ruixin-conda-vol-ddp
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-125-ablation-film-rerun.yaml -n williamli-scvl
