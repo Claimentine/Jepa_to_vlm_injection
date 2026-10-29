@@ -1,0 +1,136 @@
+# Step 126: EgoExo4D smoke/discovery download -- README's F1 item ("needs
+# locating and parsing [EgoExo4D's Hand Pose benchmark] into the same
+# target-tensor shape as EgoDex's out_feats"). Confirmed 2026-10-29 by
+# reading ThinkJEPA's own egodex/trajectory_dataset.py directly: it ALREADY
+# has a full camera_mode="egoexo" consumption path (camera pose math +
+# EgoDex-joint-name -> EgoExo-joint-name mapping, see
+# _map_query_joint_to_egoexo_candidates/_build_camera_xyz_from_egoexo_pose),
+# built for ThinkJEPA's own paper's Table 1 EgoExo4D numbers but never
+# documented in the public README. It expects npz fields egoexo_body_xyz_3d/
+# egoexo_hand_xyz_3d/egoexo_*_joint_names_3d/egoexo_*_frame_indices/
+# egoexo_cam_extrinsics[_by_frame]/egoexo_cam_intrinsics[_by_frame] -- no
+# such field-producing script exists anywhere in ThinkJEPA's repo or ours,
+# so that ETL (official EgoExo4D annotation JSON -> these npz fields) is the
+# one piece we have to write ourselves.
+#
+# This job is PURE DISCOVERY before writing that ETL script: official docs
+# (docs.ego-exo4d-data.org) are thin/inconsistain (e.g. contradict themselves
+# on whether camera intrinsics are 3x3 or 3x4) on the exact schema, so this
+# just downloads metadata + a tiny handful of takes' ego_pose annotations
+# and prints their real structure (keys/shapes/example values) instead of
+# guessing. No video download yet, no VJEPA/VLM pass -- just annotation
+# shape ground-truthing.
+#
+# AWS credentials: egoexo4d-aws-credentials Secret (2026-10-29, same pattern
+# as the existing ego4d-aws-credentials -- never written into this file).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-smoke-egoexo4d-download
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      containers:
+        - name: smoke-egoexo4d-download
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -uo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              export PATH="$(dirname "$PY"):$PATH"
+
+              "$PY" -m pip install --quiet -U "ego4d>=1.7.1"
+
+              mkdir -p ~/.aws
+              cat > ~/.aws/credentials <<CREDS
+              [default]
+              aws_access_key_id = ${AWS_ACCESS_KEY_ID}
+              aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}
+              CREDS
+              cat > ~/.aws/config <<CFG
+              [default]
+              region = ${AWS_DEFAULT_REGION}
+              CFG
+
+              OUT=/data/raw_data/egoexo4d_discovery
+              mkdir -p "$OUT"
+
+              echo "=== egoexo CLI --help (ground truth over web docs) ==="
+              "$PY" -m ego4d.cli.cli --help 2>&1 | tee "$OUT/cli_help_main.log"
+              echo
+              echo "=== egoexo subcommand --help if it exists ==="
+              egoexo --help 2>&1 | tee "$OUT/cli_help_egoexo.log" || echo "[INFO] no separate 'egoexo' console script"
+
+              echo
+              echo "=== 1. metadata download ==="
+              "$PY" -m ego4d.cli.cli -o "$OUT" --parts metadata --dataset egoexo -y 2>&1 | tee "$OUT/metadata_dl.log" \
+                || egoexo -o "$OUT" --parts metadata -y 2>&1 | tee -a "$OUT/metadata_dl.log"
+              echo "--- metadata files found ---"
+              find "$OUT" -iname "*.json" | head -20
+
+              echo
+              echo "=== 2. inspect metadata for take uids with ego_pose annotations ==="
+              "$PY" - <<'PYEOF'
+              import json, glob, os
+              out = "/data/raw_data/egoexo4d_discovery"
+              for p in glob.glob(os.path.join(out, "**", "*.json"), recursive=True):
+                  try:
+                      sz = os.path.getsize(p)
+                  except OSError:
+                      continue
+                  print(f"{p}  ({sz} bytes)")
+              PYEOF
+
+              echo "SMOKE_EGOEXO4D_DISCOVERY_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: egoexo4d-aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: egoexo4d-aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: egoexo4d-aws-credentials
+                  key: AWS_DEFAULT_REGION
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+              ephemeral-storage: "4Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+              ephemeral-storage: "6Gi"
+          volumeMounts:
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      volumes:
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-baselines2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-126-smoke-egoexo4d-download.yaml -n williamli-scvl
