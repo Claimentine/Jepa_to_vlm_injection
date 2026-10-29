@@ -1,6 +1,16 @@
 # Step 125: C2 conditioning-mechanism ablation, RERUN of job-85
-# (--injection_mode film) under full 2-GPU DDP -- job-85 itself hung
-# 4.5+ hours with zero step output and was killed undiagnosed.
+# (--injection_mode film) -- job-85 itself hung 4.5+ hours with zero step
+# output and was killed undiagnosed.
+#
+# DOWNGRADED TO SINGLE-GPU 2026-10-30: the 2-GPU DDP version of this job sat
+# Pending for 17h (cluster-wide 2-GPU scarcity, ~237/537 nodes short on
+# nvidia.com/gpu at every FailedScheduling check) with no sign of clearing,
+# so per the user's explicit call, traded training speed for a scheduling
+# slot by dropping torchrun/DDP entirely (single process, is_ddp() is False
+# when WORLD_SIZE is unset -- same fallback path job-87's own single-process
+# debug used) and halving the GPU request to 1. This roughly doubles wall
+# time (no second rank to split the epoch with), but a slow answer beats an
+# indefinitely queued one.
 #
 # job-87's isolated single-process debug repro (2026-10-28, 3 escalating
 # attempts) narrowed the diagnosis but did NOT find a FiLM- or
@@ -14,8 +24,10 @@
 # that specific hang is attributable to general cluster/CephFS storage
 # congestion from our own concurrently-running job fleet, not FiLM or
 # DDP. Conclusion: no reproducible FiLM-specific defect was found: the
-# right next step is to just retry the real thing (full DDP, full data)
-# rather than keep narrowing an inconclusive isolated repro.
+# right next step is to just retry the real thing (full data, no
+# --max_train_items cap) rather than keep narrowing an inconclusive
+# isolated repro -- see the single-GPU downgrade note below for why this
+# isn't 2-GPU DDP like job-85 originally was.
 #
 # Carries forward both fixes job-87's reruns established, plus a third
 # found while reviewing this script for job-123's full-data run:
@@ -95,8 +107,7 @@ spec:
               cd "$REPO"
               nvidia-smi --query-gpu=index,name,memory.total --format=csv
               mkdir -p /data/raw_data/ablation_film_rerun_runs
-              torchrun --standalone --nproc_per_node=2 \
-                vans_qa/full_scale/train_joint_coupled_normalized.py \
+              "$PY" vans_qa/full_scale/train_joint_coupled_normalized.py \
                 --qa_split /data/raw_data/qa_split_temporal.json \
                 --disable_norm \
                 --cycle_loss_weight 0 \
@@ -126,15 +137,15 @@ spec:
               value: expandable_segments:True
           resources:
             requests:
-              cpu: "10"
-              memory: "27Gi"
+              cpu: "5"
+              memory: "16Gi"
               ephemeral-storage: "2Gi"
-              nvidia.com/gpu: "2"
+              nvidia.com/gpu: "1"
             limits:
-              cpu: "12"
-              memory: "31500Mi"
+              cpu: "6"
+              memory: "19200Mi"
               ephemeral-storage: "2400Mi"
-              nvidia.com/gpu: "2"
+              nvidia.com/gpu: "1"
           volumeMounts:
             - name: git-repo-code
               mountPath: /code
