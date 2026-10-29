@@ -1,0 +1,163 @@
+# Step 127: EgoExo4D discovery, part 2 -- job-126 confirmed the real CLI
+# (the `egoexo` console script, NOT `python -m ego4d.cli.cli` -- that's the
+# OLD Ego4D downloader and doesn't understand --parts at all) and pulled
+# metadata (takes.json: 5035 takes, no direct "has ego_pose" flag on each
+# take). Rather than guess which take_uids have Ego-Pose benchmark
+# annotations, this just downloads the "egopose" BENCHMARK SUBSET directly
+# (--benchmarks egopose already curates to only the takes that have it) and
+# inspects a couple of real files to settle the official docs' own
+# inconsistency on camera intrinsics shape (3x3 vs 3x4).
+#
+# --views ego only (we need the Aria egocentric stream, matching this
+# project's existing EgoDex/Ego4D reverse-direction convention of predicting
+# from the wearer's own camera, not third-person "exo" views).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-egoexo4d-egopose-annotations
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      containers:
+        - name: egoexo4d-egopose-annotations
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -uo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              export PATH="$(dirname "$PY"):$PATH"
+
+              "$PY" -m pip install --quiet -U "ego4d>=1.7.1"
+
+              mkdir -p ~/.aws
+              cat > ~/.aws/credentials <<CREDS
+              [default]
+              aws_access_key_id = ${AWS_ACCESS_KEY_ID}
+              aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}
+              CREDS
+              cat > ~/.aws/config <<CFG
+              [default]
+              region = ${AWS_DEFAULT_REGION}
+              CFG
+
+              OUT=/data/raw_data/egoexo4d_discovery
+              mkdir -p "$OUT"
+
+              echo "=== downloading egopose benchmark annotations (ego views only) ==="
+              egoexo -o "$OUT" --parts annotations --benchmarks egopose --views ego -y 2>&1 | tee "$OUT/egopose_dl.log"
+
+              echo
+              echo "=== resulting file count/size ==="
+              find "$OUT/annotations" -iname "*.json" 2>/dev/null | wc -l
+              du -sh "$OUT/annotations" 2>/dev/null
+
+              echo
+              echo "=== locate hand/body/camera_pose json files ==="
+              find "$OUT/annotations" -ipath "*hand*" -iname "*.json" 2>/dev/null | head -5
+              find "$OUT/annotations" -ipath "*body*" -iname "*.json" 2>/dev/null | head -5
+              find "$OUT/annotations" -ipath "*camera*" -iname "*.json" 2>/dev/null | head -5
+
+              echo
+              echo "=== inspect one hand-pose file's real schema ==="
+              HAND_FILE=$(find "$OUT/annotations" -ipath "*hand*" -iname "*.json" 2>/dev/null | head -1)
+              echo "hand file: $HAND_FILE"
+              if [ -n "$HAND_FILE" ]; then
+                "$PY" - "$HAND_FILE" <<'PYEOF'
+              import json, sys
+              d = json.load(open(sys.argv[1]))
+              keys = list(d.keys())
+              print("top-level frame keys (first 5):", keys[:5])
+              k0 = keys[0]
+              entries = d[k0]
+              print("entries type:", type(entries), "len:", len(entries) if hasattr(entries, "__len__") else "?")
+              e0 = entries[0]
+              print("entry0 keys:", list(e0.keys()))
+              print("metadata:", e0.get("metadata"))
+              ann3d = e0.get("annotation3D")
+              if ann3d:
+                  jk = list(ann3d.keys())[:5]
+                  print("annotation3D joint keys (first 5):", jk)
+                  print("annotation3D[%s]:" % jk[0], ann3d[jk[0]])
+              PYEOF
+              fi
+
+              echo
+              echo "=== inspect one camera-pose file's real schema (intrinsics shape) ==="
+              CAM_FILE=$(find "$OUT/annotations" -ipath "*camera*" -iname "*.json" 2>/dev/null | head -1)
+              echo "camera file: $CAM_FILE"
+              if [ -n "$CAM_FILE" ]; then
+                "$PY" - "$CAM_FILE" <<'PYEOF'
+              import json, sys
+              d = json.load(open(sys.argv[1]))
+              keys = list(d.keys())
+              print("top-level frame keys (first 3):", keys[:3])
+              k0 = keys[0]
+              frame0 = d[k0]
+              print("frame0 keys:", list(frame0.keys()))
+              for cam in frame0:
+                  if cam == "metadata":
+                      continue
+                  v = frame0[cam]
+                  if isinstance(v, dict):
+                      print(cam, "keys:", list(v.keys()))
+                      for fld in ("camera_intrinsics", "camera_extrinsics"):
+                          if fld in v:
+                              import numpy as np
+                              arr = v[fld]
+                              print(" ", fld, "shape:", len(arr), "x", len(arr[0]) if arr else "?")
+              PYEOF
+              fi
+
+              echo "EGOEXO4D_EGOPOSE_ANNOTATIONS_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: egoexo4d-aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: egoexo4d-aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: egoexo4d-aws-credentials
+                  key: AWS_DEFAULT_REGION
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+              ephemeral-storage: "4Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+              ephemeral-storage: "6Gi"
+          volumeMounts:
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      volumes:
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-baselines2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-127-egoexo4d-egopose-annotations.yaml -n williamli-scvl
