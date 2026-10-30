@@ -66,6 +66,15 @@
 # how much of the full-data expansion this run actually trains on. Killed
 # and resubmitted with the numeric memory floor instead, which doesn't
 # depend on the product string matching at all.
+#
+# DOWNGRADED TO SINGLE-GPU 2026-10-30 (same call as job-125's earlier
+# downgrade): after the memory-floor fix, the 2-GPU resubmission still sat
+# Pending 2h+ with zero FailedScheduling events (cluster-wide 2-GPU
+# scarcity, same pattern job-125 hit for 17h). Per explicit user request,
+# dropped torchrun/DDP entirely (single process -- is_ddp() is False when
+# WORLD_SIZE is unset, same fallback path job-87's debug run and job-125
+# already exercised safely) and halved cpu/memory/gpu requests to match.
+# Trades ~2x wall time for an actually-schedulable job.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -157,7 +166,7 @@ spec:
               cd "$REPO"
               nvidia-smi --query-gpu=index,name,memory.total --format=csv
               mkdir -p /data/raw_data/joint_coupled_merged_v1_ego4d_runs_round6
-              torchrun --standalone --nproc_per_node=2 \
+              "$PY" \
                 vans_qa/full_scale/train_joint_coupled_normalized.py \
                 --qa_split /data/raw_data/qa_split_merged_v1.json \
                 --precompute_cache_dir /data/vans_work/eval_input_cache_merged_v1_train \
@@ -190,15 +199,15 @@ spec:
               value: expandable_segments:True
           resources:
             requests:
-              cpu: "10"
-              memory: "27Gi"
+              cpu: "5"
+              memory: "16Gi"
               ephemeral-storage: "2Gi"
-              nvidia.com/gpu: "2"
+              nvidia.com/gpu: "1"
             limits:
-              cpu: "12"
-              memory: "31500Mi"
+              cpu: "6"
+              memory: "19200Mi"
               ephemeral-storage: "2400Mi"
-              nvidia.com/gpu: "2"
+              nvidia.com/gpu: "1"
           volumeMounts:
             - name: git-repo-code
               mountPath: /code
