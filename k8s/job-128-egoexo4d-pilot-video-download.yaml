@@ -1,0 +1,161 @@
+# Step 128: EgoExo4D pilot video download -- first real step toward the
+# reverse-eval probe the user asked for ("请帮忙补充一个对齐thinkjepa的反向eval,
+# 先在job72的最佳ckp上"), after job-127's annotation discovery (5053
+# files/8.1GB, egopose benchmark, ego views only) settled the real JSON
+# schema.
+#
+# Before writing a full ETL + a job-76-style probe run, this does a SMALL
+# (5-take) pilot download to validate the end-to-end plan on a slice first,
+# because reading ThinkJEPA's own egodex/trajectory_dataset.py camera_mode=
+# "egoexo" path in full (2026-10-30) turned up two problems that change the
+# plan from "reuse ThinkJEPA's egoexo path almost unchanged" to "replicate
+# its math ourselves, skip its own egoexo_* field names entirely":
+#   1. NpzCacheDataset._load_cache_sample() unconditionally rejects any cache
+#      npz containing an "egoexo_"-prefixed key (raises ValueError before any
+#      of the egoexo-specific code below it can ever run) -- the whole
+#      camera_mode="egoexo" consumption path is dead code, never exercised.
+#   2. Specifically because it's dead/untested, _build_camera_xyz_from_egoexo_
+#      pose() has an apparent world/camera-frame mixup: it copies
+#      annotation3D's xyz straight through (those are EgoExo4D's own
+#      multi-view-triangulated WORLD coordinates) and labels it "xyz_cam",
+#      then _repair_from_egoexo_extraction() projects that AGAIN through
+#      cam_ext as if it were camera-local -- a second, erroneous transform
+#      on coordinates already in world space.
+# Fix: skip the "egoexo_*" field names and the forbidden-key guard entirely.
+# We compute xyz_world directly from annotation3D (correct, no transform
+# needed), derive xyz_cam ourselves as the correct inverse (apply
+# cam_from_world = inverse(world_from_cam) to the world points), and write
+# everything using EgoDex's own native field names (xyz_cam/xyz_world/
+# R_cam/R_world/tfs_in_cam/tfs/cam_ext/cam_int/confs/lang_instruct) --
+# NpzCacheDataset accepts these directly as already-resolved supervision,
+# no "egoexo_" prefix involved, so the forbidden-key guard never triggers.
+#
+# This changes "reverse eval" from a single small ETL script into a 2-stage
+# pipeline: (A) cache_train/rebuild_causal_cache.py on the downloaded Aria
+# video for VJEPA+VLM-guidance features (unchanged, dataset-agnostic script),
+# then (B) our own merge script that reads each stage-A cache's actual
+# sampled frame indices, pulls matching hand/body/camera_pose annotations at
+# those frame times, does the camera math above, and writes the final
+# supervision fields into a copy of the cache. This job is just the raw
+# video for 5 pilot takes (all from the val split, since val is the only
+# split with both hand-pose ground truth AND camera_pose -- test's labels
+# are held out) -- confirms --views ego actually restricts to just the Aria
+# RGB stream per take (not all exo cams too) before downloading the full
+# ~65-take val set.
+#
+# --parts takes --views ego --uids <5 val take_uids with hand-pose GT>:
+# frame_aligned_videos/<ariaNN>_<stream>.mp4 per take (confirmed via takes.
+# json inspection -- camera id varies per take, e.g. aria03 not always
+# aria01, so the actual file path is take-specific, not hardcoded here).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-egoexo4d-pilot-video-download
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      containers:
+        - name: egoexo4d-pilot-video-download
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -uo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              export PATH="$(dirname "$PY"):$PATH"
+
+              "$PY" -m pip install --quiet -U "ego4d>=1.7.1"
+
+              mkdir -p ~/.aws
+              cat > ~/.aws/credentials <<CREDS
+              [default]
+              aws_access_key_id = ${AWS_ACCESS_KEY_ID}
+              aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}
+              CREDS
+              cat > ~/.aws/config <<CFG
+              [default]
+              region = ${AWS_DEFAULT_REGION}
+              CFG
+
+              OUT=/data/raw_data/egoexo4d_discovery
+              mkdir -p "$OUT"
+
+              UIDS="0733d5bc-b1a8-40c3-98de-9585e23eb2d9 0b812849-e4a6-47f3-a379-0127f36bce72 0ee17c1c-3c71-4e5c-bc6f-ae7dfb27232e 140253fd-9258-483a-9bf1-5426d91a05dd 2bb5152e-cab4-46dc-9aa6-e73007f7df8b"
+
+              echo "=== downloading 5 pilot takes' ego (Aria) video only ==="
+              egoexo -o "$OUT" --parts takes --views ego --uids $UIDS -y 2>&1 | tee "$OUT/pilot_video_dl.log"
+
+              echo
+              echo "=== resulting video files ==="
+              find "$OUT/takes" -iname "*.mp4" 2>/dev/null
+              echo
+              echo "=== sizes ==="
+              du -sh "$OUT/takes"/*/frame_aligned_videos/*.mp4 2>/dev/null
+
+              echo
+              echo "=== sanity: can decord actually open one? ==="
+              ONE=$(find "$OUT/takes" -iname "*.mp4" 2>/dev/null | head -1)
+              if [ -n "$ONE" ]; then
+                "$PY" - "$ONE" <<'PYEOF'
+              import sys
+              import decord
+              path = sys.argv[1]
+              vr = decord.VideoReader(path)
+              print("path:", path)
+              print("num_frames:", len(vr))
+              print("shape of frame 0:", vr[0].shape)
+              PYEOF
+              fi
+
+              echo "EGOEXO4D_PILOT_VIDEO_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: egoexo4d-aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: egoexo4d-aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: egoexo4d-aws-credentials
+                  key: AWS_DEFAULT_REGION
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+              ephemeral-storage: "8Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+              ephemeral-storage: "12Gi"
+          volumeMounts:
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      volumes:
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-baselines2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-128-egoexo4d-pilot-video-download.yaml -n williamli-scvl
