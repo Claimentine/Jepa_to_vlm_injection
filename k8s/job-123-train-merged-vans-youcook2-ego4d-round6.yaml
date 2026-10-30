@@ -51,6 +51,21 @@
 # outran even the bumped 3h NCCL barrier timeout while rank 1 waited on
 # the trailing dist.barrier(). See train_joint_coupled_normalized.py's
 # --max_test_items docstring for the full diagnosis.
+#
+# FIX 2026-10-30: added the >16000MiB nvidia.com/gpu.memory nodeAffinity
+# floor (job-125 already carries this). Without it, this job's first
+# ~4.5h ran on two RTX 2080 Ti (11264MiB) cards on
+# k8s-haosu-23.sdsc.optiputer.net DESPITE the product-name exclusion list
+# below already listing NVIDIA-GeForce-RTX-2080-Ti -- that node's
+# gpu.product label apparently doesn't match the expected string (a
+# NotIn match requires the label to literally equal a listed value; a
+# missing/differently-formatted label silently passes NotIn), so the
+# name-based exclusion alone isn't reliable on every node. Result: 423+
+# OOM skip warnings (both fwd and rev items) in under 5h with zero
+# checkpoints saved (train_log.jsonl still 0 bytes) -- silently degrading
+# how much of the full-data expansion this run actually trains on. Killed
+# and resubmitted with the numeric memory floor instead, which doesn't
+# depend on the product string matching at all.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -83,6 +98,13 @@ spec:
                       - nrp-01.laccd.edu
                       - nautilus-ext-gpu01.fullerton.edu
                       - dtn-gpu2.kreonet.net
+                  # name-based exclusion above isn't reliable on every node
+                  # (see 2026-10-30 FIX note) -- this numeric floor is the
+                  # real guard against landing on an <16GB card again.
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "16000"
       containers:
         - name: train-merged-vans-youcook2-ego4d-round6
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
