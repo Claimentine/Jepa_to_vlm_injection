@@ -1,0 +1,163 @@
+# Step 129: Stage A of the EgoExo4D reverse-eval pipeline -- run ThinkJEPA's
+# own cache_train/rebuild_causal_cache.py UNCHANGED on the 5 pilot takes'
+# Aria RGB video (job-128) to produce the VJEPA+VLM-guidance feature cache
+# (vjepa_input_feats/vjepa_target_feats/vlm_old/vlm_new/source_video_relpath/
+# source_total_frames/...). This script is dataset-agnostic and needs no
+# changes -- it only touches raw MP4s and knows nothing about pose.
+#
+# The pose-supervision side is already validated and does NOT depend on this
+# job: build_egoexo4d_supervision_hdf5.py already produced real .hdf5
+# sidecars for these same 5 takes (52/52 EgoDex query joints matched on
+# every take), and loading them through ThinkJEPA's own real
+# load_supervision_from_hdf5() produced plausible xyz_cam norms (0.08-1.26m,
+# right scale for an egocentric wrist/hand distance) and the exact known
+# Aria intrinsics -- confirming the camera math (world annotation3D -> xyz_
+# world as-is, correct inverse projection into xyz_cam) is right, unlike
+# ThinkJEPA's own untested/dead camera_mode="egoexo" path (see job-128's
+# header for the full diagnosis).
+#
+# The ONE thing this job still needs to confirm end-to-end: that the REAL
+# decoded frame count T this script finds for a given mp4 exactly matches
+# the T build_egoexo4d_supervision_hdf5.py already recorded for the same
+# file (both use decord with no resize, so frame count should be decoder-
+# and resize-independent -- but this is the last unverified assumption
+# before scaling from 5 pilot takes to the full ~351-take batch).
+# Once that's confirmed, probe_egodex_reverse_adapter.py needs only
+# EGODEX_BUNDLE repointed at a bundle whose supervision_hdf5/ holds our
+# sidecars and whose cache/ holds this job's output -- no code change to
+# camera_mode (it stays "egodex"/"auto", since we never write egoexo_-
+# prefixed fields at all).
+#
+# --path_manifest restricts this to exactly the 5 pilot takes' RGB stream
+# (not the extra slam/et/collage/gp05/audio files job-128's broader --views
+# ego download also pulled in for these same takes).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-egoexo4d-pilot-causal-cache
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  # name-based exclusion alone isn't reliable on every node
+                  # (job-123 landed on an excluded 2080Ti anyway) -- this
+                  # numeric floor is the real guard.
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "16000"
+      containers:
+        - name: egoexo4d-pilot-causal-cache
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              export PATH="$(dirname "$PY"):$PATH"
+              cd /home/jovyan/ThinkJEPA
+
+              DISC=/data/raw_data/egoexo4d_discovery
+              OUT=/data/raw_data/egoexo4d_probe_bundle_pilot/cache
+              mkdir -p "$OUT"
+
+              MANIFEST=/tmp/pilot_takes_manifest.txt
+              cat > "$MANIFEST" <<'EOF'
+              takes/indiana_bike_10_7/frame_aligned_videos/aria02_214-1.mp4
+              takes/upenn_0331_Guitar_1_5/frame_aligned_videos/aria01_214-1.mp4
+              takes/georgiatech_bike_16_2/frame_aligned_videos/aria03_214-1.mp4
+              takes/iiith_cooking_59_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/indiana_bike_10_9/frame_aligned_videos/aria02_214-1.mp4
+              EOF
+
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              "$PY" cache_train/rebuild_causal_cache.py \
+                --file_dir "$DISC" \
+                --path_manifest "$MANIFEST" \
+                --output_dir "$OUT" \
+                --pretrained Qwen/Qwen3-VL-2B-Thinking \
+                --qwen_checkpoint_sha 33e0ad94c327808ebc7d3bbc97e78e600f1eeecd \
+                --vjepa_checkpoint "$VJEPA2_CKPT" \
+                --hf_home "$HF_HOME" 2>&1 | tee /data/raw_data/egoexo4d_probe_bundle_pilot/stage_a.log
+
+              echo
+              echo "=== resulting cache npz files ==="
+              find "$OUT" -iname "*.npz"
+
+              echo
+              echo "=== cross-check: source_total_frames vs our supervision hdf5's T ==="
+              "$PY" - <<'PYEOF'
+              import numpy as np, glob
+              for p in sorted(glob.glob('/data/raw_data/egoexo4d_probe_bundle_pilot/cache/**/*.npz', recursive=True)):
+                  with np.load(p, allow_pickle=False) as z:
+                      relpath = str(z['source_video_relpath'])
+                      T = int(z['source_total_frames'])
+                      has_vjepa = 'vjepa_input_feats' in z.files
+                  print(f"{p}: source_video_relpath={relpath} source_total_frames={T} has_vjepa={has_vjepa}")
+              PYEOF
+
+              echo "EGOEXO4D_PILOT_CAUSAL_CACHE_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: VJEPA2_CKPT
+              value: /data/checkpoints/vjepa2/vitl.pt
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "5"
+              memory: "16Gi"
+              ephemeral-storage: "4Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "6"
+              memory: "16Gi"
+              ephemeral-storage: "6Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      volumes:
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-baselines2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-129-egoexo4d-pilot-causal-cache.yaml -n williamli-scvl
