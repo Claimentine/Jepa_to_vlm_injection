@@ -1,0 +1,125 @@
+# Step 132: Stage A, full scale -- rebuild_causal_cache.py over all 351
+# EgoExo4D takes (job-131's download, already cleaned to exactly the 351
+# rgb mp4s so a plain --file_dir discovers exactly the right set with no
+# --path_manifest needed this time).
+#
+# SHARDED: job-129's 5-take pilot took 3h38m wall time (~6-7min one-time
+# VJEPA+Qwen load, ~38min/video marginal cost -- roughly constant
+# regardless of raw video length, since exactly 64 frames get sampled out
+# of any video regardless of its total_frames). Sequentially that's
+# ~9-10 days for 351 videos on one GPU -- not viable. rebuild_causal_
+# cache.py already supports sharding via plain RANK/WORLD_SIZE env vars
+# (discover_distributed_runtime() + stable_rank_for_video(), no torchrun/
+# DDP needed -- confirmed by reading main() directly): each of
+# WORLD_SIZE=7 independent single-GPU Jobs below processes a disjoint,
+# deterministic ~50-video slice, so whatever the cluster actually
+# schedules concurrently directly cuts wall time (1 running shard ~= the
+# old 9-10 days per-video rate over 1/7th the videos ~= ~1.3-1.6 days;
+# more concurrent shards cut it further).
+#
+# This is the 0/7 shard. Generated from a template (see
+# the loop in the commit/apply notes). All 7 shards share --file_dir/
+# --output_dir so they write into the same cache tree without conflict
+# (stable_rank_for_video guarantees disjoint video sets per rank).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-egoexo4d-full-causal-cache-shard-0
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "16000"
+      containers:
+        - name: egoexo4d-full-causal-cache-shard
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              export PATH="$(dirname "$PY"):$PATH"
+              cd /home/jovyan/ThinkJEPA
+
+              DISC=/data/raw_data/egoexo4d_discovery
+              OUT=/data/raw_data/egoexo4d_probe_bundle_full/cache
+              mkdir -p "$OUT"
+
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              "$PY" cache_train/rebuild_causal_cache.py \
+                --file_dir "$DISC" \
+                --output_dir "$OUT" \
+                --pretrained Qwen/Qwen3-VL-2B-Thinking \
+                --qwen_checkpoint_sha 33e0ad94c327808ebc7d3bbc97e78e600f1eeecd \
+                --vjepa_checkpoint "$VJEPA2_CKPT" \
+                --hf_home "$HF_HOME" 2>&1 | tee "/data/raw_data/egoexo4d_probe_bundle_full/stage_a_shard_0.log"
+
+              echo "EGOEXO4D_FULL_CAUSAL_CACHE_SHARD_0_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: VJEPA2_CKPT
+              value: /data/checkpoints/vjepa2/vitl.pt
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+            - name: RANK
+              value: "0"
+            - name: WORLD_SIZE
+              value: "7"
+          resources:
+            requests:
+              cpu: "5"
+              memory: "16Gi"
+              ephemeral-storage: "4Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "6"
+              memory: "16Gi"
+              ephemeral-storage: "6Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      volumes:
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
