@@ -1,0 +1,242 @@
+# Step 135: rebuilds the 101 EgoExo4D cache npz files that job-132's
+# shard-4 and shard-5 produced with a DIFFERENT cache_config_fingerprint
+# than the other 5 shards.
+#
+# Root cause, confirmed by diffing both shards' own configuration_json
+# field inside a sample npz: every functional setting is byte-identical
+# (qwen revision "main" resolved the same, same checkpoint_sha, same
+# vjepa_checkpoint_sha256, same layers/prompt/sampling) EXCEPT
+# extractor_source_sha256 -- a hash of rebuild_causal_cache.py's own file
+# content. shard-4/5 ran on ruixin-conda-vol-vlm/-vlm2, whose copies of
+# ThinkJEPA's cache_train/rebuild_causal_cache.py differ byte-for-byte
+# from the copies on the other 5 conda-storage PVCs (ruixin-conda-vol,
+# -ddp, -ddp2, -precompute, -baselines all agree with each other). Purely
+# a provenance/identity-hash artifact, not a functional difference in the
+# extracted features -- but NpzCacheDataset._validate_archive_set_identity
+# strictly rejects a cache_dir whose files don't all share one fingerprint
+# (confirmed hitting exactly this error via --inspect_batch_only before
+# committing to the full probe run), so the 101 affected files were
+# deleted and are rebuilt here on ruixin-conda-vol (confirmed to produce
+# the same fingerprint as shard-0/1/2/3/6).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-egoexo4d-causal-cache-fix-fingerprint
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "16000"
+      containers:
+        - name: egoexo4d-causal-cache-fix-fingerprint
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              export PATH="$(dirname "$PY"):$PATH"
+              cd /home/jovyan/ThinkJEPA
+
+              DISC=/data/raw_data/egoexo4d_discovery
+              OUT=/data/raw_data/egoexo4d_probe_bundle_full/cache
+
+              MANIFEST=/tmp/rebuild_manifest.txt
+              cat > "$MANIFEST" <<'EOF'
+              takes/cmu_bike09_5/frame_aligned_videos/aria01_214-1.mp4
+              takes/cmu_bike14_4/frame_aligned_videos/aria01_214-1.mp4
+              takes/cmu_bike16_3/frame_aligned_videos/aria01_214-1.mp4
+              takes/cmu_bike17_3/frame_aligned_videos/aria01_214-1.mp4
+              takes/cmu_bike20_4/frame_aligned_videos/aria01_214-1.mp4
+              takes/fair_bike_06_12/frame_aligned_videos/aria06_214-1.mp4
+              takes/fair_bike_06_6/frame_aligned_videos/aria06_214-1.mp4
+              takes/fair_bike_06_8/frame_aligned_videos/aria06_214-1.mp4
+              takes/fair_bike_07_12/frame_aligned_videos/aria07_214-1.mp4
+              takes/fair_bike_07_8/frame_aligned_videos/aria07_214-1.mp4
+              takes/fair_cooking_08_8/frame_aligned_videos/aria02_214-1.mp4
+              takes/georgiatech_bike_03_11/frame_aligned_videos/aria04_214-1.mp4
+              takes/georgiatech_bike_14_6/frame_aligned_videos/aria04_214-1.mp4
+              takes/georgiatech_bike_15_4/frame_aligned_videos/aria02_214-1.mp4
+              takes/georgiatech_covid_05_12/frame_aligned_videos/aria01_214-1.mp4
+              takes/georgiatech_covid_05_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/georgiatech_covid_12_3/frame_aligned_videos/aria01_214-1.mp4
+              takes/georgiatech_covid_12_5/frame_aligned_videos/aria01_214-1.mp4
+              takes/georgiatech_covid_12_7/frame_aligned_videos/aria01_214-1.mp4
+              takes/georgiatech_covid_13_6/frame_aligned_videos/aria01_214-1.mp4
+              takes/georgiatech_covid_18_12/frame_aligned_videos/aria02_214-1.mp4
+              takes/iiith_cooking_111_4/frame_aligned_videos/aria01_214-1.mp4
+              takes/iiith_cooking_116_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/iiith_cooking_117_4/frame_aligned_videos/aria01_214-1.mp4
+              takes/iiith_cooking_123_4/frame_aligned_videos/aria01_214-1.mp4
+              takes/iiith_cooking_124_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/iiith_cooking_128_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/iiith_cooking_41_1/frame_aligned_videos/aria01_214-1.mp4
+              takes/iiith_cooking_57_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/iiith_cooking_78_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/iiith_cooking_89_6/frame_aligned_videos/aria01_214-1.mp4
+              takes/iiith_cooking_99_4/frame_aligned_videos/aria01_214-1.mp4
+              takes/iiith_guitar_002_8/frame_aligned_videos/aria01_214-1.mp4
+              takes/indiana_music_04_5/frame_aligned_videos/aria01_214-1.mp4
+              takes/indiana_music_06_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/indiana_music_09_3/frame_aligned_videos/aria01_214-1.mp4
+              takes/nus_cooking_07_5/frame_aligned_videos/aria01_214-1.mp4
+              takes/sfu_covid_001_8/frame_aligned_videos/aria01_214-1.mp4
+              takes/sfu_covid_004_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/sfu_covid_010_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/upenn_0331_Guitar_1_5/frame_aligned_videos/aria01_214-1.mp4
+              takes/upenn_0407_Violin_1_3/frame_aligned_videos/aria01_214-1.mp4
+              takes/upenn_0701_Piano_3_5/frame_aligned_videos/aria01_214-1.mp4
+              takes/upenn_0709_Guitar_1_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/upenn_0717_Piano_1_3/frame_aligned_videos/aria01_214-1.mp4
+              takes/upenn_0721_Piano_1_3/frame_aligned_videos/aria01_214-1.mp4
+              takes/upenn_0722_Violin_1_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/utokyo_pcr_2001_35_4/frame_aligned_videos/aria01_214-1.mp4
+              takes/cmu_bike02_3/frame_aligned_videos/aria01_214-1.mp4
+              takes/cmu_bike02_4/frame_aligned_videos/aria01_214-1.mp4
+              takes/cmu_bike08_5/frame_aligned_videos/aria01_214-1.mp4
+              takes/fair_bike_01_12/frame_aligned_videos/aria01_214-1.mp4
+              takes/fair_bike_01_16/frame_aligned_videos/aria01_214-1.mp4
+              takes/fair_bike_06_18/frame_aligned_videos/aria06_214-1.mp4
+              takes/fair_bike_06_20/frame_aligned_videos/aria06_214-1.mp4
+              takes/fair_bike_06_3/frame_aligned_videos/aria06_214-1.mp4
+              takes/fair_bike_06_4/frame_aligned_videos/aria06_214-1.mp4
+              takes/fair_bike_07_10/frame_aligned_videos/aria07_214-1.mp4
+              takes/fair_bike_07_2/frame_aligned_videos/aria07_214-1.mp4
+              takes/fair_bike_07_4/frame_aligned_videos/aria07_214-1.mp4
+              takes/georgiatech_bike_02_6/frame_aligned_videos/aria02_214-1.mp4
+              takes/georgiatech_bike_07_10/frame_aligned_videos/aria06_214-1.mp4
+              takes/georgiatech_bike_11_7/frame_aligned_videos/aria05_214-1.mp4
+              takes/georgiatech_bike_14_2/frame_aligned_videos/aria04_214-1.mp4
+              takes/georgiatech_bike_15_2/frame_aligned_videos/aria02_214-1.mp4
+              takes/georgiatech_bike_18_2/frame_aligned_videos/aria02_214-1.mp4
+              takes/georgiatech_bike_18_6/frame_aligned_videos/aria02_214-1.mp4
+              takes/georgiatech_bike_19_10/frame_aligned_videos/aria05_214-1.mp4
+              takes/georgiatech_covid_02_10/frame_aligned_videos/aria01_214-1.mp4
+              takes/georgiatech_covid_02_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/georgiatech_covid_03_10/frame_aligned_videos/aria01_214-1.mp4
+              takes/georgiatech_covid_03_12/frame_aligned_videos/aria01_214-1.mp4
+              takes/georgiatech_covid_04_6/frame_aligned_videos/aria02_214-1.mp4
+              takes/georgiatech_covid_12_13/frame_aligned_videos/aria01_214-1.mp4
+              takes/georgiatech_covid_18_6/frame_aligned_videos/aria02_214-1.mp4
+              takes/georgiatech_covid_18_8/frame_aligned_videos/aria02_214-1.mp4
+              takes/iiith_cooking_111_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/iiith_cooking_112_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/iiith_cooking_138_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/iiith_cooking_148_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/iiith_cooking_80_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/iiith_cooking_81_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/iiith_cooking_90_4/frame_aligned_videos/aria01_214-1.mp4
+              takes/indiana_bike_06_5/frame_aligned_videos/aria01_214-1.mp4
+              takes/indiana_bike_06_9/frame_aligned_videos/aria01_214-1.mp4
+              takes/indiana_music_11_3/frame_aligned_videos/aria02_214-1.mp4
+              takes/nus_cooking_06_3/frame_aligned_videos/aria01_214-1.mp4
+              takes/nus_cooking_06_5/frame_aligned_videos/aria01_214-1.mp4
+              takes/nus_cooking_07_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/nus_cooking_07_4/frame_aligned_videos/aria01_214-1.mp4
+              takes/nus_cooking_17_5/frame_aligned_videos/aria01_214-1.mp4
+              takes/nus_cpr_08_2/frame_aligned_videos/aria01_214-1.mp4
+              takes/sfu_covid_001_10/frame_aligned_videos/aria01_214-1.mp4
+              takes/sfu_covid_008_16/frame_aligned_videos/aria01_214-1.mp4
+              takes/sfu_covid_010_4/frame_aligned_videos/aria01_214-1.mp4
+              takes/upenn_0331_Guitar_4_3/frame_aligned_videos/aria01_214-1.mp4
+              takes/upenn_0701_Piano_3_4/frame_aligned_videos/aria01_214-1.mp4
+              takes/upenn_0718_Violin_2_5/frame_aligned_videos/aria01_214-1.mp4
+              takes/upenn_0721_Piano_2_3/frame_aligned_videos/aria01_214-1.mp4
+              takes/upenn_0722_Piano_2_4/frame_aligned_videos/aria01_214-1.mp4
+              takes/utokyo_pcr_2001_37_2/frame_aligned_videos/aria01_214-1.mp4
+              EOF
+
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              "$PY" cache_train/rebuild_causal_cache.py \
+                --file_dir "$DISC" \
+                --path_manifest "$MANIFEST" \
+                --output_dir "$OUT" \
+                --pretrained Qwen/Qwen3-VL-2B-Thinking \
+                --qwen_checkpoint_sha 33e0ad94c327808ebc7d3bbc97e78e600f1eeecd \
+                --vjepa_checkpoint "$VJEPA2_CKPT" \
+                --hf_home "$HF_HOME" 2>&1 | tee /data/raw_data/egoexo4d_probe_bundle_full/stage_a_fix_fingerprint.log
+
+              echo
+              echo "=== verify fingerprint now matches ==="
+              "$PY" - <<'PYEOF'
+              import numpy as np, glob
+              from collections import Counter
+              counts = Counter()
+              for p in sorted(glob.glob('/data/raw_data/egoexo4d_probe_bundle_full/cache/**/*.npz', recursive=True)):
+                  with np.load(p, allow_pickle=False) as z:
+                      counts[str(z['cache_config_fingerprint'])] += 1
+              for fp, c in counts.items():
+                  print(fp, c)
+              print('total:', sum(counts.values()))
+              PYEOF
+
+              echo "EGOEXO4D_FIX_FINGERPRINT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: VJEPA2_CKPT
+              value: /data/checkpoints/vjepa2/vitl.pt
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "5"
+              memory: "16Gi"
+              ephemeral-storage: "4Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "6"
+              memory: "16Gi"
+              ephemeral-storage: "6Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      volumes:
+        - name: conda-storage
+          persistentVolumeClaim:
+            # confirmed to produce the same cache_config_fingerprint as
+            # shard-0/1/2/3/6 (unlike -vlm/-vlm2, which shard-4/5 used).
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-135-egoexo4d-causal-cache-fix-mismatched-fingerprint.yaml -n williamli-scvl
