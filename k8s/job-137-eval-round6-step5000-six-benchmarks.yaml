@@ -1,0 +1,169 @@
+# Step 137: 6-benchmark forward QA eval of round6's step_5000.pt --
+# per user request, to see how the checkpoint at its current peak
+# training-time val_acc (0.91 at step 5000, the highest single-snapshot
+# value seen in either round5 or round6's runs) actually performs on the
+# real held-out test splits, not just the noisy n=100 training-time probe.
+#
+# CrossTask uses live decode (no --precompute_cache_dir) -- see job-136's
+# header for why that cache is stale (missing mm_token_type_ids).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-eval-round6-step5000-six-benchmarks
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "16000"
+      containers:
+        - name: eval-round6-step5000
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              RUN=/data/raw_data/joint_coupled_merged_v1_ego4d_runs_round6
+              CKPT="round6_step5000=${RUN}/step_5000.pt"
+
+              cd "$REPO"
+
+              echo "=== COIN full-test ==="
+              export VANS_WORK_ROOT=/data/vans_work
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_full.json \
+                --split_part test \
+                --checkpoint "$CKPT" \
+                --resume \
+                --out_path /data/raw_data/round6_step5000_eval_coin.json
+
+              echo "=== COIN-hard (temporal) ==="
+              export VANS_WORK_ROOT=/data/vans_work
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --split_part test \
+                --checkpoint "$CKPT" \
+                --resume \
+                --out_path /data/raw_data/round6_step5000_eval_coin_hard.json
+
+              echo "=== YouCook2 ==="
+              export VANS_WORK_ROOT=/data/vans_work_youcook
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_youcook2.json \
+                --split_part test \
+                --checkpoint "$CKPT" \
+                --resume \
+                --out_path /data/raw_data/round6_step5000_eval_youcook2.json
+
+              echo "=== TempCompass OOD ==="
+              export VANS_WORK_ROOT=/data/vans_work_tempcompass
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_tempcompass.json \
+                --split_part test \
+                --checkpoint "$CKPT" \
+                --resume \
+                --out_path /data/raw_data/round6_step5000_eval_tempcompass.json
+
+              echo "=== MVBench OOD ==="
+              export VANS_WORK_ROOT=/data/vans_work_mvbench
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_mvbench.json \
+                --split_part test \
+                --checkpoint "$CKPT" \
+                --resume \
+                --out_path /data/raw_data/round6_step5000_eval_mvbench.json
+
+              echo "=== CrossTask OOD (live decode) ==="
+              export VANS_WORK_ROOT=/data/vans_work_crosstask
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_crosstask.json \
+                --split_part test \
+                --checkpoint "$CKPT" \
+                --resume \
+                --out_path /data/raw_data/round6_step5000_eval_crosstask.json
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "24Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "28Gi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-baselines2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-137-eval-round6-step5000-six-benchmarks.yaml -n williamli-scvl
