@@ -75,6 +75,18 @@
 # WORLD_SIZE is unset, same fallback path job-87's debug run and job-125
 # already exercised safely) and halved cpu/memory/gpu requests to match.
 # Trades ~2x wall time for an actually-schedulable job.
+#
+# RESUME 2026-11-01: the pod that had been running this since 2026-10-30
+# (43h, up to step 5500+, fwd_val_acc peaking at 0.91 at step 5000) died
+# with Init:ContainerStatusUnknown and no retained events (likely a node
+# eviction) -- kubectl's Job controller silently replaced it with a fresh
+# pod that restarted training from step 0, since
+# train_joint_coupled_normalized.py had no resume path at all. Caught this
+# at step ~1096 of the restarted run (before it reached step 2000 and
+# would have overwritten the old run's step_2000.pt), deleted that job,
+# and added --resume_from (loads injector/predictor/bridge weights only --
+# optimizer state was never persisted by this script either way) pointed
+# at the old run's step_5000.pt, its latest surviving checkpoint.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -180,6 +192,7 @@ spec:
                 --save_every_steps 1000 \
                 --max_val_items 100 \
                 --max_test_items 300 \
+                --resume_from /data/raw_data/joint_coupled_merged_v1_ego4d_runs_round6/step_5000.pt \
                 --out_dir /data/raw_data/joint_coupled_merged_v1_ego4d_runs_round6 2>&1 \
                 | tee /data/raw_data/joint_coupled_merged_v1_ego4d_runs_round6/full_run.log
           env:

@@ -269,6 +269,15 @@ def main():
                           "the whole job after all the real training work is already done.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out_dir", default=os.path.join(fwd.BASE, "raw_data/joint_coupled_normalized_runs"))
+    ap.add_argument("--resume_from", default=None,
+                     help="path to a step_*.pt checkpoint to resume weights from (injector_state/"
+                          "predictor_state/bridge_state only -- this script never persists optimizer "
+                          "state, so AdamW restarts fresh regardless; the step counter and "
+                          "best_fwd_val_acc/best_rev_val_mse trackers also restart from the checkpoint's "
+                          "step / from scratch respectively). Added 2026-11-01 after a node failure "
+                          "killed round6's pod mid-run and the Job controller's automatic pod "
+                          "replacement silently restarted training from step 0 with no way to recover "
+                          "the lost progress -- this script had no resume path at all until now.")
     args = ap.parse_args()
 
     if is_ddp():
@@ -339,6 +348,18 @@ def main():
     predictor.guidance_old_adapter = ForwardingAdapter(bridge.vlm_to_jepa, predictor.context_adapter)
     predictor.guidance_new_adapter = ForwardingAdapter(bridge.vlm_to_jepa, predictor.context_adapter)
 
+    resume_step = 0
+    if args.resume_from:
+        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
+        injector.load_state_dict(ckpt["injector_state"])
+        predictor.load_state_dict(ckpt["predictor_state"])
+        bridge.load_state_dict(ckpt["bridge_state"])
+        resume_step = ckpt["step"]
+        if is_main:
+            print(f"[INFO] resumed injector/predictor/bridge weights from {args.resume_from} "
+                  f"(checkpoint step={resume_step}); optimizer state and best_*_val trackers "
+                  f"restart fresh", flush=True)
+
     all_params = list(injector.parameters()) + list(predictor.parameters()) + list(bridge.parameters())
     opt = torch.optim.AdamW(all_params, lr=args.lr)
     n_fwd_params = sum(p.numel() for p in injector.parameters())
@@ -353,9 +374,9 @@ def main():
 
     normalizer = LossNormalizer(decay=args.loss_norm_decay, disabled=args.disable_norm)
 
-    log_f = open(os.path.join(run_dir, "train_log.jsonl"), "w") if is_main else None
+    log_f = open(os.path.join(run_dir, "train_log.jsonl"), "a" if args.resume_from else "w") if is_main else None
     rng = random.Random(args.seed)
-    step = 0
+    step = resume_step
     n_fwd_skipped = 0
     n_rev_skipped = 0
     seen_exc_types = set()
@@ -394,6 +415,8 @@ def main():
         scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=_lr_lambda)
         if is_main:
             print(f"[INFO] lr_schedule=warmup_cosine warmup_steps={warmup_steps} total_steps={total_steps}", flush=True)
+        for _ in range(resume_step):
+            scheduler.step()
     else:
         scheduler = None
 
