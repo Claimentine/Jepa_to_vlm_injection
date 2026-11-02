@@ -1,0 +1,138 @@
+# Step 138: Ego4D GoalStep forward QA eval (qa_split_ego4d.json, job-104,
+# test-only, 1829 items) -- the 7th forward benchmark, added per explicit
+# user request to include Ego4D in every eval from now on. Backfilling it
+# here for the two checkpoints the current eval round already covers on
+# the other 6 benchmarks (round6_step5000 via job-137, film_rerun via
+# job-136), so both get the full 7-benchmark picture.
+#
+# LIVE DECODE, not job-120's --precompute_cache_dir (eval_input_cache_ego4d)
+# -- job-119's own header claims it "falls back to live decode on any
+# individual cache miss", but that only covers a MISSING cache entry, not
+# a present-but-STALE one. job-130's round5 CrossTask run hit exactly that
+# stale-schema failure (1557/1558 items dead on "mm_token_type_ids is
+# missing" from a cache built before the current Qwen3VL processor
+# required that field whenever video_grid_thw is present) with a cache
+# built in the same era as this Ego4D one. Not worth re-verifying
+# item-by-item freshness here when omitting the flag costs nothing but
+# some extra decode time.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-eval-ego4d-round6step5000-and-filmrerun
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "16000"
+      containers:
+        - name: eval-ego4d
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              export VANS_WORK_ROOT=/data/vans_work_ego4d_qa
+
+              echo "=== Ego4D GoalStep full-test: round6_step5000 (live decode) ==="
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_ego4d.json \
+                --split_part test \
+                --checkpoint "round6_step5000=/data/raw_data/joint_coupled_merged_v1_ego4d_runs_round6/step_5000.pt" \
+                --resume \
+                --out_path /data/raw_data/round6_step5000_eval_ego4d.json
+
+              echo "=== Ego4D GoalStep full-test: film_rerun (live decode) ==="
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_ego4d.json \
+                --split_part test \
+                --checkpoint "film_rerun=/data/raw_data/ablation_film_rerun_runs/best_forward.pt" \
+                --resume \
+                --out_path /data/raw_data/film_rerun_eval_ego4d.json
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "24Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "28Gi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-138-eval-ego4d-round6step5000-and-filmrerun.yaml -n williamli-scvl
