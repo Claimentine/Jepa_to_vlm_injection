@@ -1,0 +1,156 @@
+# Step 134: the EgoExo4D reverse-direction probe the user originally asked
+# for ("我现在拿到了egoexo4D的access,请帮忙补充一个对齐thinkjepa的反向eval"),
+# now that the full data pipeline is validated and built:
+#   - job-127: egopose benchmark annotations (351 hand-pose-labeled takes,
+#     286 train + 65 val)
+#   - job-131: Aria RGB video for all 351 takes, cleaned to just the needed
+#     stream (37GB)
+#   - build_egoexo4d_supervision_hdf5.py: EgoDex-hdf5-shaped supervision
+#     sidecar per take (351/351 succeeded, 52/52 joints matched on every
+#     take) -- the real, production-exercised load_supervision_from_hdf5
+#     path, not ThinkJEPA's own dead/untested camera_mode="egoexo" field-
+#     name path (see job-128's header for the full diagnosis of why that
+#     path doesn't work)
+#   - job-132 (7-way sharded): rebuild_causal_cache.py VJEPA+VLM feature
+#     cache for all 351 takes (351/351 saved, 0 failed, cross-checked
+#     source_total_frames against the supervision builder's own decord
+#     count -- exact match on every pilot take)
+#   - manifests: 286 train_cache.txt / 65 test_cache.txt entries
+#
+# EGODEX_BUNDLE points at this new bundle; camera_mode stays "egodex" (the
+# script's existing default) since we write real xyz_cam/cam_ext/etc.
+# fields through the hdf5-sidecar path, never egoexo_*-prefixed ones -- so
+# NO code change to probe_egodex_reverse_adapter.py is needed, just the
+# env var and the --checkpoints override.
+#
+# RERUN 2026-11-01: the first run came back losing to the static (stay-
+# put) baseline on both ADE and FDE -- investigated and root-caused to
+# EgoExo4D's hand-pose annotation coverage ending partway through most
+# takes (median 67% of each take's raw frame count, as low as 15% on some
+# bike takes) while build_egoexo4d_supervision_hdf5.py's nearest_fill
+# extrapolated the last real position forward/backward and reported it as
+# equally confident as genuine annotation. Fixed: the hdf5 build now zeros
+# confidence outside each joint's real annotated span, a one-off patch
+# script applied that fix to all 351 already-built files in place (351/351
+# patched, 18037 joint-confidence arrays corrected), and
+# probe_egodex_reverse_adapter.py now actually masks the static/constant-
+# velocity baselines, the probe's training loss, and its final ADE/FDE/acc
+# eval using confs -- previously read from the batch and discarded, same
+# as upstream ThinkJEPA's own thinker_train.py. This rerun is to see
+# whether the probe's real motion signal looks different against a fair,
+# non-fabricated target.
+#
+# Checkpoint: per explicit user correction ("我希望在我们基于job72然后反向ft
+# 的模型上做这个eval"), this is egodex_finetuned_job72_step4000_round3's
+# predictor.pt (job72_step4000 fine-tuned on EgoDex for 38 total epochs
+# across 3 rounds), NOT the raw job72_step4000 checkpoint -- passed via the
+# script's existing label=path override syntax, same convention job-112
+# itself used to chain from round2's checkpoint.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-egoexo4d-reverse-probe-round3ft
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "16000"
+      containers:
+        - name: egoexo4d-reverse-probe
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/thinkjepa/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/egoexo4d_reverse_probe_round3ft_full
+              "$PY" vans_qa/full_scale/probe_egodex_reverse_adapter.py \
+                --checkpoints "job72_round3_ft=/data/raw_data/egodex_finetuned_job72_step4000_round3/predictor.pt" \
+                --joint_subset all \
+                --batch_size 4 \
+                --probe_epochs 10 \
+                --num_workers 4 \
+                --out_json /data/raw_data/egoexo4d_reverse_probe_round3ft_full/results.json \
+                2>&1 | tee /data/raw_data/egoexo4d_reverse_probe_round3ft_full/full_run.log
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: EGODEX_BUNDLE
+              value: /data/raw_data/egoexo4d_probe_bundle_full
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests: {cpu: "4", memory: "20Gi", ephemeral-storage: "2Gi", nvidia.com/gpu: "1"}
+            limits: {cpu: "4.8", memory: "24Gi", ephemeral-storage: "4Gi", nvidia.com/gpu: "1"}
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+            - name: shm
+              mountPath: /dev/shm
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-134-egoexo4d-reverse-probe-round3ft.yaml -n williamli-scvl
