@@ -1,0 +1,133 @@
+# Step 140: EgoExo4D reverse-direction probe (ADE/FDE/acc@0.05 vs static and
+# constant-velocity baselines) for round6's step_5000.pt -- per explicit user
+# request, to see how the joint-coupled-training checkpoint's predictor does
+# on the same fixed (confidence-masked) EgoExo4D eval job-134 just ran for
+# job72_round3_ft.
+#
+# step_5000.pt is a train_joint_coupled_normalized.py checkpoint: {"step",
+# "injection_mode", "layer_strategy", "injector_state", "predictor_state",
+# "bridge_state"}. probe_egodex_reverse_adapter.py's load_frozen_predictor()
+# already handles this shape directly (bridge_state present -> rewires
+# ForwardingAdapter from the shared CrossModalBridge before loading
+# predictor_state, exactly as it already does for job-134's reverse-FT
+# checkpoint and for job-42/49/60's best_reverse.pt) -- no code change
+# needed, just --checkpoints round6_step5000=.../step_5000.pt.
+#
+# Uses the same EGODEX_BUNDLE=egoexo4d_probe_bundle_full (351 takes) whose
+# supervision hdf5 files were patched 2026-11-01 to zero confidence outside
+# each joint's real annotated span (see job-134's own header + commit
+# 8941ca4 for the full root-cause writeup). job-134's result on this fixed
+# data: ADE=0.1088 vs static baseline's 0.0586 (still losing), and FDE
+# collapsed to 0.000000 for EVERY method (model and both baselines alike)
+# because 0/65 test takes have valid annotation at the window's final future
+# frame -- i.e. FDE is structurally unmeasurable on this bundle under
+# ThinkJEPA's full-take window sampling, not a modeling result. Expect the
+# same FDE=0 artifact here; ADE/acc@0.05 are the numbers that matter.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-egoexo4d-reverse-probe-round6-step5000
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "16000"
+      containers:
+        - name: egoexo4d-reverse-probe-round6step5000
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/thinkjepa/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/egoexo4d_reverse_probe_round6_step5000_full
+              "$PY" vans_qa/full_scale/probe_egodex_reverse_adapter.py \
+                --checkpoints "round6_step5000=/data/raw_data/joint_coupled_merged_v1_ego4d_runs_round6/step_5000.pt" \
+                --joint_subset all \
+                --batch_size 4 \
+                --probe_epochs 10 \
+                --num_workers 4 \
+                --out_json /data/raw_data/egoexo4d_reverse_probe_round6_step5000_full/results.json \
+                2>&1 | tee /data/raw_data/egoexo4d_reverse_probe_round6_step5000_full/full_run.log
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: EGODEX_BUNDLE
+              value: /data/raw_data/egoexo4d_probe_bundle_full
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests: {cpu: "4", memory: "20Gi", ephemeral-storage: "2Gi", nvidia.com/gpu: "1"}
+            limits: {cpu: "4.8", memory: "24Gi", ephemeral-storage: "4Gi", nvidia.com/gpu: "1"}
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+            - name: shm
+              mountPath: /dev/shm
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-140-egoexo4d-reverse-probe-round6-step5000.yaml -n williamli-scvl
