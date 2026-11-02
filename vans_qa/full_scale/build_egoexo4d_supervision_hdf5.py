@@ -206,7 +206,30 @@ def build_supervision_hdf5(
         xyz_dense = _nearest_fill(xyz, frames, num_frames)
         nviews_dense = _nearest_fill(nviews[:, None], frames, num_frames)[:, 0]
         joint_tfs[:, j, :3, 3] = xyz_dense.astype(np.float32)
-        joint_confs[:, j] = nviews_dense.astype(np.float32)
+        # FIX 2026-11-01: nviews_dense alone can't tell a genuinely-annotated
+        # frame from one that's just holding the nearest real annotation's
+        # edge value, since _nearest_fill extrapolates the SAME nonzero
+        # nviews forever past the last real sample -- confirmed empirically
+        # on the 65-take EgoExo4D reverse-probe test split: hand annotation
+        # coverage ends at a median of 67% of each take's raw frame count
+        # (as low as 15% on some bike takes), but every frame past that
+        # point still reported a plausible-looking nonzero confidence,
+        # making the probe/eval silently train and score against a target
+        # that's actually frozen at its last real position for a large
+        # fraction of every window (ThinkJEPA's own confs field exists for
+        # exactly this kind of masking but is read-and-discarded everywhere
+        # in its pipeline -- EgoDex never needed it, since its ARKit/SLAM
+        # hand tracking has no coverage gap to flag in the first place).
+        # Zero confidence outside [frames.min(), frames.max()] -- the real
+        # annotated span -- so a downstream consumer that actually checks
+        # confs (see probe_egodex_reverse_adapter.py's masking) can tell
+        # genuine annotation from edge extrapolation.
+        real_start, real_end = frames.min(), frames.max()
+        frame_ids = np.arange(num_frames, dtype=np.float64)
+        is_extrapolated = (frame_ids < real_start) | (frame_ids > real_end)
+        conf_dense = nviews_dense.copy()
+        conf_dense[is_extrapolated] = 0.0
+        joint_confs[:, j] = conf_dense.astype(np.float32)
         matched += 1
 
     os.makedirs(os.path.dirname(out_hdf5_path), exist_ok=True)

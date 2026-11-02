@@ -304,6 +304,13 @@ def batch_to_samples(batch, device, joint_idx):
         # cross-episode absolute-position regression into a well-posed
         # relative-displacement one (see TrajectoryProbe/run_probe).
         last_pos = xyz_world[i, 31][joint_idx, :]              # (J, 3)
+        # valid_mask: FIX 2026-11-01 -- True only where BOTH the future
+        # target frame and the anchor frame (31) have real (non-extrapolated)
+        # EgoExo4D annotation confidence; see ade_fde's own docstring. A
+        # no-op (all True) on real EgoDex data, whose confs are always ones.
+        conf_future = confs[i, FUTURE_FRAMES][:, joint_idx]     # (32, J)
+        conf_anchor = confs[i, 31][joint_idx]                    # (J,)
+        valid_mask = (conf_future > 0) & (conf_anchor.unsqueeze(0) > 0)  # (32, J)
         samples.append({
             "in_feats": vjepa_in[i:i + 1].to(device),               # (1,16,256,1024)
             "target_latent": vjepa_target[i:i + 1].to(device),      # (1,16,256,1024)
@@ -311,18 +318,38 @@ def batch_to_samples(batch, device, joint_idx):
             "vlm_new": vlm_new[i, :, :new_len, :].to(device),       # (L,S_real,2048)
             "target": target.to(device),                             # (32,J,3), absolute
             "last_pos": last_pos.to(device),                         # (J,3), absolute
+            "valid_mask": valid_mask.to(device),                     # (32,J), bool
         })
     return samples
 
 
-def ade_fde(pred, target, thr=0.05):
+def ade_fde(pred, target, mask=None, thr=0.05):
     """pred/target: (B,T,J,3). Returns per-batch-mean ADE, FDE, thr-accuracy,
     using the identical formula to ThinkJEPA's own
-    compute_trajectory_loss_and_accuracy (see import-site comment above)."""
+    compute_trajectory_loss_and_accuracy (see import-site comment above).
+
+    mask (B,T,J), optional: FIX 2026-11-01 -- excludes (b,t,j) entries whose
+    target is extrapolated past EgoExo4D's real annotation coverage (see
+    build_egoexo4d_supervision_hdf5.py's confs fix) rather than genuinely
+    observed, so the metric isn't dominated by comparing against a frozen,
+    fabricated "the hand never moved" target. A no-op for real EgoDex data,
+    whose confs are always all-ones (see load_supervision_from_hdf5's
+    fallback), so this is backward compatible with every existing
+    camera_mode="egodex" result."""
     err = torch.linalg.norm(pred - target, dim=-1)       # (B,T,J)
-    avg_dist = err.mean(dim=(1, 2))                       # (B,)
-    final_dist = err[:, -1, :].mean(dim=1)                # (B,)
-    acc = (err < thr).float().mean()
+    if mask is not None:
+        mask = mask.bool()
+        bt_denom = mask.sum(dim=(1, 2)).clamp(min=1)
+        avg_dist = (err * mask).sum(dim=(1, 2)) / bt_denom              # (B,)
+        last_mask = mask[:, -1, :]
+        b_denom = last_mask.sum(dim=1).clamp(min=1)
+        final_dist = (err[:, -1, :] * last_mask).sum(dim=1) / b_denom   # (B,)
+        thr_denom = mask.float().sum().clamp(min=1)
+        acc = ((err < thr) & mask).float().sum() / thr_denom
+    else:
+        avg_dist = err.mean(dim=(1, 2))                       # (B,)
+        final_dist = err[:, -1, :].mean(dim=1)                # (B,)
+        acc = (err < thr).float().mean()
     return float(avg_dist.mean().item()), float(final_dist.mean().item()), float(acc.item())
 
 
@@ -354,7 +381,7 @@ def static_baseline_ade_fde(loader, joint_idx, max_batches=None, thr=0.05):
     observed (past-window) position for the whole future window. If a
     trained probe can't beat this, it hasn't learned any real motion
     signal -- just necessary context for judging the probe's ADE/FDE."""
-    all_pred, all_target = [], []
+    all_pred, all_target, all_mask = [], [], []
     for bi, batch in enumerate(loader):
         if max_batches and bi >= max_batches:
             break
@@ -363,11 +390,16 @@ def static_baseline_ade_fde(loader, joint_idx, max_batches=None, thr=0.05):
         last_pos = xyz_world[:, 31][:, joint_idx, :]          # (B,J,3) last past frame
         pred = last_pos.unsqueeze(1).expand(-1, 32, -1, -1)         # (B,32,J,3)
         target = xyz_world[:, FUTURE_FRAMES][:, :, joint_idx, :]  # (B,32,J,3)
+        conf_future = confs[:, FUTURE_FRAMES][:, :, joint_idx]        # (B,32,J)
+        conf_anchor = confs[:, 31][:, joint_idx]                        # (B,J)
+        mask = (conf_future > 0) & (conf_anchor.unsqueeze(1) > 0)       # (B,32,J)
         all_pred.append(pred)
         all_target.append(target)
+        all_mask.append(mask)
     pred_stack = torch.cat(all_pred, dim=0)
     target_stack = torch.cat(all_target, dim=0)
-    ade, fde, acc = ade_fde(pred_stack, target_stack, thr=thr)
+    mask_stack = torch.cat(all_mask, dim=0)
+    ade, fde, acc = ade_fde(pred_stack, target_stack, mask=mask_stack, thr=thr)
     return ade, fde, acc, pred_stack.shape[0]
 
 
@@ -379,7 +411,7 @@ def constant_velocity_baseline_ade_fde(loader, joint_idx, max_batches=None, thr=
     joint is actually moving at a roughly constant velocity at the moment
     the window ends -- a probe that can't beat THIS has learned nothing
     beyond "keep going the way you were already going"."""
-    all_pred, all_target = [], []
+    all_pred, all_target, all_mask = [], [], []
     for bi, batch in enumerate(loader):
         if max_batches and bi >= max_batches:
             break
@@ -391,11 +423,18 @@ def constant_velocity_baseline_ade_fde(loader, joint_idx, max_batches=None, thr=
         steps = torch.arange(1, 33, dtype=velocity.dtype, device=velocity.device)  # (32,)
         pred = pos_31.unsqueeze(1) + steps.view(1, 32, 1, 1) * velocity.unsqueeze(1)  # (B,32,J,3)
         target = xyz_world[:, FUTURE_FRAMES][:, :, joint_idx, :]  # (B,32,J,3)
+        conf_future = confs[:, FUTURE_FRAMES][:, :, joint_idx]        # (B,32,J)
+        conf_30 = confs[:, 30][:, joint_idx]                             # (B,J), velocity anchor
+        conf_31 = confs[:, 31][:, joint_idx]                             # (B,J), velocity anchor
+        valid_anchor = (conf_30 > 0) & (conf_31 > 0)                     # (B,J)
+        mask = (conf_future > 0) & valid_anchor.unsqueeze(1)             # (B,32,J)
         all_pred.append(pred)
         all_target.append(target)
+        all_mask.append(mask)
     pred_stack = torch.cat(all_pred, dim=0)
     target_stack = torch.cat(all_target, dim=0)
-    ade, fde, acc = ade_fde(pred_stack, target_stack, thr=thr)
+    mask_stack = torch.cat(all_mask, dim=0)
+    ade, fde, acc = ade_fde(pred_stack, target_stack, mask=mask_stack, thr=thr)
     return ade, fde, acc, pred_stack.shape[0]
 
 
@@ -430,7 +469,7 @@ def run_probe(label, predictor, train_loader, test_loader, device, args, joint_i
             if max_batches and bi >= max_batches:
                 break
             samples = batch_to_samples(batch, device, joint_idx)
-            pred_list, target_list = [], []
+            pred_list, target_list, mask_list = [], [], []
             for s in samples:
                 with torch.no_grad():
                     y_future = predict_future_latent(
@@ -443,9 +482,18 @@ def run_probe(label, predictor, train_loader, test_loader, device, args, joint_i
                     target = s["target"]  # (32,2,3), absolute xyz_world, no reference offset
                 pred_list.append(pred)
                 target_list.append(target)
+                mask_list.append(s["valid_mask"])
             pred_stack = torch.stack(pred_list)    # (B,32,2,3)
             target_stack = torch.stack(target_list)
-            loss = nn.functional.mse_loss(pred_stack, target_stack)
+            mask_stack = torch.stack(mask_list)    # (B,32,2)
+            # FIX 2026-11-01: masked MSE -- excludes EgoExo4D frames whose
+            # target is extrapolated past real annotation coverage (see
+            # ade_fde's docstring), so the probe isn't trained to chase a
+            # fabricated "stayed still forever" target for a large share of
+            # every window. No-op on real EgoDex data (mask always True).
+            sq_err = ((pred_stack - target_stack) ** 2).sum(dim=-1)  # (B,32,2)
+            denom = mask_stack.float().sum().clamp(min=1)
+            loss = (sq_err * mask_stack.float()).sum() / denom
             if train:
                 opt.zero_grad()
                 loss.backward()
@@ -459,7 +507,7 @@ def run_probe(label, predictor, train_loader, test_loader, device, args, joint_i
         print(f"[{label}] epoch {epoch+1}/{args.probe_epochs} probe_train_mse={train_loss:.6f}", flush=True)
 
     probe.eval()
-    all_pred, all_target = [], []
+    all_pred, all_target, all_mask = [], [], []
     with torch.no_grad():
         for bi, batch in enumerate(test_loader):
             if args.max_test_batches and bi >= args.max_test_batches:
@@ -476,9 +524,11 @@ def run_probe(label, predictor, train_loader, test_loader, device, args, joint_i
                     pred_abs = pred  # already absolute, no reference offset to add back
                 all_pred.append(pred_abs)
                 all_target.append(s["target"])  # already absolute
+                all_mask.append(s["valid_mask"])
     pred_stack = torch.stack(all_pred)
     target_stack = torch.stack(all_target)
-    ade, fde, acc = ade_fde(pred_stack.unsqueeze(0), target_stack.unsqueeze(0))
+    mask_stack = torch.stack(all_mask)
+    ade, fde, acc = ade_fde(pred_stack.unsqueeze(0), target_stack.unsqueeze(0), mask=mask_stack.unsqueeze(0))
     # NOTE: ade_fde expects (B,T,J,3); stacking all test samples into one
     # pseudo-batch (unsqueeze(0)) and averaging over all of them at once
     # matches "mean over the whole test set" exactly as job-61's own
