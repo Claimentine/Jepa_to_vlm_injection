@@ -1,0 +1,131 @@
+# Step 141: "Effect of Rollout Horizon" table -- ADE@H/FDE@H/acc@0.05@H at
+# H in {4,8,16,32} on EgoDex (default EGODEX_BUNDLE, NOT EgoExo4D -- the
+# paper's own table caption says "on EgoDex"), for the 3 checkpoints
+# already available:
+#   - job_none_guidance  -> paper's "No-guidance Predictor"
+#   - job15_independent  -> paper's "Reverse-only Injection Training"
+#   - job72_step4000     -> paper's "ThinkBridge (10k, 2 epochs)"
+# "ThinkBridge (30k)" (round6 at ~step_30000) is deliberately NOT included
+# here -- round6 hasn't reached that step count yet (step_21000 as of
+# 2026-11-02, rev_loss_ema plateaued ~6.9-7.2 the whole run per the
+# training-log review, so no need to wait for a "settled" point, just the
+# nearest checkpoint to 30k once saved) -- will be added as its own small
+# follow-up job against the committed probe_egodex_reverse_adapter.py
+# --horizons flag once that checkpoint exists.
+#
+# --horizons uses the commit 1fe8548 flag: slices the SAME single-shot
+# 32-frame prediction/target to each H and re-scores with the existing
+# masked ade_fde() -- not a recursive rollout (this architecture predicts
+# the full 32-frame future in one forward pass already, no autoregressive
+# feedback loop to roll out).
+#
+# --joint_subset all matches job-61's own evaluation scope (all 52 joints,
+# not just wrists) for apples-to-apples comparability with the existing
+# README ADE/FDE table built the same way.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-egodex-reverse-probe-horizon-breakdown
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "16000"
+      containers:
+        - name: egodex-reverse-probe-horizon
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/thinkjepa/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/egodex_reverse_probe_horizon_breakdown
+              "$PY" vans_qa/full_scale/probe_egodex_reverse_adapter.py \
+                --checkpoints job_none_guidance job15_independent job72_step4000 \
+                --joint_subset all \
+                --batch_size 4 \
+                --probe_epochs 10 \
+                --num_workers 4 \
+                --horizons 4 8 16 32 \
+                --out_json /data/raw_data/egodex_reverse_probe_horizon_breakdown/results.json \
+                2>&1 | tee /data/raw_data/egodex_reverse_probe_horizon_breakdown/full_run.log
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests: {cpu: "4", memory: "20Gi", ephemeral-storage: "2Gi", nvidia.com/gpu: "1"}
+            limits: {cpu: "4.8", memory: "24Gi", ephemeral-storage: "4Gi", nvidia.com/gpu: "1"}
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+            - name: shm
+              mountPath: /dev/shm
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-141-egodex-reverse-probe-horizon-breakdown.yaml -n williamli-scvl
