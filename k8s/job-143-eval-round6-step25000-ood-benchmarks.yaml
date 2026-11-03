@@ -1,0 +1,153 @@
+# Step 143: OOD-only forward QA eval of round6's step_25000.pt -- same 4
+# out-of-domain benchmarks as job-139 (TempCompass, MVBench, CrossTask,
+# Ego4D), for round6's last periodic checkpoint now that training has
+# finished entirely (2026-11-03, steps_completed=25728, 2 epochs,
+# best_fwd_val_acc=0.9). Lets us compare step_5000 (job-137/138) vs
+# step_13000 (job-139) vs step_25000 (this job) on the same 4 OOD
+# benchmarks to see whether the step_13000 regression on TempCompass/
+# MVBench (0.763->0.659, 0.692->0.621) continued, reversed, or plateaued
+# with the rest of training.
+#
+# CrossTask and Ego4D use live decode (no --precompute_cache_dir) -- see
+# job-136/138/139's headers for why cached features can be silently stale.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-eval-round6-step25000-ood-benchmarks
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "16000"
+      containers:
+        - name: eval-round6-step25000-ood
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              RUN=/data/raw_data/joint_coupled_merged_v1_ego4d_runs_round6
+              CKPT="round6_step25000=${RUN}/step_25000.pt"
+
+              cd "$REPO"
+
+              echo "=== TempCompass OOD ==="
+              export VANS_WORK_ROOT=/data/vans_work_tempcompass
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_tempcompass.json \
+                --split_part test \
+                --checkpoint "$CKPT" \
+                --resume \
+                --out_path /data/raw_data/round6_step25000_eval_tempcompass.json
+
+              echo "=== MVBench OOD ==="
+              export VANS_WORK_ROOT=/data/vans_work_mvbench
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_mvbench.json \
+                --split_part test \
+                --checkpoint "$CKPT" \
+                --resume \
+                --out_path /data/raw_data/round6_step25000_eval_mvbench.json
+
+              echo "=== CrossTask OOD (live decode) ==="
+              export VANS_WORK_ROOT=/data/vans_work_crosstask
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_crosstask.json \
+                --split_part test \
+                --checkpoint "$CKPT" \
+                --resume \
+                --out_path /data/raw_data/round6_step25000_eval_crosstask.json
+
+              echo "=== Ego4D GoalStep OOD (live decode) ==="
+              export VANS_WORK_ROOT=/data/vans_work_ego4d_qa
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --qa_split /data/raw_data/qa_split_ego4d.json \
+                --split_part test \
+                --checkpoint "$CKPT" \
+                --resume \
+                --out_path /data/raw_data/round6_step25000_eval_ego4d.json
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "24Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "28Gi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-youcook
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-143-eval-round6-step25000-ood-benchmarks.yaml -n williamli-scvl
