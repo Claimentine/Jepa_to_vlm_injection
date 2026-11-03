@@ -536,7 +536,28 @@ def run_probe(label, predictor, train_loader, test_loader, device, args, joint_i
     # whenever it evaluates in one pass), so these numbers are directly
     # comparable to job-61's ADE=0.0683/FDE=0.0733.
     print(f"[{label}] TEST n={len(all_pred)} ADE={ade:.6f} FDE={fde:.6f} acc@0.05={acc:.4f}", flush=True)
-    return {"label": label, "n_test": len(all_pred), "ADE": ade, "FDE": fde, "acc_at_0.05": acc}
+    result = {"label": label, "n_test": len(all_pred), "ADE": ade, "FDE": fde, "acc_at_0.05": acc}
+    if args.horizons:
+        # Horizon-specific breakdown (paper's "Effect of Rollout Horizon"
+        # table): the probe already predicts the FULL 32-frame future
+        # trajectory in one forward pass (n_tokens=T_PER_CLIP=16, each
+        # decoded to 2 raw frames -- see TokenTrajectoryProbe.forward()), so
+        # ADE@H/FDE@H for H<32 is just this same single-shot prediction
+        # truncated to its first H frames, re-scored with the SAME ade_fde()
+        # used for the full H=32 number above -- not a recursive rollout
+        # (this architecture has no autoregressive feedback loop to roll
+        # out; see README's C3 planning note for why a true short-window
+        # recursive rollout would need brand-new checkpoints instead).
+        horizon_results = {}
+        for H in args.horizons:
+            h_ade, h_fde, h_acc = ade_fde(
+                pred_stack[:, :H].unsqueeze(0), target_stack[:, :H].unsqueeze(0),
+                mask=mask_stack[:, :H].unsqueeze(0),
+            )
+            horizon_results[H] = {"ADE": h_ade, "FDE": h_fde, "acc_at_0.05": h_acc}
+            print(f"[{label}] HORIZON H={H} ADE@{H}={h_ade:.6f} FDE@{H}={h_fde:.6f} acc@0.05={h_acc:.4f}", flush=True)
+        result["horizons"] = horizon_results
+    return result
 
 
 def compute_predictor_latent_metrics(label, predictor, loader, device, max_batches=None):
@@ -598,6 +619,12 @@ def main():
     ap.add_argument("--max_train_batches", type=int, default=None, help="smoke-test cap")
     ap.add_argument("--max_test_batches", type=int, default=None, help="smoke-test cap")
     ap.add_argument("--out_json", default=None)
+    ap.add_argument("--horizons", type=int, nargs="+", default=None,
+                     help="report ADE@H/FDE@H/acc@0.05@H for each H in this list, alongside the "
+                          "usual full-H=32 numbers -- paper's 'Effect of Rollout Horizon' table. "
+                          "Each H truncates the SAME single-shot 32-frame prediction/target to its "
+                          "first H frames and re-scores with ade_fde(); no retraining, no "
+                          "autoregressive rollout (see run_probe's own comment for why).")
     ap.add_argument("--latent_metrics_only", action="store_true",
                      help="compute FD/SL1/CD for --checkpoints and exit -- no probe training, no "
                           "ADE/FDE/acc@0.05. Cheap (one no-grad pass per checkpoint over the test "
