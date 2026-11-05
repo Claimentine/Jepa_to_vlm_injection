@@ -1,0 +1,142 @@
+# Step 146: A1 baseline from README's "Planned additional experiments"
+# (section A, row A1) -- "VLM-only, trained": a trained small head on the
+# frozen VLM's OWN hidden states, zero external (JEPA) conditioning, and NO
+# perturbation of the VLM's forward pass at all (no decoder hook of any
+# kind). Per explicit user request 2026-11-05.
+#
+# Distinct from the existing --injection {random,constant} content-free
+# controls in train_qa_full.py: those keep the real cross_attn/film
+# injection mechanism (still perturbing the frozen decoder's hidden_states
+# at 4 middle layers), just feed it meaningless input -- isolating "does
+# the injection mechanism's extra capacity help" from "does real content
+# help". This isolates a different question: "does ANY supervised
+# adaptation on this task help over true zero-shot, with the VLM's own
+# forward computation completely untouched" -- closer to ThinkJEPA's own
+# "Qwen3-VL Thinking" Table 1 baseline (a trained downstream head on VLM
+# features, not zero-shot) than this project's current zeroshot_none row.
+#
+# Same qa_split_temporal.json + --max_steps 5000 budget as job-145 (the
+# bridge-depth-vs-joint-training ablation), for a clean 3/4-way comparison
+# once all land: job-13-style real jepa injection, job-145's depth-matched
+# independent injection, this A1 trained-but-content-free head, and the
+# existing zeroshot_none true-zero-shot control.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-ablation-a1-vlm-only-trained-head
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "16000"
+      containers:
+        - name: ablation-a1-vlm-only
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/ablation_a1_vlm_only_runs
+              "$PY" vans_qa/full_scale/train_qa_vlm_only_head.py \
+                --split /data/raw_data/qa_split_temporal.json \
+                --max_steps 5000 \
+                --epochs 1 \
+                --val_every_steps 500 \
+                --save_every_steps 1000 \
+                --max_val_items 100 \
+                --out_dir /data/raw_data/ablation_a1_vlm_only_runs 2>&1 \
+                | tee /data/raw_data/ablation_a1_vlm_only_runs/full_run.log
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "24Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "28Gi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-baselines2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-146-ablation-a1-vlm-only-trained-head.yaml -n williamli-scvl
