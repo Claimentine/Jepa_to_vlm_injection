@@ -37,6 +37,7 @@ from common.jepa_injection_model import (  # noqa: E402
     resolve_decoder_layers,
     select_layer_indices,
 )
+from common.cross_modal_bridge import CrossModalBridge, ForwardingAdapter  # noqa: E402
 
 BASE = os.environ.get("VANS_ROOT", "/projects/bhay/william/ruixin/vans_world_model")
 WORK_BASE = os.environ.get("VANS_WORK_ROOT", "/work/nvme/bdqf/yli8/vans_raw_data")  # relocated off the near-full /projects/bhay allocation
@@ -592,6 +593,27 @@ def main():
                     help="periodic checkpoint cadence, independent of best.pt (0 disables)")
     ap.add_argument("--max_val_items", type=int, default=200, help="cap for periodic in-training eval")
     ap.add_argument("--max_train_items", type=int, default=None, help="smoke-test cap")
+    ap.add_argument("--max_steps", type=int, default=None,
+                     help="stop after this many successful training steps, mid-epoch if needed -- "
+                          "for a step-budget-matched ablation (e.g. comparing against a specific "
+                          "step_N.pt from a joint-training run) rather than a full-epoch run")
+    ap.add_argument("--bridge_hidden_dim", type=int, default=None,
+                     help="JOINT-TRAINING CAPACITY ABLATION (2026-11-05): train_joint_coupled_"
+                          "normalized.py's --bridge_hidden_dim doesn't just 'share' a bridge "
+                          "between directions -- with cycle_loss_weight=0 (job-42/72's own "
+                          "recipe), fwd_loss and rev_loss touch disjoint halves of the bridge "
+                          "(see common/cross_modal_bridge.py), so there is no actual cross-"
+                          "direction gradient coupling. Passing --bridge_hidden_dim here replicates "
+                          "ONLY the capacity side effect on the forward path in this independent, "
+                          "forward-only script: it replaces injector.conditioner.adapter.mlp[0] "
+                          "(normally a plain nn.Linear(1024, hidden_size)) with a CrossModalBridge's "
+                          "jepa_to_vlm head of this hidden width (a 2-layer MLP when set, matching "
+                          "job-42/72's bridge_hidden_dim=2048 exactly), with NO reverse direction, "
+                          "no predictor, no cycle_loss, no joint anything. Isolates whether the "
+                          "job-13->job-72 accuracy gain came from the extra adapter depth alone, "
+                          "independent of joint training ever existing. injection_site must be "
+                          "'film' or 'cross_attn' (mlp[0] lives at injector.conditioner.adapter.mlp[0] "
+                          "there); unsupported for 'prefix'.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out_dir", default=os.path.join(BASE, "raw_data/qa_full_runs"))
     ap.add_argument("--warmstart_alignment", default=None,
@@ -699,6 +721,21 @@ def main():
         ).to(device)
         hook = DecoderLayerInjectionHook(model, injector)
 
+    bridge_jepa_to_vlm = None
+    if args.bridge_hidden_dim is not None:
+        if args.injection_site == "prefix":
+            raise ValueError("--bridge_hidden_dim requires injection_site in {film, cross_attn}")
+        # See --bridge_hidden_dim's own help text: replicates ONLY job-42/72's
+        # capacity side effect on the forward adapter (mlp[0] replaced by a
+        # 2-layer MLP of this width), with no reverse direction/predictor/
+        # cycle_loss -- isolates adapter depth from "joint training exists".
+        bridge = CrossModalBridge(jepa_dim=1024, vlm_dim=hidden_size, hidden_dim=args.bridge_hidden_dim).to(device)
+        bridge_jepa_to_vlm = bridge.jepa_to_vlm
+        injector.conditioner.adapter.mlp[0] = ForwardingAdapter(bridge_jepa_to_vlm)
+        print(f"[INFO] --bridge_hidden_dim {args.bridge_hidden_dim}: replaced "
+              f"injector.conditioner.adapter.mlp[0] with a CrossModalBridge jepa_to_vlm head "
+              f"(forward-only capacity ablation, no joint training)", flush=True)
+
     if args.warmstart_alignment:
         # See fit_warmstart_alignment.py's module docstring for the full
         # rationale. adapter.mlp[0] lives at injector.adapter (prefix mode)
@@ -718,6 +755,14 @@ def main():
         print(f"[INFO] warm-started conditioner.adapter.mlp[0] from {args.warmstart_alignment} "
               f"(fit on {align['n_pairs']} pairs)")
 
+    # ForwardingAdapter is deliberately parameter-free (see its own class
+    # docstring), so bridge_jepa_to_vlm's weights are NOT in
+    # injector.parameters() even after the mlp[0] substitution above --
+    # must be added to the optimizer explicitly or they'd never train.
+    trainable_params = list(injector.parameters())
+    if bridge_jepa_to_vlm is not None:
+        trainable_params += list(bridge_jepa_to_vlm.parameters())
+
     if hasattr(injector, "gates") and args.gate_lr_multiplier != 1.0:
         # Separate param group so the gate can move faster than everything
         # else under AdamW's own per-parameter adaptive step size, without
@@ -725,15 +770,16 @@ def main():
         # conditioner params. See --gate_lr_multiplier's help text.
         gate_params = list(injector.gates.parameters())
         gate_ids = {id(p) for p in gate_params}
-        other_params = [p for p in injector.parameters() if id(p) not in gate_ids]
+        other_params = [p for p in trainable_params if id(p) not in gate_ids]
         opt = torch.optim.AdamW([
             {"params": other_params, "lr": args.lr},
             {"params": gate_params, "lr": args.lr * args.gate_lr_multiplier},
         ])
     else:
-        opt = torch.optim.AdamW(injector.parameters(), lr=args.lr)
+        opt = torch.optim.AdamW(trainable_params, lr=args.lr)
     print(f"[INFO] injection={args.injection} site={args.injection_site} layers={layer_indices} "
-          f"trainable_params={sum(p.numel() for p in injector.parameters()):,} "
+          f"trainable_params={sum(p.numel() for p in trainable_params):,} "
+          f"bridge_hidden_dim={args.bridge_hidden_dim} "
           f"gate_lr_multiplier={args.gate_lr_multiplier}")
 
     step = 0
@@ -818,10 +864,20 @@ def main():
                 log_f.flush()
                 if val_tally.acc > best_val_acc:
                     best_val_acc = val_tally.acc
-                    torch.save({"args": vars(args), "injector_state": injector.state_dict(),
-                                "step": step, "val_acc": val_tally.acc,
-                                "val_acc_by_difficulty": val_tally.acc_by_difficulty},
-                               os.path.join(run_dir, "best.pt"))
+                    ckpt = {"args": vars(args), "injector_state": injector.state_dict(),
+                            "step": step, "val_acc": val_tally.acc,
+                            "val_acc_by_difficulty": val_tally.acc_by_difficulty}
+                    if bridge_jepa_to_vlm is not None:
+                        # Saved under "bridge_state" with the SAME key names
+                        # load_checkpoint_into_fresh_injector (eval_forward_
+                        # checkpoint.py) already looks for ("jepa_to_vlm.weight"
+                        # or "jepa_to_vlm.0.weight") -- a plain CrossModalBridge
+                        # whose vlm_to_jepa half was simply never trained/used,
+                        # not a new checkpoint format, so this ablation's
+                        # checkpoints are evaluable with the existing eval
+                        # script unchanged.
+                        ckpt["bridge_state"] = {f"jepa_to_vlm.{k}": v for k, v in bridge_jepa_to_vlm.state_dict().items()}
+                    torch.save(ckpt, os.path.join(run_dir, "best.pt"))
 
             if args.save_every_steps and step % args.save_every_steps == 0:
                 # Independent of best.pt: best.pt only ever holds the single
@@ -832,9 +888,17 @@ def main():
                 # in practice on the jepa x cross_attn temporal-split run,
                 # where best.pt froze at step 3000 despite training continuing
                 # to step 6641. These periodic snapshots keep that history.
-                torch.save({"args": vars(args), "injector_state": injector.state_dict(), "step": step},
-                           os.path.join(run_dir, f"step_{step}.pt"))
+                ckpt = {"args": vars(args), "injector_state": injector.state_dict(), "step": step}
+                if bridge_jepa_to_vlm is not None:
+                    ckpt["bridge_state"] = {f"jepa_to_vlm.{k}": v for k, v in bridge_jepa_to_vlm.state_dict().items()}
+                torch.save(ckpt, os.path.join(run_dir, f"step_{step}.pt"))
                 print(f"[epoch {epoch} step {step}] saved checkpoint -> step_{step}.pt")
+
+            if args.max_steps and step >= args.max_steps:
+                print(f"[INFO] --max_steps {args.max_steps} reached, stopping", flush=True)
+                break
+        if args.max_steps and step >= args.max_steps:
+            break
 
     # The final summary used to be stdout-only -- if the pod gets GC'd before
     # anyone reads its logs (confirmed 2026-09-09: happened to job-13, whose
