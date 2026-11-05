@@ -33,8 +33,8 @@ spec:
                 "$T/cache_train/thinker_predictor.py" | head -60
               echo "SCRIPT_DONE"
           resources:
-            requests: {cpu: "500m", memory: "2Gi", ephemeral-storage: "512Mi"}
-            limits: {cpu: "1", memory: "4Gi", ephemeral-storage: "1Gi"}
+            requests: {cpu: "500m", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "600m", memory: "2.4Gi", ephemeral-storage: "1.2Gi"}
           volumeMounts:
             - name: conda-storage
               mountPath: /home/jovyan
