@@ -1,0 +1,48 @@
+# Step 144: one-off verification (no GPU needed) -- does ThinkJEPA's own
+# thinker_train.py ever unfreeze/fine-tune the VJEPA encoder, or is it
+# frozen the entire time (standard JEPA practice: encoder frozen, only the
+# predictor trained)? Just greps their source for encoder-related
+# requires_grad/freeze/optimizer-param-group logic and prints the hits;
+# not a training/eval run, no checkpoint touched, nothing committed to the
+# project's own data.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-debug-verify-thinkjepa-encoder-frozen
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      containers:
+        - name: debug-verify
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -uo pipefail
+              T=/home/jovyan/ThinkJEPA
+              echo "=== files ==="
+              ls "$T/cache_train/" | grep -i thinker
+              echo "=== encoder construction / freeze logic in thinker_train.py ==="
+              grep -n -i -E "encoder|requires_grad|freeze|\.eval\(\)|param_groups|optimizer\s*=|AdamW\(" \
+                "$T/cache_train/thinker_train.py" | head -150
+              echo "=== same search in thinker_predictor.py ==="
+              grep -n -i -E "encoder|requires_grad|freeze" \
+                "$T/cache_train/thinker_predictor.py" | head -60
+              echo "SCRIPT_DONE"
+          resources:
+            requests: {cpu: "500m", memory: "2Gi", ephemeral-storage: "512Mi"}
+            limits: {cpu: "1", memory: "4Gi", ephemeral-storage: "1Gi"}
+          volumeMounts:
+            - name: conda-storage
+              mountPath: /home/jovyan
+      volumes:
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-baselines2
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-144-debug-verify-thinkjepa-encoder-frozen.yaml -n williamli-scvl
