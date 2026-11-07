@@ -1,0 +1,38 @@
+# Step 147: one-off, no-GPU readback -- pulls job-72's own val_acc curve up
+# to step 5000 from its train_log.jsonl, for direct comparison against
+# job-145 (bridge-depth-vs-joint ablation, best_val_acc=0.59@step5000) and
+# job-146 (A1 vlm-only-trained-head, best_val_acc=0.53@step5000). Read-only,
+# nothing trained or modified.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-debug-pull-job72-early-val-curve
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      containers:
+        - name: debug-pull
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -uo pipefail
+              grep -h "val_acc" /data/raw_data/joint_coupled_bridge_mlp_2epoch_runs/train_log.jsonl | head -11
+              echo "SCRIPT_DONE"
+          resources:
+            requests: {cpu: "500m", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "600m", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          volumeMounts:
+            - name: data-storage
+              mountPath: /data
+      volumes:
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-147-debug-pull-job72-early-val-curve.yaml -n williamli-scvl
