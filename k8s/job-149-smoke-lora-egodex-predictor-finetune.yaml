@@ -1,0 +1,132 @@
+# Step 149: smoke test for the new --lora mode in finetune_egodex_predictor.py
+# (commit pending). Per explicit user request 2026-11-07: "freeze only JEPA's
+# encoder, add LoRA to ALL layers, train that way instead of full fine-tune."
+#
+# The VJEPA encoder itself is never loaded by finetune_egodex_predictor.py at
+# all -- predict_future_latent only ever consumes precomputed
+# vjepa_input_feats/vjepa_target_feats (see probe_egodex_reverse_adapter.py's
+# own docstring), so "encoder frozen" is automatically true regardless of
+# --lora. What --lora actually changes: instead of fully unfreezing
+# CortexGuidedVideoPredictor (+ CrossModalBridge, for bridge-trained
+# checkpoints) for fine-tuning, freeze ALL of their original pretrained
+# weights and wrap every nn.Linear/nn.MultiheadAttention submodule with a
+# LoRA adapter (common/lora.py) -- 12 rollout_layers' attn.qkv/attn.proj/
+# mlp.fc1/mlp.fc2, context_adapter, output_adapter, guidance_old/new_adapter,
+# and the 12 guidance_memory_readers (real nn.MultiheadAttention -- verified
+# by job-148's module-tree dump) -- then train only the LoRA A/B factors.
+#
+# Uses job72_step4000 (has a CrossModalBridge) specifically to exercise BOTH
+# the predictor-LoRA path AND the bridge-LoRA path in one smoke test, not
+# just the simpler no-bridge checkpoints. Tiny budget (3 train batches, 2
+# test batches, 1 epoch) -- this only needs to prove the mechanism runs
+# end-to-end (loads, wraps, one backward/step, evaluates, saves) without
+# shape/dtype errors; not a real training result.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-smoke-lora-egodex-predictor-finetune
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "16000"
+      containers:
+        - name: smoke-lora-finetune
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/thinkjepa/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/ablation_lora_predictor_smoketest
+              "$PY" vans_qa/full_scale/finetune_egodex_predictor.py \
+                --checkpoint job72_step4000 \
+                --lora --lora_r 8 --lora_alpha 16 \
+                --batch_size 2 \
+                --epochs 1 \
+                --max_train_batches 3 \
+                --max_test_batches 2 \
+                --num_workers 2 \
+                --save_path /data/raw_data/ablation_lora_predictor_smoketest/lora_smoketest.pt \
+                --out_json /data/raw_data/ablation_lora_predictor_smoketest/results.json \
+                2>&1 | tee /data/raw_data/ablation_lora_predictor_smoketest/full_run.log
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests: {cpu: "4", memory: "20Gi", ephemeral-storage: "2Gi", nvidia.com/gpu: "1"}
+            limits: {cpu: "4.8", memory: "24Gi", ephemeral-storage: "4Gi", nvidia.com/gpu: "1"}
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+            - name: shm
+              mountPath: /dev/shm
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-149-smoke-lora-egodex-predictor-finetune.yaml -n williamli-scvl

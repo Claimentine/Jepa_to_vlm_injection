@@ -58,14 +58,29 @@ if _THIS_DIR not in sys.path:
 import probe_egodex_reverse_adapter as probe  # noqa: E402
 import train_latent_world_model_full as rev  # noqa: E402
 from common.cross_modal_bridge import CrossModalBridge, ForwardingAdapter  # noqa: E402
+from common.lora import (  # noqa: E402
+    apply_lora_to_all_layers, freeze_all_except_lora, lora_trainable_param_count,
+)
 
 
-def load_predictor_for_finetune(label, device):
+def load_predictor_for_finetune(label, device, lora_cfg=None):
     """Same checkpoint-loading logic as probe_egodex_reverse_adapter.py's
     load_frozen_predictor (bridge rewiring for joint-trained checkpoints,
-    etc.) -- but leaves everything UNFROZEN (train mode, requires_grad=True)
-    and returns (predictor, bridge_or_None) separately so the caller can
-    build an optimizer over both."""
+    etc.). Two modes, selected by lora_cfg:
+      - lora_cfg is None (default): leaves everything UNFROZEN (train mode,
+        requires_grad=True) -- the original full-fine-tune behavior.
+      - lora_cfg is a dict {"r", "alpha", "dropout"}: freezes the predictor's
+        (and, if present, the bridge's) own pretrained weights entirely, then
+        wraps every nn.Linear/nn.MultiheadAttention in both with a LoRA
+        adapter (see common/lora.py) and leaves only the LoRA A/B factors
+        trainable. The VJEPA encoder itself is never loaded by this script
+        at all (predict_future_latent only ever consumes precomputed
+        vjepa_input_feats/vjepa_target_feats -- the encoder's own forward
+        pass never runs here), so "freeze the encoder" is automatically true
+        in both modes; lora_cfg controls how the PREDICTOR (and bridge) are
+        trained instead of full fine-tuning.
+    Returns (predictor, bridge_or_None) separately so the caller can build
+    an optimizer over both."""
     path = probe.CHECKPOINTS[label] if "=" not in label else label.split("=", 1)[1]
     ckpt = torch.load(path, map_location=device, weights_only=False)
     guidance_mode = ckpt.get("guidance", "crossattn")
@@ -83,16 +98,45 @@ def load_predictor_for_finetune(label, device):
         predictor.guidance_old_adapter = ForwardingAdapter(bridge.vlm_to_jepa, predictor.context_adapter)
         predictor.guidance_new_adapter = ForwardingAdapter(bridge.vlm_to_jepa, predictor.context_adapter)
         bridge.load_state_dict(bridge_state)
-        bridge.train()
-        for p in bridge.parameters():
-            p.requires_grad_(True)
     state = ckpt["predictor_state"] if "predictor_state" in ckpt else ckpt
     predictor.load_state_dict(state)
-    predictor.train()
+
+    if lora_cfg is None:
+        predictor.train()
+        for p in predictor.parameters():
+            p.requires_grad_(True)
+        if bridge is not None:
+            bridge.train()
+            for p in bridge.parameters():
+                p.requires_grad_(True)
+        print(f"[INFO] loaded (UNFROZEN) predictor from {path} (step={ckpt.get('step')}) "
+              f"for fine-tuning", flush=True)
+        return predictor, bridge
+
+    # LoRA mode: apply AFTER load_state_dict (so the pretrained weights land
+    # in the plain nn.Linear/nn.MultiheadAttention modules first, exactly as
+    # saved) -- wrapping first would change the state_dict's key names
+    # (base.weight vs weight) and break loading.
     for p in predictor.parameters():
-        p.requires_grad_(True)
-    print(f"[INFO] loaded (UNFROZEN) predictor from {path} (step={ckpt.get('step')}) "
-          f"for fine-tuning", flush=True)
+        p.requires_grad_(False)
+    wrapped = apply_lora_to_all_layers(predictor, r=lora_cfg["r"], alpha=lora_cfg["alpha"],
+                                        dropout=lora_cfg["dropout"])
+    freeze_all_except_lora(predictor)
+    predictor.train()
+    n_trainable, n_total = lora_trainable_param_count(predictor), sum(p.numel() for p in predictor.parameters())
+    print(f"[INFO] loaded predictor from {path} (step={ckpt.get('step')}) with LoRA on "
+          f"{len(wrapped)} layers (r={lora_cfg['r']} alpha={lora_cfg['alpha']}): "
+          f"trainable={n_trainable:,}/{n_total:,} ({100 * n_trainable / n_total:.2f}%)", flush=True)
+    if bridge is not None:
+        for p in bridge.parameters():
+            p.requires_grad_(False)
+        b_wrapped = apply_lora_to_all_layers(bridge, r=lora_cfg["r"], alpha=lora_cfg["alpha"],
+                                              dropout=lora_cfg["dropout"])
+        freeze_all_except_lora(bridge)
+        bridge.train()
+        bn_trainable, bn_total = lora_trainable_param_count(bridge), sum(p.numel() for p in bridge.parameters())
+        print(f"[INFO] bridge also got LoRA on {len(b_wrapped)} layers: "
+              f"trainable={bn_trainable:,}/{bn_total:,} ({100 * bn_trainable / max(bn_total, 1):.2f}%)", flush=True)
     return predictor, bridge
 
 
@@ -230,6 +274,16 @@ def main():
                      help="weight on an added (1 - cosine_similarity) term in the training loss, "
                           "on top of the base MSE term -- see train_epoch's own comment for why. "
                           "0.0 (default) reproduces rounds 1-2's pure-MSE loss exactly.")
+    ap.add_argument("--lora", action="store_true",
+                     help="freeze the predictor's (and bridge's, if the checkpoint has one) own "
+                          "pretrained weights entirely and train LoRA adapters on every "
+                          "nn.Linear/nn.MultiheadAttention layer instead of full fine-tuning. The "
+                          "VJEPA encoder is never loaded by this script regardless (see "
+                          "load_predictor_for_finetune's docstring), so this is the "
+                          "'freeze JEPA's encoder, LoRA all other layers' recipe end to end.")
+    ap.add_argument("--lora_r", type=int, default=8, help="LoRA rank, only used with --lora.")
+    ap.add_argument("--lora_alpha", type=float, default=16.0, help="LoRA scaling alpha, only used with --lora.")
+    ap.add_argument("--lora_dropout", type=float, default=0.0, help="dropout on LoRA's input, only used with --lora.")
     ap.add_argument("--max_train_batches", type=int, default=None, help="smoke-test cap")
     ap.add_argument("--max_test_batches", type=int, default=None, help="smoke-test cap")
     ap.add_argument("--save_path", required=True,
@@ -242,10 +296,12 @@ def main():
     train_loader, test_loader = probe.build_dataloaders(args)
     print(f"[INFO] train_loader batches~{len(train_loader)} test_loader batches~{len(test_loader)}", flush=True)
 
-    predictor, bridge = load_predictor_for_finetune(args.checkpoint, device)
-    params = list(predictor.parameters())
+    lora_cfg = {"r": args.lora_r, "alpha": args.lora_alpha, "dropout": args.lora_dropout} if args.lora else None
+    predictor, bridge = load_predictor_for_finetune(args.checkpoint, device, lora_cfg=lora_cfg)
+    params = [p for p in predictor.parameters() if p.requires_grad]
     if bridge is not None:
-        params += list(bridge.parameters())
+        params += [p for p in bridge.parameters() if p.requires_grad]
+    print(f"[INFO] optimizer over {sum(p.numel() for p in params):,} trainable params", flush=True)
     optimizer = torch.optim.AdamW(params, lr=args.lr)
     scheduler = None
     if args.lr_min is not None:
@@ -271,7 +327,15 @@ def main():
         history.append({"epoch": epoch + 1, "lr": cur_lr, "train_loss": train_loss,
                          "FD": fd, "SL1": sl1, "CD": cd, "n_test": n_test})
 
-    save_payload = {"predictor_state": predictor.state_dict(), "checkpoint_source": args.checkpoint}
+    # NOTE: when --lora is on, predictor.state_dict()'s keys reflect the
+    # LoRA-wrapped structure (e.g. "...attn.qkv.base.weight" / "...lora_A.weight"),
+    # not the original flat keys -- this checkpoint is NOT directly loadable
+    # by load_frozen_predictor/load_predictor_for_finetune(lora_cfg=None)
+    # without first re-applying the same wrapping. lora_cfg is saved
+    # alongside so a future loader can detect this and re-wrap before
+    # load_state_dict.
+    save_payload = {"predictor_state": predictor.state_dict(), "checkpoint_source": args.checkpoint,
+                     "lora_cfg": lora_cfg}
     if bridge is not None:
         save_payload["bridge_state"] = bridge.state_dict()
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)

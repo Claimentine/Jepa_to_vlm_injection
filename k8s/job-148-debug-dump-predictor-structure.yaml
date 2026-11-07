@@ -1,0 +1,100 @@
+# Step 148: no-GPU debug pod -- dumps CortexGuidedVideoPredictor's full
+# named_modules() tree (filtered to nn.Linear/nn.MultiheadAttention) so we
+# can design a LoRA-on-all-layers wrapping scheme against the real module
+# tree instead of guessing. Read-only, nothing trained.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-debug-dump-predictor-structure
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      containers:
+        - name: debug-dump
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -uo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+              "$PY" - <<'PYEOF'
+              import os, sys, torch, torch.nn as nn
+              THINKJEPA_ROOT = os.environ.get("THINKJEPA_ROOT", "/home/jovyan/ThinkJEPA")
+              for p in (THINKJEPA_ROOT, os.path.join(THINKJEPA_ROOT, "cache_train"), os.path.join(THINKJEPA_ROOT, "vjepa2")):
+                  if p not in sys.path:
+                      sys.path.insert(0, p)
+              sys.path.insert(0, "/code/Jepa_to_vlm_injection/vans_qa/full_scale")
+              from cache_train.thinker_predictor import CortexGuidedVideoPredictor
+              import inspect
+              sig = inspect.signature(CortexGuidedVideoPredictor.__init__)
+              print("INIT SIGNATURE:", sig, flush=True)
+              import train_latent_world_model_full as rev
+              predictor = rev.build_predictor(torch.device("cpu"), "crossattn")
+              total = sum(p.numel() for p in predictor.parameters())
+              print(f"TOTAL PARAMS: {total:,}", flush=True)
+              print("---- named_modules (Linear / MultiheadAttention / LayerNorm only) ----", flush=True)
+              for name, m in predictor.named_modules():
+                  if isinstance(m, (nn.Linear, nn.MultiheadAttention, nn.LayerNorm)):
+                      extra = ""
+                      if isinstance(m, nn.Linear):
+                          extra = f"in={m.in_features} out={m.out_features} bias={m.bias is not None}"
+                      elif isinstance(m, nn.MultiheadAttention):
+                          extra = f"embed_dim={m.embed_dim} num_heads={m.num_heads}"
+                      print(f"{name}\t{type(m).__name__}\t{extra}", flush=True)
+              print("---- top-level children ----", flush=True)
+              for name, m in predictor.named_children():
+                  print(f"{name}: {type(m).__name__}", flush=True)
+              PYEOF
+              echo "SCRIPT_DONE"
+          env:
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: VANS_ROOT
+              value: /data
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests: {cpu: "1", memory: "4Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1.2", memory: "4Gi", ephemeral-storage: "1200Mi"}
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-148-debug-dump-predictor-structure.yaml -n williamli-scvl
