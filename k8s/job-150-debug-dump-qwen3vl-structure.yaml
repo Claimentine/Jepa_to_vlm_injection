@@ -1,0 +1,96 @@
+# Step 150: no-GPU debug pod -- dumps Qwen3-VL-2B-Thinking's named_modules()
+# tree (filtered to nn.Linear/nn.MultiheadAttention, counted by dotted-name
+# pattern since there are hundreds of decoder layers) so VLM-side LoRA
+# coverage ("fine-tune all modules except JEPA's encoder", per explicit user
+# request 2026-11-07) is designed against the real module tree, same
+# approach as job-148 did for CortexGuidedVideoPredictor. Read-only.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-debug-dump-qwen3vl-structure
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      containers:
+        - name: debug-dump
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -uo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              cd /code/Jepa_to_vlm_injection
+              "$PY" - <<'PYEOF'
+              import re, collections
+              import torch, torch.nn as nn
+              from transformers import AutoModelForImageTextToText
+              model = AutoModelForImageTextToText.from_pretrained("Qwen/Qwen3-VL-2B-Thinking", dtype="auto")
+              total = sum(p.numel() for p in model.parameters())
+              print(f"TOTAL PARAMS: {total:,}", flush=True)
+              print("---- top-level children ----", flush=True)
+              for name, m in model.named_children():
+                  print(f"{name}: {type(m).__name__}", flush=True)
+              print("---- per-pattern Linear/MHA counts (decoder-layer index collapsed to N) ----", flush=True)
+              counts = collections.Counter()
+              examples = {}
+              for name, m in model.named_modules():
+                  if isinstance(m, (nn.Linear, nn.MultiheadAttention)):
+                      pattern = re.sub(r"\.\d+\.", ".N.", name)
+                      counts[pattern] += 1
+                      if pattern not in examples:
+                          extra = f"in={m.in_features} out={m.out_features}" if isinstance(m, nn.Linear) else f"embed_dim={m.embed_dim}"
+                          examples[pattern] = (name, type(m).__name__, extra)
+              for pattern, n in sorted(counts.items()):
+                  name, typ, extra = examples[pattern]
+                  print(f"{pattern}\tcount={n}\t{typ}\t{extra}\t(e.g. {name})", flush=True)
+              print(f"TOTAL LINEAR/MHA MODULES: {sum(counts.values())}", flush=True)
+              PYEOF
+              echo "SCRIPT_DONE"
+          env:
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests: {cpu: "4", memory: "16Gi", ephemeral-storage: "2Gi"}
+            limits: {cpu: "4.8", memory: "20Gi", ephemeral-storage: "4Gi"}
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-150-debug-dump-qwen3vl-structure.yaml -n williamli-scvl
