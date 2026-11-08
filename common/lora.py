@@ -45,6 +45,27 @@ class LoRALinear(nn.Module):
     def forward(self, x):
         return self.base(x) + self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
 
+    # Passthroughs so code that introspects a plain nn.Linear's shape/weight
+    # attributes (not just calls it) still works on a wrapped layer -- e.g.
+    # ThinkJEPA's own thinker_predictor.py reads context_adapter.out_features
+    # directly (confirmed via job-149's traceback: "'LoRALinear' object has
+    # no attribute 'out_features'" once context_adapter got wrapped).
+    @property
+    def in_features(self):
+        return self.base.in_features
+
+    @property
+    def out_features(self):
+        return self.base.out_features
+
+    @property
+    def weight(self):
+        return self.base.weight
+
+    @property
+    def bias(self):
+        return self.base.bias
+
 
 class LoRAMultiheadAttention(nn.Module):
     """Wraps an existing nn.MultiheadAttention: freezes its in_proj_weight/
