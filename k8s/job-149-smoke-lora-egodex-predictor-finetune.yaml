@@ -29,6 +29,16 @@ spec:
   backoffLimit: 1
   template:
     spec:
+      # Relaxed memory floor only (16000 -> 10000) vs. this project's usual
+      # affinity, to widen scheduling odds for this tiny smoke test when the
+      # >16GB nodes are saturated -- but the GPU.product exclusion list is
+      # the FULL original list again (V100-SXM2-16GB got scheduled once
+      # when this list was accidentally trimmed down to just the oldest
+      # cards, and crashed with "no kernel image is available for execution
+      # on the device": this conda env's PyTorch build doesn't support CC
+      # 7.0 at all, confirmed by the runtime's own compute-capability
+      # warning). Keep every excluded card excluded; only the memory floor
+      # changes.
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -50,7 +60,7 @@ spec:
                   - key: nvidia.com/gpu.memory
                     operator: Gt
                     values:
-                      - "16000"
+                      - "10000"
       containers:
         - name: smoke-lora-finetune
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
