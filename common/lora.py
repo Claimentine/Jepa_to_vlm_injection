@@ -31,8 +31,13 @@ class LoRALinear(nn.Module):
             p.requires_grad_(False)
         self.r = r
         self.scaling = alpha / r
-        self.lora_A = nn.Linear(base.in_features, r, bias=False)
-        self.lora_B = nn.Linear(r, base.out_features, bias=False)
+        # base is typically already on its final device/dtype (LoRA wrapping
+        # happens after the host model's own .to(device) call) -- lora_A/B
+        # must match it, or the very first forward hits a cpu/cuda mismatch
+        # (confirmed by job-149's traceback: "mat2 is on cpu, different from
+        # other tensors on cuda:0").
+        self.lora_A = nn.Linear(base.in_features, r, bias=False, device=base.weight.device, dtype=base.weight.dtype)
+        self.lora_B = nn.Linear(r, base.out_features, bias=False, device=base.weight.device, dtype=base.weight.dtype)
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B.weight)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
@@ -59,8 +64,9 @@ class LoRAMultiheadAttention(nn.Module):
         self.num_heads = base.num_heads
         self.r = r
         self.scaling = alpha / r
-        self.lora_A = nn.Linear(self.embed_dim, r, bias=False)
-        self.lora_B = nn.Linear(r, 3 * self.embed_dim, bias=False)
+        _dev, _dtype = base.in_proj_weight.device, base.in_proj_weight.dtype
+        self.lora_A = nn.Linear(self.embed_dim, r, bias=False, device=_dev, dtype=_dtype)
+        self.lora_B = nn.Linear(r, 3 * self.embed_dim, bias=False, device=_dev, dtype=_dtype)
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B.weight)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
