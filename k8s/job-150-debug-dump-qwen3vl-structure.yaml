@@ -52,11 +52,25 @@ spec:
           env:
             - name: HF_HOME
               value: /data/hf_cache
+            # The model (Qwen3-VL-2B-Thinking, 4.0GB) is already fully
+            # cached at /data/hf_cache/hub/models--Qwen--Qwen3-VL-2B-Thinking
+            # (confirmed by exec'ing into the first attempt's pod) -- the
+            # first attempt sat for 20+ minutes anyway because
+            # from_pretrained still does a network metadata/etag check by
+            # default even with local files present, and that call was
+            # stalling ("unauthenticated requests to HF Hub" rate-limit
+            # warning in the first attempt's log). HF_HUB_OFFLINE skips that
+            # network round-trip entirely and loads straight from the local
+            # cache.
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
             - name: PYTHONUNBUFFERED
               value: "1"
           resources:
             requests: {cpu: "4", memory: "16Gi", ephemeral-storage: "2Gi"}
-            limits: {cpu: "4.8", memory: "20Gi", ephemeral-storage: "4Gi"}
+            limits: {cpu: "4.8", memory: "19Gi", ephemeral-storage: "4Gi"}
           volumeMounts:
             - name: git-repo-code
               mountPath: /code
