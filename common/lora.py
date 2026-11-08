@@ -152,3 +152,21 @@ def freeze_all_except_lora(module):
 
 def lora_trainable_param_count(module):
     return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+
+def lora_state_dict(module):
+    """Only the lora_A/lora_B weights, for compact checkpointing -- saving a
+    LoRA-wrapped host model's FULL state_dict would re-save every frozen
+    base weight (e.g. all 2.13B of Qwen3-VL-2B) on every checkpoint, when
+    only the tiny trainable delta needs to persist."""
+    return {k: v for k, v in module.state_dict().items() if ".lora_A." in k or ".lora_B." in k}
+
+
+def load_lora_state_dict(module, state_dict):
+    """Inverse of lora_state_dict: loads only the lora_A/lora_B entries into
+    an already-LoRA-wrapped module (apply_lora_to_all_layers must have been
+    called first, so those submodules exist)."""
+    missing, unexpected = module.load_state_dict(state_dict, strict=False)
+    unexpected_lora = [k for k in unexpected if ".lora_A." in k or ".lora_B." in k]
+    if unexpected_lora:
+        raise RuntimeError(f"unexpected LoRA keys not found in module: {unexpected_lora}")

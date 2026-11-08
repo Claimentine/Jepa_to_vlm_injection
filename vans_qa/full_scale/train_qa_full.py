@@ -38,6 +38,9 @@ from common.jepa_injection_model import (  # noqa: E402
     select_layer_indices,
 )
 from common.cross_modal_bridge import CrossModalBridge, ForwardingAdapter  # noqa: E402
+from common.lora import (  # noqa: E402
+    apply_lora_to_all_layers, freeze_all_except_lora, lora_trainable_param_count, lora_state_dict,
+)
 
 BASE = os.environ.get("VANS_ROOT", "/projects/bhay/william/ruixin/vans_world_model")
 WORK_BASE = os.environ.get("VANS_WORK_ROOT", "/work/nvme/bdqf/yli8/vans_raw_data")  # relocated off the near-full /projects/bhay allocation
@@ -597,6 +600,18 @@ def main():
                      help="stop after this many successful training steps, mid-epoch if needed -- "
                           "for a step-budget-matched ablation (e.g. comparing against a specific "
                           "step_N.pt from a joint-training run) rather than a full-epoch run")
+    ap.add_argument("--lora_vlm", action="store_true",
+                     help="FULL-STACK FINE-TUNING (2026-11-07): instead of the VLM staying "
+                          "entirely frozen (the project's default -- only injector/bridge train), "
+                          "freeze the VLM's own pretrained weights and wrap every nn.Linear in it "
+                          "(language model + vision tower + merger, 301 modules on Qwen3-VL-2B-"
+                          "Thinking, confirmed via job-150's module dump) with a LoRA adapter "
+                          "(common/lora.py), training those alongside injector/bridge. Per explicit "
+                          "user request: JEPA's own V-JEPA2 encoder stays the only fully-frozen "
+                          "component; everything else (VLM included) gets some trainable capacity.")
+    ap.add_argument("--lora_vlm_r", type=int, default=8, help="LoRA rank for --lora_vlm.")
+    ap.add_argument("--lora_vlm_alpha", type=float, default=16.0, help="LoRA alpha for --lora_vlm.")
+    ap.add_argument("--lora_vlm_dropout", type=float, default=0.0, help="LoRA dropout for --lora_vlm.")
     ap.add_argument("--bridge_hidden_dim", type=int, default=None,
                      help="JOINT-TRAINING CAPACITY ABLATION (2026-11-05): train_joint_coupled_"
                           "normalized.py's --bridge_hidden_dim doesn't just 'share' a bridge "
@@ -699,7 +714,21 @@ def main():
     model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, dtype="auto").to(device)
     processor = AutoProcessor.from_pretrained(MODEL_ID)
     model.requires_grad_(False)
-    model.eval()
+    vlm_lora_wrapped = []
+    if args.lora_vlm:
+        # Applied AFTER from_pretrained+.to(device) so lora_A/lora_B land on
+        # the same device/dtype as the (already placed) base weights -- see
+        # common/lora.py's LoRALinear for why this ordering matters.
+        vlm_lora_wrapped = apply_lora_to_all_layers(
+            model, r=args.lora_vlm_r, alpha=args.lora_vlm_alpha, dropout=args.lora_vlm_dropout,
+        )
+        freeze_all_except_lora(model)
+        n_trainable = lora_trainable_param_count(model)
+        n_total = sum(p.numel() for p in model.parameters())
+        print(f"[INFO] --lora_vlm: wrapped {len(vlm_lora_wrapped)} Linear layers in {MODEL_ID} "
+              f"(r={args.lora_vlm_r} alpha={args.lora_vlm_alpha}): trainable="
+              f"{n_trainable:,}/{n_total:,} ({100 * n_trainable / n_total:.2f}%)", flush=True)
+    model.eval()  # LoRA's own A/B params still get gradients in eval mode; this only affects dropout/BN
     hidden_size = model.config.text_config.hidden_size
 
     video_token_id = model.config.video_token_id
@@ -762,6 +791,8 @@ def main():
     trainable_params = list(injector.parameters())
     if bridge_jepa_to_vlm is not None:
         trainable_params += list(bridge_jepa_to_vlm.parameters())
+    if args.lora_vlm:
+        trainable_params += [p for p in model.parameters() if p.requires_grad]
 
     if hasattr(injector, "gates") and args.gate_lr_multiplier != 1.0:
         # Separate param group so the gate can move faster than everything
@@ -877,6 +908,8 @@ def main():
                         # checkpoints are evaluable with the existing eval
                         # script unchanged.
                         ckpt["bridge_state"] = {f"jepa_to_vlm.{k}": v for k, v in bridge_jepa_to_vlm.state_dict().items()}
+                    if args.lora_vlm:
+                        ckpt["vlm_lora_state"] = lora_state_dict(model)
                     torch.save(ckpt, os.path.join(run_dir, "best.pt"))
 
             if args.save_every_steps and step % args.save_every_steps == 0:
@@ -891,6 +924,8 @@ def main():
                 ckpt = {"args": vars(args), "injector_state": injector.state_dict(), "step": step}
                 if bridge_jepa_to_vlm is not None:
                     ckpt["bridge_state"] = {f"jepa_to_vlm.{k}": v for k, v in bridge_jepa_to_vlm.state_dict().items()}
+                if args.lora_vlm:
+                    ckpt["vlm_lora_state"] = lora_state_dict(model)
                 torch.save(ckpt, os.path.join(run_dir, f"step_{step}.pt"))
                 print(f"[epoch {epoch} step {step}] saved checkpoint -> step_{step}.pt")
 
