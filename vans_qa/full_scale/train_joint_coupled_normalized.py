@@ -113,6 +113,9 @@ from common.jepa_injection_model import (  # noqa: E402
     select_layer_indices,
 )
 from common.cross_modal_bridge import CrossModalBridge, ForwardingAdapter  # noqa: E402
+from common.lora import (  # noqa: E402
+    apply_lora_to_all_layers, freeze_all_except_lora, lora_trainable_param_count, lora_state_dict,
+)
 
 import train_qa_full as fwd  # noqa: E402
 import train_latent_world_model_full as rev  # noqa: E402
@@ -278,6 +281,44 @@ def main():
                           "killed round6's pod mid-run and the Job controller's automatic pod "
                           "replacement silently restarted training from step 0 with no way to recover "
                           "the lost progress -- this script had no resume path at all until now.")
+    ap.add_argument("--lora_vlm", action="store_true",
+                     help="FULL-STACK FINE-TUNING (2026-11-07/08/09): freeze the VLM's own pretrained "
+                          "weights and LoRA-wrap every nn.Linear in it (301 on Qwen3-VL-2B-Thinking, "
+                          "see common/lora.py) instead of leaving it fully frozen. Trains ONE shared "
+                          "set of VLM LoRA weights, used by BOTH directions' own forward passes on the "
+                          "SAME model instance (not two independently-LoRA'd copies) -- the forward "
+                          "injector's QA-scoring call and (with --live_vlm) the reverse direction's own "
+                          "guidance-extraction call both run through this one model, so fwd_loss and "
+                          "rev_loss both reach the same VLM LoRA params, genuinely joint at the VLM "
+                          "level too, not just through the shared bridge.")
+    ap.add_argument("--lora_vlm_r", type=int, default=8, help="only used with --lora_vlm")
+    ap.add_argument("--lora_vlm_alpha", type=float, default=16.0, help="only used with --lora_vlm")
+    ap.add_argument("--lora_vlm_dropout", type=float, default=0.0, help="only used with --lora_vlm")
+    ap.add_argument("--lora_predictor", action="store_true",
+                     help="freeze CortexGuidedVideoPredictor's own pretrained-at-init weights and "
+                          "LoRA-wrap every nn.Linear/nn.MultiheadAttention in it (62 layers, see "
+                          "common/lora.py) instead of training it fully dense. Applied AFTER the "
+                          "bridge/ForwardingAdapter wiring below, so guidance_old_adapter/"
+                          "guidance_new_adapter (already parameter-free ForwardingAdapters at that "
+                          "point) are correctly skipped, not double-wrapped.")
+    ap.add_argument("--lora_predictor_r", type=int, default=8, help="only used with --lora_predictor")
+    ap.add_argument("--lora_predictor_alpha", type=float, default=16.0, help="only used with --lora_predictor")
+    ap.add_argument("--lora_predictor_dropout", type=float, default=0.0, help="only used with --lora_predictor")
+    ap.add_argument("--live_vlm", action="store_true",
+                     help="instead of reading the reverse direction's vlm_old/vlm_new from "
+                          "extract_vlm_guidance_paired.py's frozen cache, recompute them live via a "
+                          "gradient-carrying teacher-forced forward pass through the SAME shared "
+                          "`model` the forward direction uses (see common/live_vlm_guidance.py's "
+                          "register_decoder_hooks_on_model/infer_qwen_teacher_forced_live) -- requires "
+                          "--lora_vlm to have any trainable effect on the VLM (otherwise this just "
+                          "computes an equivalent, but live and slower, frozen feature every step).")
+    ap.add_argument("--qwen_res", type=int, default=256, help="only used with --live_vlm")
+    ap.add_argument("--qwen_guidance_layers", type=int, nargs="+", default=[0, 4, 8, 12, 16, 20, 24, 27],
+                     help="which decoder layers to hook for live vlm_old/vlm_new -- only used with "
+                          "--live_vlm; MUST match whatever extract_vlm_guidance_paired.py used to build "
+                          "--cache_dir's cache (its own in_clip_relpath/question/correct_caption fields "
+                          "are reused here, but the layer COUNT fixes guidance_old_adapter/"
+                          "guidance_new_adapter's expected shape at predictor-construction time).")
     args = ap.parse_args()
 
     if is_ddp():
@@ -309,6 +350,54 @@ def main():
     model = AutoModelForImageTextToText.from_pretrained(fwd.MODEL_ID, dtype="auto").to(device)
     processor = AutoProcessor.from_pretrained(fwd.MODEL_ID)
     model.requires_grad_(False)
+
+    vlm_lora_params = []
+    if args.lora_vlm:
+        # Applied AFTER .to(device) so lora_A/lora_B land on the same
+        # device/dtype as the already-placed base weights.
+        vlm_wrapped = apply_lora_to_all_layers(
+            model, r=args.lora_vlm_r, alpha=args.lora_vlm_alpha, dropout=args.lora_vlm_dropout,
+        )
+        freeze_all_except_lora(model)
+        vlm_lora_params = [p for p in model.parameters() if p.requires_grad]
+        if is_main:
+            n_total = sum(p.numel() for p in model.parameters())
+            print(f"[INFO] --lora_vlm: wrapped {len(vlm_wrapped)} Linear layers in {fwd.MODEL_ID}: "
+                  f"trainable={sum(p.numel() for p in vlm_lora_params):,}/{n_total:,}", flush=True)
+
+    qwen_guidance_saved = None
+    qwen_guidance_args = None
+    if args.live_vlm:
+        from types import SimpleNamespace
+        qwen_guidance_args = SimpleNamespace(qwen_res=args.qwen_res, layers=args.qwen_guidance_layers)
+        # Registers ADDITIONAL forward hooks on this SAME model (not a
+        # second, separate Qwen3-VL instance) to capture the hidden states
+        # the reverse direction's own guidance-extraction call needs. These
+        # hooks fire on EVERY forward call through `model` regardless of
+        # caller, including the forward direction's own QA-scoring call
+        # earlier in the same step -- harmless because
+        # infer_qwen_teacher_forced_live() always clears every entry in
+        # this dict BEFORE its own model() call (see common/
+        # live_vlm_guidance.py), so whatever the forward call appended is
+        # wiped before the reverse call's single append, and the "exactly
+        # one call per layer" check downstream sees only the reverse call's
+        # own entry. This only holds because the forward block always runs
+        # BEFORE the reverse block within a step (current code order) --
+        # if that order ever changes, this stops being safe.
+        from common.live_vlm_guidance import register_decoder_hooks_on_model
+        qwen_guidance_saved, _layers_path = register_decoder_hooks_on_model(model, args.qwen_guidance_layers)
+
+    def get_rev_pair(pid):
+        # rev.evaluate (used for both periodic val and the final test
+        # eval below) takes this callable instead of a bare cache_dir, so
+        # it transparently reuses whichever of the two paths --live_vlm
+        # selects, matching the per-step training loop's own dispatch.
+        if args.live_vlm:
+            return rev.load_pair_live(
+                args.cache_dir, pid, device, model, processor, qwen_guidance_saved, qwen_guidance_args,
+            )
+        return rev.load_pair(args.cache_dir, pid, device)
+
     model.eval()
     hidden_size = model.config.text_config.hidden_size
     n_tokens = 64
@@ -354,20 +443,52 @@ def main():
         injector.load_state_dict(ckpt["injector_state"])
         predictor.load_state_dict(ckpt["predictor_state"])
         bridge.load_state_dict(ckpt["bridge_state"])
+        if args.lora_vlm and "vlm_lora_state" in ckpt:
+            # model is already LoRA-wrapped by this point (wrapping happens
+            # right after loading, before injector construction) -- its
+            # state_dict keys already match this checkpoint's LoRA-only
+            # format.
+            model.load_state_dict(ckpt["vlm_lora_state"], strict=False)
         resume_step = ckpt["step"]
         if is_main:
             print(f"[INFO] resumed injector/predictor/bridge weights from {args.resume_from} "
                   f"(checkpoint step={resume_step}); optimizer state and best_*_val trackers "
                   f"restart fresh", flush=True)
 
-    all_params = list(injector.parameters()) + list(predictor.parameters()) + list(bridge.parameters())
+    if args.lora_predictor:
+        # Applied AFTER --resume_from's load_state_dict (if any) -- that
+        # checkpoint's predictor_state is in plain, dense-trained format,
+        # so it must land in the plain nn.Linear/nn.MultiheadAttention
+        # structure first; wrapping first would change the state_dict's
+        # key names and break loading. guidance_old_adapter/
+        # guidance_new_adapter are already parameter-free ForwardingAdapters
+        # by this point (wired above), so apply_lora_to_all_layers correctly
+        # skips them (not nn.Linear/nn.MultiheadAttention instances).
+        predictor_wrapped = apply_lora_to_all_layers(
+            predictor, r=args.lora_predictor_r, alpha=args.lora_predictor_alpha, dropout=args.lora_predictor_dropout,
+        )
+        freeze_all_except_lora(predictor)
+        if is_main:
+            n_trainable = lora_trainable_param_count(predictor)
+            n_total = sum(p.numel() for p in predictor.parameters())
+            print(f"[INFO] --lora_predictor: wrapped {len(predictor_wrapped)} layers: "
+                  f"trainable={n_trainable:,}/{n_total:,}", flush=True)
+
+    all_params = (
+        [p for p in injector.parameters() if p.requires_grad]
+        + [p for p in predictor.parameters() if p.requires_grad]
+        + [p for p in bridge.parameters() if p.requires_grad]
+        + vlm_lora_params
+    )
     opt = torch.optim.AdamW(all_params, lr=args.lr)
-    n_fwd_params = sum(p.numel() for p in injector.parameters())
-    n_rev_params = sum(p.numel() for p in predictor.parameters())
-    n_bridge_params = sum(p.numel() for p in bridge.parameters())
+    n_fwd_params = sum(p.numel() for p in injector.parameters() if p.requires_grad)
+    n_rev_params = sum(p.numel() for p in predictor.parameters() if p.requires_grad)
+    n_bridge_params = sum(p.numel() for p in bridge.parameters() if p.requires_grad)
+    n_vlm_params = sum(p.numel() for p in vlm_lora_params)
     if is_main:
         print(f"[INFO] trainable params: forward_injector={n_fwd_params:,} "
               f"reverse_predictor={n_rev_params:,} shared_bridge={n_bridge_params:,} "
+              f"shared_vlm_lora={n_vlm_params:,} "
               f"cycle_loss_weight={args.cycle_loss_weight} disable_norm={args.disable_norm} "
               f"loss_norm_decay={args.loss_norm_decay} "
               f"world_size={world_size}", flush=True)
@@ -472,7 +593,7 @@ def main():
             rev_ok = False
             pooled_vlm = None
             try:
-                in_feats, out_feats, extras = rev.load_pair(args.cache_dir, rev_pid, device)
+                in_feats, out_feats, extras = get_rev_pair(rev_pid)
                 pooled_vlm = extras["vlm_old"].mean(dim=(0, 1), keepdim=True)
                 metrics = rev.forward_step(predictor, in_feats, out_feats, extras, "crossattn", device)
                 rev_loss = metrics["pred_loss"]
@@ -575,7 +696,7 @@ def main():
                 fwd_val_tally = fwd.evaluate_logprob(
                     model, processor, hook, injector, fwd_val, "cross_attn", n_tokens, placeholder_id, device, rng,
                 )
-                rev_val_metrics, n_rev_val = rev.evaluate(predictor, args.cache_dir, rev_val, "crossattn", device)
+                rev_val_metrics, n_rev_val = rev.evaluate(predictor, get_rev_pair, rev_val, "crossattn", device)
                 print(f"[epoch {epoch} step {step}] fwd_val_acc={fwd_val_tally.summary_str()}  "
                       f"rev_val_mse={rev_val_metrics['pred_loss']:.4f} (n={n_rev_val})", flush=True)
                 log_f.write(json.dumps({
@@ -589,22 +710,29 @@ def main():
 
                 if fwd_val_tally.acc > best_fwd_val_acc:
                     best_fwd_val_acc = fwd_val_tally.acc
-                    torch.save({"step": step, "val_acc": fwd_val_tally.acc,
+                    ckpt_fwd = {"step": step, "val_acc": fwd_val_tally.acc,
                                 "injection_mode": args.injection_mode, "layer_strategy": args.layer_strategy,
-                                "injector_state": injector.state_dict(), "bridge_state": bridge.state_dict()},
-                               os.path.join(run_dir, "best_forward.pt"))
+                                "injector_state": injector.state_dict(), "bridge_state": bridge.state_dict()}
+                    if args.lora_vlm:
+                        ckpt_fwd["vlm_lora_state"] = lora_state_dict(model)
+                    torch.save(ckpt_fwd, os.path.join(run_dir, "best_forward.pt"))
                 if rev_val_metrics["pred_loss"] < best_rev_val_mse:
                     best_rev_val_mse = rev_val_metrics["pred_loss"]
-                    torch.save({"step": step, "val_mse": rev_val_metrics["pred_loss"],
-                                "predictor_state": predictor.state_dict(), "bridge_state": bridge.state_dict()},
-                               os.path.join(run_dir, "best_reverse.pt"))
+                    ckpt_rev = {"step": step, "val_mse": rev_val_metrics["pred_loss"],
+                                "predictor_state": predictor.state_dict(), "bridge_state": bridge.state_dict()}
+                    if args.lora_vlm:
+                        ckpt_rev["vlm_lora_state"] = lora_state_dict(model)
+                    torch.save(ckpt_rev, os.path.join(run_dir, "best_reverse.pt"))
 
             if is_main and args.save_every_steps and step % args.save_every_steps == 0:
-                torch.save({
+                ckpt_step = {
                     "step": step, "injection_mode": args.injection_mode, "layer_strategy": args.layer_strategy,
                     "injector_state": injector.state_dict(),
                     "predictor_state": predictor.state_dict(), "bridge_state": bridge.state_dict(),
-                }, os.path.join(run_dir, f"step_{step}.pt"))
+                }
+                if args.lora_vlm:
+                    ckpt_step["vlm_lora_state"] = lora_state_dict(model)
+                torch.save(ckpt_step, os.path.join(run_dir, f"step_{step}.pt"))
                 print(f"[epoch {epoch} step {step}] saved checkpoint -> step_{step}.pt", flush=True)
 
             # `step` is incremented identically on every rank (all ranks run
@@ -640,7 +768,7 @@ def main():
         if os.path.exists(best_reverse_path):
             predictor.load_state_dict(torch.load(best_reverse_path, map_location=device, weights_only=False)["predictor_state"])
         rev_test_metrics, n_rev_test = rev.evaluate(
-            predictor, args.cache_dir, rev_test, "crossattn", device, max_items=args.max_test_items)
+            predictor, get_rev_pair, rev_test, "crossattn", device, max_items=args.max_test_items)
         print(f"[TEST] reverse n={n_rev_test} {rev_test_metrics}", flush=True)
         with open(os.path.join(run_dir, "rev_test_metrics.json"), "w") as f:
             json.dump({"n_test": n_rev_test, **rev_test_metrics}, f, indent=2)
