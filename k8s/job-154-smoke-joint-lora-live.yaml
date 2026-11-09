@@ -111,7 +111,7 @@ spec:
               nvidia.com/gpu: "1"
             limits:
               cpu: "4.8"
-              memory: "33Gi"
+              memory: "32Gi"
               ephemeral-storage: "2400Mi"
               nvidia.com/gpu: "1"
           volumeMounts:
