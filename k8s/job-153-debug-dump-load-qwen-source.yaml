@@ -1,0 +1,44 @@
+# Step 153: no-GPU debug pod -- dumps cache_train/rebuild_causal_cache.py's
+# load_qwen + hook-registration function source, so the joint-training
+# script's own VLM-LoRA integration can register the SAME hook mechanism
+# directly onto its own already-loaded `model` (shared with the forward
+# direction) instead of loading a second, separate Qwen3-VL instance via
+# load_qwen itself -- needed for a genuinely SHARED, jointly-updated VLM+LoRA
+# across both directions, not two independently-LoRA'd copies.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-debug-dump-load-qwen-source
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      containers:
+        - name: debug-dump
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -uo pipefail
+              echo "---- load_qwen + hook-related source ----"
+              grep -n "def load_qwen\|def register_thinker_decoder_hooks\|def register_decoder_hooks\|register_forward_hook\|register_forward_pre_hook\|saved\[" -A 40 /home/jovyan/ThinkJEPA/cache_train/rebuild_causal_cache.py | head -300
+              echo "SCRIPT_DONE"
+          resources:
+            requests: {cpu: "500m", memory: "1Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "600m", memory: "1Gi", ephemeral-storage: "1200Mi"}
+          volumeMounts:
+            - name: conda-storage
+              mountPath: /home/jovyan
+      volumes:
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-153-debug-dump-load-qwen-source.yaml -n williamli-scvl
