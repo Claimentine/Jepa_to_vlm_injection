@@ -34,7 +34,7 @@ spec:
       volumes:
         - name: conda-storage
           persistentVolumeClaim:
-            claimName: ruixin-conda-vol-vlm
+            claimName: ruixin-conda-vol-vlm2
       securityContext:
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
