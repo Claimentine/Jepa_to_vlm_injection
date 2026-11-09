@@ -13,8 +13,12 @@ Linear module, so a naive "replace every nn.Linear child" pass would silently
 skip them and leave those layers un-adapted -- which would make "LoRA on
 every layer" false for any layer whose self-attention is nn.MultiheadAttention
 (as CortexGuidedVideoPredictor's guidance_memory_readers are). LoRAMultiheadAttention
-below adds low-rank updates to the fused in_proj (q/k/v jointly) and wraps
-out_proj with a plain LoRALinear, so both halves of an MHA block are covered.
+below adds a separate low-rank update to each of the fused in_proj's three
+logical slices (q/k/v each get their own A/B pair, applied to their own
+input) and wraps out_proj with a plain LoRALinear, so both halves of an MHA
+block are covered -- and cross-attention (query/key/value with different
+sequence lengths, as guidance_memory_readers actually is) works correctly,
+not just self-attention.
 """
 import math
 
@@ -69,11 +73,21 @@ class LoRALinear(nn.Module):
 
 class LoRAMultiheadAttention(nn.Module):
     """Wraps an existing nn.MultiheadAttention: freezes its in_proj_weight/
-    in_proj_bias and out_proj, adds a low-rank update to the fused QKV
-    in_proj (one A/B pair shared across q/k/v, matching how LoRA is normally
-    applied to fused qkv projections), and wraps out_proj with LoRALinear.
+    in_proj_bias and out_proj, adds a low-rank update to each of the fused
+    QKV in_proj's three logical slices, and wraps out_proj with LoRALinear.
     Forward signature matches nn.MultiheadAttention's (query, key, value,
-    key_padding_mask=..., need_weights=..., attn_mask=...) for drop-in use."""
+    key_padding_mask=..., need_weights=..., attn_mask=...) for drop-in use.
+
+    Q/K/V each get their OWN lora_A/lora_B pair, applied to their OWN input
+    (query/key/value respectively) -- not one shared delta computed from
+    query alone. That shared-delta shortcut only works for self-attention
+    (query is key is value, same sequence length); guidance_memory_readers
+    is real cross-attention (query = rollout tokens, key/value = a longer
+    memory bank), so query and key/value have different sequence lengths
+    and a query-derived delta cannot be added to a key/value projection at
+    all -- confirmed by a job-149 GPU-run crash: "RuntimeError: The size of
+    tensor a (1181) must match the size of tensor b (8192) at non-singleton
+    dimension 1"."""
 
     def __init__(self, base: nn.MultiheadAttention, r=8, alpha=16, dropout=0.0):
         super().__init__()
@@ -86,22 +100,31 @@ class LoRAMultiheadAttention(nn.Module):
         self.r = r
         self.scaling = alpha / r
         _dev, _dtype = base.in_proj_weight.device, base.in_proj_weight.dtype
-        self.lora_A = nn.Linear(self.embed_dim, r, bias=False, device=_dev, dtype=_dtype)
-        self.lora_B = nn.Linear(r, 3 * self.embed_dim, bias=False, device=_dev, dtype=_dtype)
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B.weight)
+
+        def _make_lora_pair():
+            a = nn.Linear(self.embed_dim, r, bias=False, device=_dev, dtype=_dtype)
+            b = nn.Linear(r, self.embed_dim, bias=False, device=_dev, dtype=_dtype)
+            nn.init.kaiming_uniform_(a.weight, a=math.sqrt(5))
+            nn.init.zeros_(b.weight)
+            return a, b
+
+        self.lora_A_q, self.lora_B_q = _make_lora_pair()
+        self.lora_A_k, self.lora_B_k = _make_lora_pair()
+        self.lora_A_v, self.lora_B_v = _make_lora_pair()
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.out_proj_lora = LoRALinear(base.out_proj, r=r, alpha=alpha, dropout=dropout)
         self.base.out_proj = self.out_proj_lora
 
     def forward(self, query, key, value, key_padding_mask=None, need_weights=True, attn_mask=None, **kw):
         # Project q/k/v through the frozen fused in_proj_weight plus this
-        # layer's own LoRA delta, then run attention directly -- torch's own
-        # F.multi_head_attention_forward always does its OWN in_proj, so
-        # re-entering it after projecting here would double-project.
-        delta = self.lora_B(self.lora_A(self.dropout(query))) * self.scaling  # (..., 3*embed_dim)
-        dq, dk, dv = delta.split(self.embed_dim, dim=-1)
+        # layer's own LoRA delta (each computed from its OWN input), then
+        # run attention directly -- torch's own F.multi_head_attention_
+        # forward always does its OWN in_proj, so re-entering it after
+        # projecting here would double-project.
         bias = self.base.in_proj_bias
+        dq = self.lora_B_q(self.lora_A_q(self.dropout(query))) * self.scaling
+        dk = self.lora_B_k(self.lora_A_k(self.dropout(key))) * self.scaling
+        dv = self.lora_B_v(self.lora_A_v(self.dropout(value))) * self.scaling
         q = F.linear(query, self.base.in_proj_weight[: self.embed_dim], bias[: self.embed_dim] if bias is not None else None) + dq
         k = F.linear(key, self.base.in_proj_weight[self.embed_dim: 2 * self.embed_dim], bias[self.embed_dim: 2 * self.embed_dim] if bias is not None else None) + dk
         v = F.linear(value, self.base.in_proj_weight[2 * self.embed_dim:], bias[2 * self.embed_dim:] if bias is not None else None) + dv
@@ -180,7 +203,11 @@ def lora_state_dict(module):
     LoRA-wrapped host model's FULL state_dict would re-save every frozen
     base weight (e.g. all 2.13B of Qwen3-VL-2B) on every checkpoint, when
     only the tiny trainable delta needs to persist."""
-    return {k: v for k, v in module.state_dict().items() if ".lora_A." in k or ".lora_B." in k}
+    # Substring, not dot-anchored: LoRAMultiheadAttention's params are named
+    # lora_A_q/lora_A_k/lora_A_v (and lora_B_q/k/v), not plain lora_A/lora_B,
+    # so a ".lora_A." check (requiring an immediate trailing dot) would miss
+    # them entirely.
+    return {k: v for k, v in module.state_dict().items() if ".lora_A" in k or ".lora_B" in k}
 
 
 def load_lora_state_dict(module, state_dict):
@@ -188,6 +215,6 @@ def load_lora_state_dict(module, state_dict):
     an already-LoRA-wrapped module (apply_lora_to_all_layers must have been
     called first, so those submodules exist)."""
     missing, unexpected = module.load_state_dict(state_dict, strict=False)
-    unexpected_lora = [k for k in unexpected if ".lora_A." in k or ".lora_B." in k]
+    unexpected_lora = [k for k in unexpected if ".lora_A" in k or ".lora_B" in k]
     if unexpected_lora:
         raise RuntimeError(f"unexpected LoRA keys not found in module: {unexpected_lora}")
