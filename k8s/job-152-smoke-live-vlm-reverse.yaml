@@ -73,9 +73,9 @@ spec:
                 --guidance crossattn \
                 --live_vlm --lora_vlm_r 8 --lora_vlm_alpha 16 \
                 --epochs 1 \
-                --max_train_items 2 \
-                --val_every_steps 1 \
-                --save_every_steps 2 \
+                --max_train_items 6 \
+                --val_every_steps 2 \
+                --save_every_steps 5 \
                 --max_val_items 2 \
                 --out_dir /data/raw_data/smoke_live_vlm_reverse_runs 2>&1 \
                 | tee /data/raw_data/smoke_live_vlm_reverse_runs/full_run.log
