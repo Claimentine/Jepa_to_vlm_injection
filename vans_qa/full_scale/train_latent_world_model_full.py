@@ -62,6 +62,17 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+# Needed for --live_vlm's `from common.live_vlm_guidance import ...` /
+# `from common.lora import ...` (deferred imports inside main()) -- this
+# script never previously imported anything from the project's own common/
+# package, only from cache_train.*, so repo root was never added to
+# sys.path (confirmed by a real run: "ModuleNotFoundError: No module named
+# 'common'" the first time --live_vlm hit that import). Script's own
+# directory is vans_qa/full_scale/, so repo root is 2 levels up.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 BASE = os.environ.get("VANS_ROOT", "/data")
 WORK_BASE = os.environ.get("VANS_WORK_ROOT", "/data/vans_work")
 THINKJEPA_ROOT = os.environ.get("THINKJEPA_ROOT", "/home/jovyan/ThinkJEPA")
