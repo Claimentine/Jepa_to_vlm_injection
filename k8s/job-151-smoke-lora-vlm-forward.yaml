@@ -1,0 +1,151 @@
+# Step 151: smoke test for the new --lora_vlm flag in train_qa_full.py
+# (commit 95c4ae3 + follow-up fixes to common/lora.py). Per explicit user
+# request 2026-11-07/08: "fine-tune all modules, only JEPA's encoder stays
+# frozen" -- this is the FORWARD-direction half (the VLM was previously
+# fully frozen; --lora_vlm wraps all 301 Linear layers in Qwen3-VL-2B-
+# Thinking -- language model + vision tower + merger, confirmed via job-150's
+# module dump, no nn.MultiheadAttention anywhere -- with LoRA and trains
+# those alongside the injector/bridge).
+#
+# Runs independently in parallel with job-149 (the predictor/bridge LoRA
+# smoke test, vans_qa/full_scale/finetune_egodex_predictor.py) -- different
+# script, and deliberately uses a DIFFERENT conda-storage PVC
+# (ruixin-conda-vol-baselines2, same one job-146 used, also has the
+# qwen3vl conda env) so this doesn't collide with job-149's RWO-mounted
+# ruixin-conda-vol-ddp2 (confirmed this session: two pods can't attach the
+# same RWO PVC at once -- "Multi-Attach error" -- which stalled job-149
+# itself for ~15 minutes earlier against job-150).
+#
+# Tiny budget (--max_steps 5, --max_val_items 10) -- this only needs to
+# prove the mechanism runs end-to-end (VLM LoRA wraps, forward with the
+# injection hook still active, backward through the whole VLM, optimizer
+# step, periodic save) without shape/attribute/device errors; not a real
+# training result.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-smoke-lora-vlm-forward
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "16000"
+      containers:
+        - name: smoke-lora-vlm
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/smoke_lora_vlm_forward_runs
+              "$PY" vans_qa/full_scale/train_qa_full.py \
+                --split /data/raw_data/qa_split_temporal.json \
+                --injection jepa \
+                --injection_site cross_attn \
+                --layer_strategy middle4 \
+                --lora_vlm --lora_vlm_r 8 --lora_vlm_alpha 16 \
+                --max_steps 5 \
+                --epochs 1 \
+                --val_every_steps 2 \
+                --save_every_steps 5 \
+                --max_val_items 10 \
+                --out_dir /data/raw_data/smoke_lora_vlm_forward_runs 2>&1 \
+                | tee /data/raw_data/smoke_lora_vlm_forward_runs/full_run.log
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "24Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "28Gi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-baselines2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-151-smoke-lora-vlm-forward.yaml -n williamli-scvl
