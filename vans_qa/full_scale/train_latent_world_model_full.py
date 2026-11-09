@@ -327,7 +327,7 @@ def main():
     if args.live_vlm:
         from common.live_vlm_guidance import load_qwen_with_lora
         qwen_model, qwen_processor, qwen_saved, _qwen_sha, _wrapped = load_qwen_with_lora(
-            args, device, lora_r=args.lora_vlm_r, lora_alpha=args.lora_vlm_alpha, dropout=args.lora_vlm_dropout,
+            args, device, lora_r=args.lora_vlm_r, lora_alpha=args.lora_vlm_alpha, lora_dropout=args.lora_vlm_dropout,
         )
         vlm_lora_params = [p for p in qwen_model.parameters() if p.requires_grad]
 

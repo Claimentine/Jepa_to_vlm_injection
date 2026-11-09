@@ -21,6 +21,12 @@
 # injection hook still active, backward through the whole VLM, optimizer
 # step, periodic save) without shape/attribute/device errors; not a real
 # training result.
+#
+# gpu.memory floor bumped 16000 -> 40000 (only L40/L40S, 46GB, qualify)
+# after a first attempt OOM'd on a 23GB A10 ("Tried to allocate 376.00MiB
+# ... 20.74GiB already allocated") -- backprop now has to reach through the
+# WHOLE 2.14B-param VLM, not just the small injector, so this needs
+# meaningfully more headroom than this project's usual >16GB floor.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -50,7 +56,7 @@ spec:
                   - key: nvidia.com/gpu.memory
                     operator: Gt
                     values:
-                      - "16000"
+                      - "40000"
       containers:
         - name: smoke-lora-vlm
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
