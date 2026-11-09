@@ -131,6 +131,38 @@ def load_pair(cache_dir, pid, device):
     return in_feats, out_feats, extras
 
 
+def load_pair_live(cache_dir, pid, device, qwen_model, qwen_processor, qwen_saved, qwen_args):
+    """--live_vlm variant of load_pair: vjepa_input_feats/vjepa_target_feats
+    still come from the cache (V-JEPA2's encoder is frozen and deterministic
+    given the input frames, so caching it is still exactly correct -- the
+    user's own "only JEPA's encoder stays frozen" scope does not touch this
+    side). vlm_old/vlm_new, instead of being read from the cache's own frozen
+    arrays, are recomputed LIVE by re-running Qwen3-VL's teacher-forced
+    inference on this pid's actual (in_clip, question, correct_caption) --
+    all three already stored in the SAME npz by extract_vlm_guidance_paired.py
+    (see its own payload dict), so no separate raw-data lookup is needed.
+    Returns the same (in_feats, out_feats, extras) shape as load_pair, so
+    forward_step needs no changes -- only vlm_old/vlm_new now carry gradients
+    back into qwen_model's LoRA parameters."""
+    from cache_train.rebuild_causal_cache import NUM_PAST_FRAMES
+    from common.live_vlm_guidance import decode_clip_with_timeout, infer_qwen_teacher_forced_live
+
+    d = np.load(os.path.join(cache_dir, f"{pid}.npz"))
+    in_feats = torch.from_numpy(d["vjepa_input_feats"].astype(np.float32)).unsqueeze(0).to(device)
+    out_feats = torch.from_numpy(d["vjepa_target_feats"].astype(np.float32)).unsqueeze(0).to(device)
+
+    in_clip_relpath = str(d["in_clip_relpath"])
+    question = str(d["question"])
+    correct_caption = str(d["correct_caption"])
+    past_frames, past_times, in_fps = decode_clip_with_timeout(in_clip_relpath, NUM_PAST_FRAMES)
+    vlm_old, vlm_new = infer_qwen_teacher_forced_live(
+        qwen_args, qwen_model, qwen_processor, qwen_saved, device,
+        past_frames, past_times, in_fps, question, correct_caption,
+    )
+    extras = {"vlm_old": vlm_old.float(), "vlm_new": vlm_new.float()}
+    return in_feats, out_feats, extras
+
+
 def build_predictor(device, guidance):
     total_frames = 2 * T_PER_CLIP
     use_guidance = guidance != "none"
@@ -186,14 +218,14 @@ def forward_step(predictor, in_feats, out_feats, extras, guidance, device):
     return metrics
 
 
-def evaluate(predictor, cache_dir, pids, guidance, device, max_items=None):
+def evaluate(predictor, get_pair, pids, guidance, device, max_items=None):
     predictor.eval()
     totals = {"pred_loss": 0.0, "pred_latent_dist": 0.0, "pred_latent_cosine_distance": 0.0}
     n = 0
     use_pids = pids[:max_items] if max_items else pids
     with torch.no_grad():
         for pid in use_pids:
-            in_feats, out_feats, extras = load_pair(cache_dir, pid, device)
+            in_feats, out_feats, extras = get_pair(pid)
             m = forward_step(predictor, in_feats, out_feats, extras, guidance, device)
             for k in totals:
                 totals[k] += float(m[k].item())
@@ -222,6 +254,29 @@ def main():
                           "--guidance != none), initializes guidance_old_adapter/guidance_new_adapter "
                           "from the fitted VLM->JEPA alignment (composed through CortexGuidedVideoPredictor's "
                           "own context_adapter) instead of random init.")
+    ap.add_argument("--live_vlm", action="store_true",
+                     help="FULL-STACK FINE-TUNING (2026-11-07/08): instead of reading this pid's "
+                          "vlm_old/vlm_new from the (frozen, pre-extracted) cache, load Qwen3-VL live, "
+                          "LoRA-wrap it (common/lora.py), and recompute vlm_old/vlm_new via a "
+                          "gradient-carrying teacher-forced forward pass on this pid's actual "
+                          "(in_clip, question, correct_caption) every time -- so the predictor's "
+                          "pred_loss gradient reaches the VLM's own LoRA params too, not just the "
+                          "predictor. V-JEPA2's encoder output (in_feats/out_feats) still comes from "
+                          "the cache unchanged -- that encoder stays frozen regardless (see "
+                          "load_pair_live's docstring).")
+    ap.add_argument("--pretrained", default="Qwen/Qwen3-VL-2B-Thinking", help="only used with --live_vlm")
+    ap.add_argument("--qwen_revision", default="main", help="only used with --live_vlm")
+    ap.add_argument("--qwen_checkpoint_sha", default="", help="only used with --live_vlm")
+    ap.add_argument("--qwen_res", type=int, default=256, help="only used with --live_vlm")
+    ap.add_argument("--layers", type=int, nargs="+", default=[0, 4, 8, 12, 16, 20, 24, 27],
+                     help="which Qwen3-VL decoder layers to hook for vlm_old/vlm_new -- only used with "
+                          "--live_vlm; MUST match whatever extract_vlm_guidance_paired.py used to build "
+                          "the cache this run inherits its train/val/test pid split from, since "
+                          "guidance_old_adapter/guidance_new_adapter's expected layer count (L) is fixed "
+                          "at predictor-construction time by the cache's OWN L (see load_pair's comment).")
+    ap.add_argument("--lora_vlm_r", type=int, default=8, help="only used with --live_vlm")
+    ap.add_argument("--lora_vlm_alpha", type=float, default=16.0, help="only used with --live_vlm")
+    ap.add_argument("--lora_vlm_dropout", type=float, default=0.0, help="only used with --live_vlm")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -257,6 +312,20 @@ def main():
     n_params = sum(p.numel() for p in predictor.parameters())
     print(f"[INFO] guidance={args.guidance} predictor params: {n_params:,}", flush=True)
 
+    vlm_lora_params = []
+    if args.live_vlm:
+        from common.live_vlm_guidance import load_qwen_with_lora
+        qwen_model, qwen_processor, qwen_saved, _qwen_sha, _wrapped = load_qwen_with_lora(
+            args, device, lora_r=args.lora_vlm_r, lora_alpha=args.lora_vlm_alpha, dropout=args.lora_vlm_dropout,
+        )
+        vlm_lora_params = [p for p in qwen_model.parameters() if p.requires_grad]
+
+        def get_pair(pid):
+            return load_pair_live(args.cache_dir, pid, device, qwen_model, qwen_processor, qwen_saved, args)
+    else:
+        def get_pair(pid):
+            return load_pair(args.cache_dir, pid, device)
+
     if args.warmstart_alignment and args.guidance != "none":
         # See fit_warmstart_alignment.py's module docstring for the full
         # rationale -- guidance_old_adapter/guidance_new_adapter only exist
@@ -276,7 +345,7 @@ def main():
                 layer.weight.copy_(align[key].to(device))
         print(f"[INFO] warm-started guidance_old_adapter/guidance_new_adapter from "
               f"{args.warmstart_alignment} (fit on {align['n_pairs']} pairs)", flush=True)
-    opt = torch.optim.AdamW(predictor.parameters(), lr=args.lr)
+    opt = torch.optim.AdamW(list(predictor.parameters()) + vlm_lora_params, lr=args.lr)
 
     log_path = os.path.join(run_dir, "train_log.jsonl")
     log_f = open(log_path, "a")
@@ -287,7 +356,7 @@ def main():
         rng.shuffle(train_ids)
         for pid in train_ids:
             step += 1
-            in_feats, out_feats, extras = load_pair(args.cache_dir, pid, device)
+            in_feats, out_feats, extras = get_pair(pid)
             metrics = forward_step(predictor, in_feats, out_feats, extras, args.guidance, device)
             loss = metrics["pred_loss"]
 
@@ -298,7 +367,7 @@ def main():
             log_f.write(json.dumps({"step": step, "epoch": epoch, "train_loss": float(loss.item())}) + "\n")
 
             if step % args.val_every_steps == 0:
-                val_metrics, n_val = evaluate(predictor, args.cache_dir, val_ids, args.guidance, device, args.max_val_items)
+                val_metrics, n_val = evaluate(predictor, get_pair, val_ids, args.guidance, device, args.max_val_items)
                 print(
                     f"[step {step}] train_loss={loss.item():.4f}  "
                     f"val_mse={val_metrics['pred_loss']:.4f}  "
@@ -309,21 +378,32 @@ def main():
                 log_f.write(json.dumps({"step": step, "epoch": epoch, **{f"val_{k}": v for k, v in val_metrics.items()}}) + "\n")
                 if val_metrics["pred_loss"] < best_val:
                     best_val = val_metrics["pred_loss"]
-                    torch.save({"step": step, "guidance": args.guidance, "best_val_mse": best_val,
-                                "predictor_state": predictor.state_dict()},
-                               os.path.join(run_dir, "best.pt"))
+                    ckpt = {"step": step, "guidance": args.guidance, "best_val_mse": best_val,
+                            "predictor_state": predictor.state_dict()}
+                    if args.live_vlm:
+                        from common.lora import lora_state_dict
+                        ckpt["vlm_lora_state"] = lora_state_dict(qwen_model)
+                    torch.save(ckpt, os.path.join(run_dir, "best.pt"))
             if step % args.save_every_steps == 0:
-                torch.save({"step": step, "guidance": args.guidance,
-                            "predictor_state": predictor.state_dict()},
-                           os.path.join(run_dir, f"step_{step}.pt"))
+                ckpt = {"step": step, "guidance": args.guidance, "predictor_state": predictor.state_dict()}
+                if args.live_vlm:
+                    from common.lora import lora_state_dict
+                    ckpt["vlm_lora_state"] = lora_state_dict(qwen_model)
+                torch.save(ckpt, os.path.join(run_dir, f"step_{step}.pt"))
             log_f.flush()
 
     log_f.close()
 
     best_path = os.path.join(run_dir, "best.pt")
     if os.path.exists(best_path):
+        # NOTE: with --live_vlm, this restores the predictor's own best
+        # snapshot but NOT qwen_model's VLM LoRA weights back to that same
+        # step (they're left at whatever they were at the end of training) --
+        # best.pt's "vlm_lora_state" is saved for inspection/reuse elsewhere,
+        # not auto-reloaded here. Fine for a smoke test; a real run wanting a
+        # true best-checkpoint test score would need to also reload it here.
         predictor.load_state_dict(torch.load(best_path, map_location=device, weights_only=False)["predictor_state"])
-    test_metrics, n_test = evaluate(predictor, args.cache_dir, test_ids, args.guidance, device)
+    test_metrics, n_test = evaluate(predictor, get_pair, test_ids, args.guidance, device)
     print(f"[TEST] guidance={args.guidance} n={n_test} {test_metrics}", flush=True)
     with open(os.path.join(run_dir, "test_metrics.json"), "w") as f:
         json.dump({"n_test": n_test, **test_metrics}, f, indent=2)
