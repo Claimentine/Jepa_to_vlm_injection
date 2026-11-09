@@ -172,17 +172,83 @@ def infer_qwen_teacher_forced_live(args, model, processor, saved, device, past_f
     return vlm_old, vlm_new
 
 
+def register_decoder_hooks_live(decoder_layers, layers):
+    """Same capture structure as cache_train.qwen3_feature_hooks.
+    register_thinker_decoder_hooks (confirmed via job-153's source dump),
+    MINUS its `.detach().cpu()` on the captured hidden state. That detach+
+    cpu is correct for the frozen, no_grad extraction pipeline it was
+    written for (avoids holding every call's autograd graph/GPU memory
+    during a large-scale cache build) -- but it silently severs the
+    autograd graph, which is fatal here: the whole point of --live_vlm is a
+    gradient-carrying forward pass that trains Qwen3-VL's own LoRA
+    parameters. An earlier version of this file called load_qwen (which
+    uses the detaching hook) directly -- job-152's first "successful" run
+    completed without crashing, but its vlm_old/vlm_new were already
+    detached by the time the predictor used them, so no gradient ever
+    reached the VLM's LoRA weights from the reverse direction at all (only
+    the predictor's own LoRA/context_adapter trained) -- a real, previously
+    unnoticed correctness bug, not just a missed optimization."""
+    saved = {f"dec_{i}": [] for i in layers}
+
+    def make_hook(name):
+        def hook(_module, _inp, out):
+            hidden = out
+            if isinstance(hidden, (tuple, list)):
+                hidden = hidden[0]
+                if isinstance(hidden, (tuple, list)):
+                    hidden = hidden[0]
+            if torch.is_tensor(hidden):
+                saved[name].append(hidden)  # NOT .detach().cpu()
+        return hook
+
+    for layer_idx in layers:
+        decoder_layers[layer_idx].register_forward_hook(make_hook(f"dec_{layer_idx}"))
+    return saved
+
+
+def load_qwen_live(args, device):
+    """Like cache_train.rebuild_causal_cache.load_qwen, but registers
+    gradient-carrying hooks (register_decoder_hooks_live) instead of its
+    own detaching ones. Returns (model, processor, saved, layers_path)."""
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+    from cache_train.qwen3_feature_hooks import locate_thinker_decoder_layers
+
+    kwargs = {"revision": args.qwen_revision, "device_map": None}
+    try:
+        model = AutoModelForImageTextToText.from_pretrained(args.pretrained, torch_dtype="auto", **kwargs)
+    except TypeError:
+        model = AutoModelForImageTextToText.from_pretrained(args.pretrained, dtype="auto", **kwargs)
+    processor = AutoProcessor.from_pretrained(args.pretrained, revision=args.qwen_revision)
+    if getattr(processor, "tokenizer", None) is not None:
+        processor.tokenizer.padding_side = "left"
+    model.eval().requires_grad_(False).to(device)
+
+    saved, layers_path = register_decoder_hooks_on_model(model, args.layers)
+    return model, processor, saved, layers_path
+
+
+def register_decoder_hooks_on_model(model, layers):
+    """Just the hook-registration half of load_qwen_live, for reuse on a
+    model that's ALREADY loaded (e.g. a joint-training script's own
+    `model`, shared with the forward direction) instead of loading a
+    second, separate Qwen3-VL instance. Returns (saved, layers_path)."""
+    from cache_train.qwen3_feature_hooks import locate_thinker_decoder_layers
+
+    decoder_layers, layers_path = locate_thinker_decoder_layers(model)
+    saved = register_decoder_hooks_live(decoder_layers, list(layers))
+    print(f"[INFO] registered gradient-carrying decoder hooks: {layers_path} layers={list(layers)}", flush=True)
+    return saved, layers_path
+
+
 def load_qwen_with_lora(args, device, lora_r=8, lora_alpha=16, lora_dropout=0.0):
-    """Loads Qwen3-VL + registers the same decoder-hidden-state hooks
-    extract_vlm_guidance_paired.py uses (via cache_train.rebuild_causal_cache.
-    load_qwen), then LoRA-wraps every nn.Linear in it (301 on Qwen3-VL-2B-
-    Thinking, confirmed via job-150's module dump -- no nn.MultiheadAttention
-    anywhere) and freezes everything else. Returns (model, processor, saved,
-    qwen_sha, wrapped_names)."""
-    from cache_train.rebuild_causal_cache import load_qwen
+    """Loads Qwen3-VL with gradient-carrying hooks (load_qwen_live), then
+    LoRA-wraps every nn.Linear in it (301 on Qwen3-VL-2B-Thinking, confirmed
+    via job-150's module dump -- no nn.MultiheadAttention anywhere) and
+    freezes everything else. Returns (model, processor, saved, layers_path,
+    wrapped_names)."""
     from common.lora import apply_lora_to_all_layers, freeze_all_except_lora, lora_trainable_param_count
 
-    model, processor, saved, qwen_sha = load_qwen(args, device)
+    model, processor, saved, layers_path = load_qwen_live(args, device)
     wrapped = apply_lora_to_all_layers(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
     freeze_all_except_lora(model)
     n_trainable = lora_trainable_param_count(model)
@@ -190,4 +256,4 @@ def load_qwen_with_lora(args, device, lora_r=8, lora_alpha=16, lora_dropout=0.0)
     print(f"[INFO] load_qwen_with_lora: wrapped {len(wrapped)} Linear layers "
           f"(r={lora_r} alpha={lora_alpha}): trainable={n_trainable:,}/{n_total:,} "
           f"({100 * n_trainable / n_total:.2f}%)", flush=True)
-    return model, processor, saved, qwen_sha, wrapped
+    return model, processor, saved, layers_path, wrapped

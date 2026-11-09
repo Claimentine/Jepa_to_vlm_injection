@@ -373,6 +373,25 @@ def main():
 
             opt.zero_grad()
             loss.backward()
+            if args.live_vlm and step == 1:
+                # One-time diagnostic: confirm the reverse direction's loss
+                # actually reaches the VLM's own LoRA params, not just the
+                # predictor's -- the earlier version of this path silently
+                # didn't (register_thinker_decoder_hooks detaches+CPUs the
+                # captured hidden state, severing autograd right there; see
+                # common/live_vlm_guidance.py's register_decoder_hooks_live
+                # docstring). A zero/None total here means that regressed.
+                vlm_grad_norm = sum(
+                    p.grad.norm().item() for p in vlm_lora_params if p.grad is not None
+                )
+                n_with_grad = sum(1 for p in vlm_lora_params if p.grad is not None)
+                print(f"[DIAG --live_vlm step 1] VLM LoRA params with grad: "
+                      f"{n_with_grad}/{len(vlm_lora_params)}  total_grad_norm={vlm_grad_norm:.6f}", flush=True)
+                if n_with_grad == 0 or vlm_grad_norm == 0.0:
+                    raise RuntimeError(
+                        "--live_vlm: no gradient reached the VLM's LoRA params -- "
+                        "the reverse direction is not actually training the VLM"
+                    )
             opt.step()
 
             log_f.write(json.dumps({"step": step, "epoch": epoch, "train_loss": float(loss.item())}) + "\n")
