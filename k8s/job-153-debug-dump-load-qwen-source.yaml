@@ -22,8 +22,8 @@ spec:
             - "-c"
             - |
               set -uo pipefail
-              echo "---- load_qwen + hook-related source ----"
-              grep -n "def load_qwen\|def register_thinker_decoder_hooks\|def register_decoder_hooks\|register_forward_hook\|register_forward_pre_hook\|saved\[" -A 40 /home/jovyan/ThinkJEPA/cache_train/rebuild_causal_cache.py | head -300
+              echo "---- qwen3_feature_hooks.py full source ----"
+              cat -n /home/jovyan/ThinkJEPA/cache_train/qwen3_feature_hooks.py
               echo "SCRIPT_DONE"
           resources:
             requests: {cpu: "500m", memory: "1Gi", ephemeral-storage: "1Gi"}
