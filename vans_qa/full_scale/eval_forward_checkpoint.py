@@ -62,6 +62,9 @@ from common.jepa_injection_model import (  # noqa: E402
     select_layer_indices,
 )
 from common.cross_modal_bridge import CrossModalBridge, ForwardingAdapter  # noqa: E402
+from common.lora import (  # noqa: E402
+    apply_lora_to_all_layers, freeze_all_except_lora, load_lora_state_dict, reset_lora_to_noop,
+)
 import train_qa_full as fwd  # noqa: E402
 
 NONE_SENTINEL = "NONE"
@@ -150,6 +153,20 @@ def load_checkpoint_into_fresh_injector(checkpoint_path, model, hidden_size, def
         bridge.load_state_dict(bridge_state)
     injector.load_state_dict(ckpt["injector_state"])
     injector.eval()
+    if "vlm_lora_state" in ckpt:
+        # model is already LoRA-wrapped by the caller (--lora_vlm, applied
+        # once up front) -- just load this checkpoint's own deltas on top.
+        load_lora_state_dict(model, ckpt["vlm_lora_state"])
+        print(f"[INFO] {checkpoint_path}: loaded its own vlm_lora_state", flush=True)
+    elif any(".lora_A" in n or ".lora_B" in n for n, _ in model.named_parameters()):
+        # model was LoRA-wrapped (--lora_vlm) but THIS checkpoint has no
+        # vlm_lora_state of its own (e.g. a plain pre-LoRA checkpoint
+        # evaluated in the same multi-checkpoint run) -- reset to an exact
+        # no-op so it isn't silently contaminated by whichever checkpoint's
+        # LoRA weights were loaded last.
+        reset_lora_to_noop(model)
+        print(f"[INFO] {checkpoint_path}: no vlm_lora_state in this checkpoint -- "
+              "reset VLM LoRA to no-op", flush=True)
     print(f"[INFO] loaded {checkpoint_path} (step={ckpt.get('step')}, "
           f"checkpoint's own val_acc={ckpt.get('val_acc')})", flush=True)
     return injector
@@ -199,6 +216,16 @@ def main():
                           "already-decoded-and-processed model inputs from here instead of doing "
                           "that CPU-bound work live, falling back to live building on any "
                           "per-item cache miss")
+    ap.add_argument("--lora_vlm", action="store_true",
+                     help="the checkpoint(s) being evaluated were trained with --lora_vlm "
+                          "(train_qa_full.py / train_joint_coupled_normalized.py) -- LoRA-wrap the "
+                          "VLM ONCE up front (same r/alpha as training), then for each checkpoint in "
+                          "this run: load its own vlm_lora_state if present, else reset the LoRA "
+                          "deltas to an exact no-op (see common/lora.py's reset_lora_to_noop) so a "
+                          "plain/zeroshot checkpoint evaluated in the SAME multi-checkpoint run isn't "
+                          "silently contaminated by the previous checkpoint's LoRA weights.")
+    ap.add_argument("--lora_vlm_r", type=int, default=8, help="only used with --lora_vlm")
+    ap.add_argument("--lora_vlm_alpha", type=float, default=16.0, help="only used with --lora_vlm")
     ap.add_argument("--resume", action="store_true",
                      help="if --out_path already exists, load it first and skip any checkpoint "
                           "label already present with the same split_part -- lets a multi-checkpoint "
@@ -234,6 +261,12 @@ def main():
     model = AutoModelForImageTextToText.from_pretrained(model_id, dtype="auto").to(device)
     processor = AutoProcessor.from_pretrained(model_id)
     model.requires_grad_(False)
+    if args.lora_vlm:
+        wrapped = apply_lora_to_all_layers(model, r=args.lora_vlm_r, alpha=args.lora_vlm_alpha)
+        freeze_all_except_lora(model)
+        print(f"[INFO] --lora_vlm: wrapped {len(wrapped)} Linear layers (r={args.lora_vlm_r} "
+              f"alpha={args.lora_vlm_alpha}) -- starts as an exact no-op until each checkpoint's own "
+              "vlm_lora_state (if any) is loaded below", flush=True)
     model.eval()
     hidden_size = model.config.text_config.hidden_size
     n_tokens = 64
@@ -263,6 +296,8 @@ def main():
                       f"(n={existing.get('n_total')} acc={existing.get('acc')})", flush=True)
                 continue
             if checkpoint_path == NONE_SENTINEL:
+                if args.lora_vlm:
+                    reset_lora_to_noop(model)
                 rng = random.Random(args.seed)
                 tally = evaluate_logprob_none(
                     model, processor, items, device, rng,

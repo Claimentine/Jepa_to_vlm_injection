@@ -218,3 +218,17 @@ def load_lora_state_dict(module, state_dict):
     unexpected_lora = [k for k in unexpected if ".lora_A" in k or ".lora_B" in k]
     if unexpected_lora:
         raise RuntimeError(f"unexpected LoRA keys not found in module: {unexpected_lora}")
+
+
+def reset_lora_to_noop(module):
+    """Zeros every lora_B weight in an already-wrapped module, restoring the
+    exact no-op-at-init state (see LoRALinear/LoRAMultiheadAttention's own
+    zero-init convention). For an eval script that mixes LoRA and non-LoRA
+    checkpoints in one run on a single shared, already-wrapped model --
+    without this, a checkpoint with no vlm_lora_state would silently
+    inherit whatever LoRA deltas the PREVIOUS checkpoint in the loop left
+    behind."""
+    with torch.no_grad():
+        for name, p in module.named_parameters():
+            if ".lora_B" in name:
+                p.zero_()
