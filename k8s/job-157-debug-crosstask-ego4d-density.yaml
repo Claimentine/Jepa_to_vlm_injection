@@ -1,0 +1,102 @@
+# Step 157: no-GPU debug pod -- checks same-video item density directly
+# from the ALREADY-EXTRACTED qa_split_crosstask.json/qa_split_ego4d.json
+# (each item already carries its own correct_caption + a pid encoding its
+# source video), instead of re-touching the raw downloaded annotations --
+# answers "do we have enough same-video alternative captions to build a
+# hard (same-video-different-moment) distractor scheme" without needing
+# extract_crosstask_qa.py/extract_ego4d_qa.py's own raw annotation inputs
+# at all.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-debug-crosstask-ego4d-density
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      containers:
+        - name: debug-dump
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -uo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              "$PY" - <<'PYEOF'
+              import json, collections
+
+              for name, path, video_key_guess in [
+                  ("crosstask", "/data/raw_data/qa_split_crosstask.json", None),
+                  ("ego4d", "/data/raw_data/qa_split_ego4d.json", None),
+              ]:
+                  print(f"==== {name} ====", flush=True)
+                  try:
+                      d = json.load(open(path))
+                  except Exception as e:
+                      print(f"ERROR loading {path}: {type(e).__name__}: {e}", flush=True)
+                      continue
+                  all_items = [it for part in d.values() for it in part]
+                  print(f"total items: {len(all_items)}", flush=True)
+                  if not all_items:
+                      continue
+                  sample = all_items[0]
+                  print(f"sample item keys: {list(sample.keys())}", flush=True)
+                  print(f"sample item: {json.dumps({k: str(v)[:80] for k, v in sample.items()}, indent=2)}", flush=True)
+
+                  # Try to find a video-id-bearing field: explicit video_id/video_uid
+                  # key, else derive from pid (e.g. "crosstask_<task>_<video>_<idx>"
+                  # or similar "<prefix>_<video>__<n>" conventions used elsewhere).
+                  video_key = None
+                  for k in ("video_id", "video_uid", "source_video", "video"):
+                      if k in sample:
+                          video_key = k
+                          break
+                  by_video = collections.Counter()
+                  for it in all_items:
+                      if video_key:
+                          vid = it[video_key]
+                      else:
+                          pid = it.get("pid", "")
+                          # crosstask pid: crosstask_{task_id}_{video_id}_{pair_idx}
+                          # -- video_id itself may contain underscores, so this is a
+                          # best-effort split, not guaranteed exact; still gives a
+                          # usable distinct-video lower bound.
+                          parts = pid.split("_")
+                          vid = "_".join(parts[1:-1]) if len(parts) > 2 else pid
+                      by_video[vid] += 1
+                  n_videos = len(by_video)
+                  avg = len(all_items) / max(n_videos, 1)
+                  singleton = sum(1 for v in by_video.values() if v == 1)
+                  print(f"video_key used: {video_key or '(derived from pid)'}", flush=True)
+                  print(f"distinct videos (best-effort): {n_videos}, avg items/video: {avg:.2f}, "
+                        f"singleton videos (no same-video alt available): {singleton} "
+                        f"({100*singleton/max(n_videos,1):.1f}%)", flush=True)
+              PYEOF
+              echo "SCRIPT_DONE"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1.2", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          volumeMounts:
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      volumes:
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-baselines2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-157-debug-crosstask-ego4d-density.yaml -n williamli-scvl
