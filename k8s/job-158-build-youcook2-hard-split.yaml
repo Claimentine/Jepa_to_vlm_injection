@@ -32,6 +32,14 @@ spec:
                       - Tesla-V100-SXM2-32GB
                       - NVIDIA-GeForce-RTX-2080-Ti
                       - NVIDIA-TITAN-RTX
+                  # uicnrp-fiona.evl.uic.edu has a broken GPU (NVLink "GPU is
+                  # lost" UnexpectedAdmissionError, hit 5x across two
+                  # submissions of this job) -- excluded by hostname to force
+                  # scheduling onto a different, working node.
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - uicnrp-fiona.evl.uic.edu
       containers:
         - name: build-youcook2-hard-split
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp

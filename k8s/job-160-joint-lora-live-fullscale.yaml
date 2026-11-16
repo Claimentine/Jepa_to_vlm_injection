@@ -1,0 +1,147 @@
+# Step 160: full-scale (1 full epoch, 6688 steps) run of the same recipe
+# job-155 validated at 3000 steps -- "freeze JEPA's own encoder, LoRA/live-VLM
+# everything else, genuinely joint across both directions via one shared
+# VLM+LoRA instance." User explicitly confirmed the 6688-step / ~3-day
+# budget (AskUserQuestion, this session) after job-155 completed cleanly and
+# showed a consistent, well-understood easy/hard accuracy pattern across its
+# whole run -- this is the follow-up "real" run, not another smoke test.
+#
+# Identical flags to job-155 (same --bridge_hidden_dim 2048, same LoRA r/alpha
+# for both VLM and predictor, same --live_vlm) -- only --max_steps changes
+# (3000 -> 6688, i.e. the full epoch instead of a conservative partial
+# budget). --save_every_steps kept at 250 (same insurance rationale as
+# job-155: 46GB-class nodes are queue-prone and this is a ~3-day run).
+#
+# Separate --out_dir (joint_lora_live_fullscale_runs) so job-155's own
+# checkpoints/logs are never touched -- this is a new run, not a resume.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-joint-lora-live-fullscale
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "40000"
+      containers:
+        - name: joint-lora-live-fullscale
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/joint_lora_live_fullscale_runs
+              "$PY" vans_qa/full_scale/train_joint_coupled_normalized.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --cache_dir /data/vans_work/vlm_guidance_cache_paired \
+                --rev_qa_split /data/raw_data/qa_split_full.json \
+                --bridge_hidden_dim 2048 \
+                --lora_vlm --lora_vlm_r 8 --lora_vlm_alpha 16 \
+                --lora_predictor --lora_predictor_r 8 --lora_predictor_alpha 16 \
+                --live_vlm \
+                --epochs 1 \
+                --max_steps 6688 \
+                --val_every_steps 250 \
+                --save_every_steps 250 \
+                --max_val_items 100 \
+                --max_test_items 100 \
+                --out_dir /data/raw_data/joint_lora_live_fullscale_runs 2>&1 \
+                | tee /data/raw_data/joint_lora_live_fullscale_runs/full_run.log
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "28Gi"
+              ephemeral-storage: "4Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "32Gi"
+              ephemeral-storage: "6Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-160-joint-lora-live-fullscale.yaml -n williamli-scvl
