@@ -218,6 +218,28 @@ def main():
                           "longer than 2 epochs safe to try.")
     ap.add_argument("--warmup_steps", type=int, default=200,
                      help="only used when --lr_schedule warmup_cosine")
+    ap.add_argument("--vlm_lr", type=float, default=None,
+                     help="separate learning rate for the shared VLM's own LoRA params "
+                          "(vlm_lora_params), as its own AdamW param group -- defaults to --lr "
+                          "(the old single-group behavior) if unset. injector/predictor/bridge are "
+                          "freshly-initialized modules that need a large step to learn from scratch; "
+                          "the VLM's LoRA adapts an already-pretrained 2.14B model, which is far more "
+                          "fragile to a large step on every one of its layers -- using the same --lr "
+                          "for both groups (round1's job-155/job-160) is the likely cause of "
+                          "fwd_val_acc oscillating near-chance with no convergence trend across an "
+                          "entire 3000+-step run instead of climbing, e.g. job-160's own "
+                          "0.51/0.39/0.31/0.46/.../0.43 at steps 250-3000, far wider than n=100's "
+                          "sampling noise (+-0.05) could explain on its own. A --lr_schedule "
+                          "warmup_cosine factor still multiplies both groups' base lr identically "
+                          "(LambdaLR with one lr_lambda applies to every param group).")
+    ap.add_argument("--grad_clip_norm", type=float, default=1.0,
+                     help="torch.nn.utils.clip_grad_norm_ max_norm applied to all_params before "
+                          "opt.step(), 0 to disable. round1 (job-155/job-160) had NO grad clipping "
+                          "at all -- with two very different-scale losses (fwd cross-entropy, rev "
+                          "MSE-distance) landing on the same shared VLM-LoRA weights every step, an "
+                          "occasional gradient spike from either side can whipsaw those weights with "
+                          "nothing to bound it, compounding the oscillation --vlm_lr addresses from "
+                          "the learning-rate side.")
     ap.add_argument("--cycle_loss_weight", type=float, default=0.1)
     ap.add_argument("--loss_norm_decay", type=float, default=0.98,
                      help="EMA decay for the per-loss magnitude normalizer -- higher means "
@@ -474,13 +496,24 @@ def main():
             print(f"[INFO] --lora_predictor: wrapped {len(predictor_wrapped)} layers: "
                   f"trainable={n_trainable:,}/{n_total:,}", flush=True)
 
-    all_params = (
+    scratch_params = (
         [p for p in injector.parameters() if p.requires_grad]
         + [p for p in predictor.parameters() if p.requires_grad]
         + [p for p in bridge.parameters() if p.requires_grad]
-        + vlm_lora_params
     )
-    opt = torch.optim.AdamW(all_params, lr=args.lr)
+    all_params = scratch_params + vlm_lora_params
+    # Two AdamW param groups, not one: scratch_params (injector/predictor/
+    # bridge) are freshly-initialized and need --lr's full step size to learn
+    # from scratch, while vlm_lora_params adapts an already-pretrained model
+    # and defaults to the SAME --lr only if --vlm_lr is left unset (preserves
+    # job-155/job-160's exact old behavior when --vlm_lr isn't passed).
+    vlm_lr = args.vlm_lr if args.vlm_lr is not None else args.lr
+    opt_param_groups = [{"params": scratch_params, "lr": args.lr}]
+    if vlm_lora_params:
+        # An AdamW param_group with an empty "params" list raises ValueError
+        # -- only add this group when --lora_vlm actually produced params.
+        opt_param_groups.append({"params": vlm_lora_params, "lr": vlm_lr})
+    opt = torch.optim.AdamW(opt_param_groups)
     n_fwd_params = sum(p.numel() for p in injector.parameters() if p.requires_grad)
     n_rev_params = sum(p.numel() for p in predictor.parameters() if p.requires_grad)
     n_bridge_params = sum(p.numel() for p in bridge.parameters() if p.requires_grad)
@@ -492,6 +525,9 @@ def main():
               f"cycle_loss_weight={args.cycle_loss_weight} disable_norm={args.disable_norm} "
               f"loss_norm_decay={args.loss_norm_decay} "
               f"world_size={world_size}", flush=True)
+        print(f"[INFO] optimizer: lr={args.lr} vlm_lr={vlm_lr} "
+              f"({'own param group' if vlm_lora_params else 'no vlm_lora_params, group omitted'}) "
+              f"grad_clip_norm={args.grad_clip_norm} lr_schedule={args.lr_schedule}", flush=True)
 
     normalizer = LossNormalizer(decay=args.loss_norm_decay, disabled=args.disable_norm)
 
@@ -679,11 +715,15 @@ def main():
             total_loss.backward()
             if is_ddp():
                 sync_gradients(all_params, world_size)
+            if args.grad_clip_norm > 0:
+                log_entry["grad_norm"] = torch.nn.utils.clip_grad_norm_(all_params, args.grad_clip_norm).item()
             opt.step()
             if scheduler is not None:
                 scheduler.step()
             step += 1
             log_entry["lr"] = opt.param_groups[0]["lr"]
+            if len(opt.param_groups) > 1:
+                log_entry["vlm_lr"] = opt.param_groups[1]["lr"]
 
             if is_main:
                 log_f.write(json.dumps(log_entry) + "\n")
