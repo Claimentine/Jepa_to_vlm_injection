@@ -1,0 +1,100 @@
+# Step 156: no-GPU debug pod -- counts items in every qa_split_*.json we
+# have, and checks whether YouCook2/COIN/Ego4D/CrossTask's raw CSVs carry
+# enough same-video multi-segment structure to rebuild a "hard" (same-video,
+# different-moment) distractor scheme like qa_split_temporal.json's, instead
+# of the "easy" (any-other-row) scheme extract_crosstask_qa.py/
+# extract_ego4d_qa.py/build_youcook2_qa_split.py currently use.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-debug-dataset-sizes
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      containers:
+        - name: debug-dump
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -uo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              "$PY" - <<'PYEOF'
+              import json, csv, os
+
+              print("==== qa_split_*.json sizes ====", flush=True)
+              for name, path in [
+                  ("qa_split_temporal (in-domain, hard)", "/data/raw_data/qa_split_temporal.json"),
+                  ("qa_split_full", "/data/raw_data/qa_split_full.json"),
+                  ("qa_split_youcook2", "/data/raw_data/qa_split_youcook2.json"),
+                  ("qa_split_crosstask", "/data/raw_data/qa_split_crosstask.json"),
+                  ("qa_split_ego4d", "/data/raw_data/qa_split_ego4d.json"),
+                  ("qa_split_tempcompass", "/data/raw_data/qa_split_tempcompass.json"),
+                  ("qa_split_mvbench", "/data/raw_data/qa_split_mvbench.json"),
+              ]:
+                  try:
+                      d = json.load(open(path))
+                      counts = {k: len(v) for k, v in d.items()}
+                      print(f"{name}: {counts} total={sum(counts.values())}", flush=True)
+                  except Exception as e:
+                      print(f"{name}: ERROR {type(e).__name__}: {e}", flush=True)
+
+              print("==== raw CSV sources: rows + distinct source videos ====", flush=True)
+              for name, path in [
+                  ("VANS-DATA_full (temporal src)", "/data/hf_data/VANS-DATA_full.csv"),
+                  ("VANS-DATA_COIN", "/data/hf_data/VANS-DATA_COIN.csv"),
+                  ("VANS-DATA_YouCook", "/data/hf_data/VANS-DATA_YouCook.csv"),
+              ]:
+                  try:
+                      with open(path, encoding="utf-8-sig", errors="replace") as f:
+                          rows = list(csv.DictReader(f))
+                      video_ids = set()
+                      for r in rows:
+                          inp = (r.get("input_video_path") or "").strip()
+                          if inp:
+                              video_ids.add(inp.lstrip("/").split("/")[0])
+                      print(f"{name}: {len(rows)} rows, {len(video_ids)} distinct source videos "
+                            f"(avg {len(rows)/max(len(video_ids),1):.1f} rows/video)", flush=True)
+                  except Exception as e:
+                      print(f"{name}: ERROR {type(e).__name__}: {e}", flush=True)
+
+              print("==== Ego4D / CrossTask raw sources (dir listing) ====", flush=True)
+              for name, path in [
+                  ("ego4d qa raw dir", "/data/raw_data/ego4d_qa_source"),
+                  ("crosstask qa raw dir", "/data/raw_data/crosstask_qa_source"),
+              ]:
+                  try:
+                      entries = os.listdir(path)
+                      print(f"{name}: {len(entries)} entries, e.g. {entries[:3]}", flush=True)
+                  except Exception as e:
+                      print(f"{name}: ERROR {type(e).__name__}: {e}", flush=True)
+              PYEOF
+              echo "SCRIPT_DONE"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1.2", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          volumeMounts:
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      volumes:
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-baselines2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-156-debug-dataset-sizes.yaml -n williamli-scvl
