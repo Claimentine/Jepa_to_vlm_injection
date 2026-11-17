@@ -1,0 +1,151 @@
+# Step 163: medium-scale (1250 steps) validation of the three stability
+# fixes added after job-160's fwd_val_acc oscillated near-chance with no
+# convergence trend across 3000+ steps (job-162's own 20-step smoke test
+# confirmed the mechanism works, and incidentally caught a real pre-clip
+# grad_norm spike of 1019.8 at step 2 -- exactly the kind of event clipping
+# is meant to contain -- but 20 steps can't show whether fwd_val_acc
+# actually trends upward instead of just not crashing).
+#
+# Runs ALONGSIDE job-160 (not a replacement yet) -- user's explicit choice:
+# prove convergence on a medium budget before killing a run that's already
+# ~50%+ through its full 6688-step budget. Separate --out_dir, separate PVC
+# (ruixin-conda-vol-vlm, free again since job-162 finished).
+#
+# --vlm_lr 3e-5 (vs --lr 1e-4 for injector/predictor/bridge, same ratio
+# job-162 smoke-tested) -- --lr_schedule warmup_cosine --warmup_steps 125
+# (10% of 1250, same proportion as job-162's 5/20) --grad_clip_norm 1.0
+# (the default, passed explicitly for clarity).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-joint-stability-fix-medium-validation
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "40000"
+      containers:
+        - name: joint-stability-fix-medium-validation
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/joint_stability_fix_medium_runs
+              "$PY" vans_qa/full_scale/train_joint_coupled_normalized.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --cache_dir /data/vans_work/vlm_guidance_cache_paired \
+                --rev_qa_split /data/raw_data/qa_split_full.json \
+                --bridge_hidden_dim 2048 \
+                --lora_vlm --lora_vlm_r 8 --lora_vlm_alpha 16 \
+                --lora_predictor --lora_predictor_r 8 --lora_predictor_alpha 16 \
+                --live_vlm \
+                --lr 1e-4 --vlm_lr 3e-5 \
+                --lr_schedule warmup_cosine --warmup_steps 125 \
+                --grad_clip_norm 1.0 \
+                --epochs 1 \
+                --max_steps 1250 \
+                --val_every_steps 125 \
+                --save_every_steps 250 \
+                --max_val_items 100 \
+                --max_test_items 100 \
+                --out_dir /data/raw_data/joint_stability_fix_medium_runs 2>&1 \
+                | tee /data/raw_data/joint_stability_fix_medium_runs/full_run.log
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "28Gi"
+              ephemeral-storage: "4Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "32Gi"
+              ephemeral-storage: "6Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-163-joint-stability-fix-medium-validation.yaml -n williamli-scvl
