@@ -1,0 +1,148 @@
+# Step 165: full-scale run of the stability-fixed recipe (grad_clip_norm +
+# vlm_lr + warmup_cosine, validated at medium scale by job-163) on the
+# EXPANDED datasets instead of job-155/160/163's smaller ones:
+#   - forward: qa_split_merged_v2_hard.json (10137 train), NOT the old
+#     qa_split_merged_v1.json -- that file mixes qa_split_temporal.json's
+#     hard (same-video-different-moment) COIN/VANS rows with
+#     qa_split_youcook2.json's EASY (any-other-video) rows, which would
+#     dilute exactly the hard-distractor training signal this session's
+#     work has been building toward. qa_split_merged_v2_hard.json instead
+#     merges qa_split_temporal.json with job-158's NEW hard-scheme
+#     qa_split_youcook2_temporal.json, keeping every train row hard-only
+#     (built this session via merge_qa_splits.py, confirmed: train=10137
+#     val=2868 test=4088, zero cross-file pid collisions).
+#   - reverse: qa_split_full_merged_ego4d.json (16834 train, EgoDex +
+#     Ego4D narration/goalstep reverse-guided pairs, job-122) instead of
+#     plain qa_split_full.json (8422 train, EgoDex only) -- and its
+#     matching --cache_dir (vlm_guidance_cache_paired_merged_ego4d,
+#     20189 npz files, confirmed intact on the data PVC). No easy/hard
+#     concept applies to the reverse side (MSE regression, not a
+#     classification task) so this is a clean addition, no dilution risk.
+#
+# forward+reverse train totals ~27k (10137+16834), matching the scale of
+# the OLDER job-123/round6 data-expansion work -- this is that same
+# expansion, applied to the NEW LoRA+live-VLM+joint recipe for the first
+# time, with the forward side rebuilt hard-only instead of reusing the
+# easy-contaminated v1 merge.
+#
+# n_steps_per_epoch = min(fwd_train, rev_train) = min(10137, 16834) = 10137
+# (train_joint_coupled_normalized.py's own formula) -- --max_steps 10137
+# --epochs 1 for a full natural epoch on the new data (not 6688, job-160's
+# own value for the smaller 6690-train forward set). --warmup_steps 1000
+# (~10%, same proportion as job-163's 125/1250).
+#
+# Runs on nvidia.com/a100 (not the generic nvidia.com/gpu) -- confirmed
+# working end-to-end by job-163 (scheduled onto gp-engine.beocat.ksu.edu,
+# a real A100-SXM4-80GB). User's explicit request to put new work on A100.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-joint-fullscale-stabfix-expanded-data
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      containers:
+        - name: joint-fullscale-stabfix-expanded-data
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/joint_fullscale_stabfix_expanded_runs
+              "$PY" vans_qa/full_scale/train_joint_coupled_normalized.py \
+                --qa_split /data/raw_data/qa_split_merged_v2_hard.json \
+                --cache_dir /data/vans_work/vlm_guidance_cache_paired_merged_ego4d \
+                --rev_qa_split /data/raw_data/qa_split_full_merged_ego4d.json \
+                --bridge_hidden_dim 2048 \
+                --lora_vlm --lora_vlm_r 8 --lora_vlm_alpha 16 \
+                --lora_predictor --lora_predictor_r 8 --lora_predictor_alpha 16 \
+                --live_vlm \
+                --lr 1e-4 --vlm_lr 3e-5 \
+                --lr_schedule warmup_cosine --warmup_steps 1000 \
+                --grad_clip_norm 1.0 \
+                --epochs 1 \
+                --max_steps 10137 \
+                --val_every_steps 250 \
+                --save_every_steps 250 \
+                --max_val_items 100 \
+                --max_test_items 100 \
+                --out_dir /data/raw_data/joint_fullscale_stabfix_expanded_runs 2>&1 \
+                | tee /data/raw_data/joint_fullscale_stabfix_expanded_runs/full_run.log
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "28Gi"
+              ephemeral-storage: "4Gi"
+              nvidia.com/a100: "1"
+            limits:
+              cpu: "4.8"
+              memory: "32Gi"
+              ephemeral-storage: "6Gi"
+              nvidia.com/a100: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-165-joint-fullscale-stabfix-expanded-data.yaml -n williamli-scvl

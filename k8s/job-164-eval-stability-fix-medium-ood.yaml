@@ -1,0 +1,193 @@
+# Step 164: OOD forward-QA eval of job-163's checkpoint (the medium-scale,
+# 1250-step run of the stability-fixed recipe: grad_clip_norm + vlm_lr +
+# warmup_cosine). job-161 already showed that round1's (job-155, the
+# UNFIXED recipe) more-trained checkpoint (step_3000) scored BELOW CHANCE
+# on all 4 OOD benchmarks (TempCompass 0.299, MVBench 0.335, CrossTask
+# 0.315, Ego4D 0.409), worse than its own earlier best_forward checkpoint
+# (~0.49 on all three) -- consistent with job-160's own in-domain val
+# oscillation (more unfixed-recipe training made things worse, not
+# better). job-163's in-domain val curve was visibly healthier (tighter,
+# mostly at/above chance, no easy-crash) -- this job checks whether that
+# in-domain improvement actually carries over OOD too.
+#
+# Same --lora_vlm r=8 alpha=16 as every other eval of this family (must
+# match training's own LoRA shape for vlm_lora_state to load correctly).
+# Same OMP_NUM_THREADS=1/MKL_NUM_THREADS=1 + 32Gi memory + full-log-tee
+# fixes as job-161 (job-159's thread-leak/log-rotation lessons).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-eval-stability-fix-medium-ood
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "16000"
+      containers:
+        - name: eval-stability-fix-medium-ood
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              RUN=/data/raw_data/joint_stability_fix_medium_runs
+              CKPT_FINAL="stabfix_step1250=${RUN}/step_1250.pt"
+              CKPT_BESTFWD="stabfix_best_forward=${RUN}/best_forward.pt"
+              LOG=/data/raw_data/stabfix_medium_eval_full_run.log
+
+              cd "$REPO"
+
+              {
+              echo "=== TempCompass OOD ==="
+              export VANS_WORK_ROOT=/data/vans_work_tempcompass
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --checkpoint "$CKPT_FINAL" --checkpoint "$CKPT_BESTFWD" \
+                --lora_vlm --lora_vlm_r 8 --lora_vlm_alpha 16 \
+                --qa_split /data/raw_data/qa_split_tempcompass.json \
+                --split_part test \
+                --resume \
+                --out_path /data/raw_data/stabfix_medium_eval_tempcompass.json
+
+              echo "=== MVBench OOD ==="
+              export VANS_WORK_ROOT=/data/vans_work_mvbench
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --checkpoint "$CKPT_FINAL" --checkpoint "$CKPT_BESTFWD" \
+                --lora_vlm --lora_vlm_r 8 --lora_vlm_alpha 16 \
+                --qa_split /data/raw_data/qa_split_mvbench.json \
+                --split_part test \
+                --resume \
+                --out_path /data/raw_data/stabfix_medium_eval_mvbench.json
+
+              echo "=== CrossTask OOD (live decode) ==="
+              export VANS_WORK_ROOT=/data/vans_work_crosstask
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --checkpoint "$CKPT_FINAL" --checkpoint "$CKPT_BESTFWD" \
+                --lora_vlm --lora_vlm_r 8 --lora_vlm_alpha 16 \
+                --qa_split /data/raw_data/qa_split_crosstask.json \
+                --split_part test \
+                --resume \
+                --out_path /data/raw_data/stabfix_medium_eval_crosstask.json
+
+              echo "=== Ego4D GoalStep OOD (live decode) ==="
+              export VANS_WORK_ROOT=/data/vans_work_ego4d_qa
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --checkpoint "$CKPT_FINAL" --checkpoint "$CKPT_BESTFWD" \
+                --lora_vlm --lora_vlm_r 8 --lora_vlm_alpha 16 \
+                --qa_split /data/raw_data/qa_split_ego4d.json \
+                --split_part test \
+                --resume \
+                --out_path /data/raw_data/stabfix_medium_eval_ego4d.json
+
+              echo "=== YouCook2 easy-scheme OOD (live decode) ==="
+              export VANS_WORK_ROOT=/data/vans_work_youcook
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --checkpoint "$CKPT_FINAL" --checkpoint "$CKPT_BESTFWD" \
+                --lora_vlm --lora_vlm_r 8 --lora_vlm_alpha 16 \
+                --qa_split /data/raw_data/qa_split_youcook2.json \
+                --split_part test \
+                --resume \
+                --out_path /data/raw_data/stabfix_medium_eval_youcook2.json
+
+              echo "=== YouCook2 hard-scheme OOD (live decode) ==="
+              export VANS_WORK_ROOT=/data/vans_work_youcook
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --checkpoint "$CKPT_FINAL" --checkpoint "$CKPT_BESTFWD" \
+                --lora_vlm --lora_vlm_r 8 --lora_vlm_alpha 16 \
+                --qa_split /data/raw_data/qa_split_youcook2_temporal.json \
+                --split_part test \
+                --resume \
+                --out_path /data/raw_data/stabfix_medium_eval_youcook2_temporal.json
+              echo "SCRIPT_DONE"
+              } 2>&1 | tee "$LOG"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: MKL_NUM_THREADS
+              value: "1"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "28Gi"
+              ephemeral-storage: "2Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "32Gi"
+              ephemeral-storage: "2400Mi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-164-eval-stability-fix-medium-ood.yaml -n williamli-scvl
