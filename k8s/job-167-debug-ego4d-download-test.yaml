@@ -1,0 +1,86 @@
+# Step 167: minimal test of whether the ego4d-aws-credentials Secret (set
+# up 2026-09-29 for job-109's one-time extraction) still grants real S3
+# access -- the user wants ALL reverse training data live-decoded (not the
+# frozen-cache fallback job-f229283 added for items whose raw video isn't
+# on disk), which means re-downloading Ego4D's full-length videos. Before
+# committing to that (a large undertaking: a 300-file sample of the
+# narration cache alone showed 285/300 distinct video_uids, extrapolating
+# to roughly 6500+ unique full-length videos just for narration, before
+# even counting goalstep's own set), first confirm the SAME credentials
+# extract_ego4d_longaxis.py's write_aws_credentials()/download_video()
+# already use can still pull ONE video, so we know whether this is a
+# bandwidth/storage/time cost or an actual access-renewal problem.
+#
+# No GPU needed -- this is a pure network/credentials check, not a decode
+# or model job.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-debug-ego4d-download-test
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      containers:
+        - name: debug-ego4d-download-test
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -uo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              mkdir -p /tmp/ego4d_test
+              echo "=== credentials present? ==="
+              [ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo "AWS_ACCESS_KEY_ID set (len=${#AWS_ACCESS_KEY_ID})" || echo "MISSING"
+              echo "=== attempting one video download ==="
+              "$PY" -m ego4d.cli.cli \
+                -o /tmp/ego4d_test \
+                --datasets full_scale \
+                --video_uids 03e90bbc-7d6b-423c-84d9-b5be3eff11c5 \
+                --no-metadata -y
+              echo "=== exit code: $? ==="
+              ls -la /tmp/ego4d_test/v2/full_scale/ 2>&1
+              echo "SCRIPT_DONE"
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_DEFAULT_REGION
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+              ephemeral-storage: "8Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+              ephemeral-storage: "10Gi"
+          volumeMounts:
+            - name: conda-storage
+              mountPath: /home/jovyan
+      volumes:
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-baselines
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-167-debug-ego4d-download-test.yaml -n williamli-scvl
