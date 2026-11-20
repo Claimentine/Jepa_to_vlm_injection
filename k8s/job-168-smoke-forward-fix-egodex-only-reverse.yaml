@@ -26,6 +26,12 @@
 # queue (48 Insufficient nvidia.com/gpu) when this was first submitted,
 # while A100 quota sat completely unused (0/2). Same resource name job-163/
 # job-165 already confirmed works.
+#
+# node-2-3.sdsc.optiputer.net excluded: 3 different PVCs in a row hit the
+# identical "MountVolume.MountDevice ... an operation with the given
+# Volume ID ... already exists" failure when scheduled there -- a broken
+# rook-ceph CSI driver on that one node, not a PVC problem (same pattern
+# as job-158's earlier GPU-lost node, same fix: exclude by hostname).
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -34,6 +40,15 @@ spec:
   backoffLimit: 2
   template:
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - node-2-3.sdsc.optiputer.net
       containers:
         - name: smoke-forward-fix-egodex-only-reverse
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
