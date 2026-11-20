@@ -1,0 +1,53 @@
+# Step 170: quick check of whether EgoExo4D's raw videos/feature cache
+# (job-128/131 download, job-129/132 causal-cache build, back in October)
+# are still intact on the data PVC -- answers whether the switch to
+# --live_vlm in TRAINING has any bearing on EgoExo4D, which this project
+# only uses for EVAL (probe_egodex_reverse_adapter.py's frozen-predictor
+# ADE/FDE probe, never live-decodes anything itself). No GPU needed.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-debug-egoexo4d-file-check
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      containers:
+        - name: debug-egoexo4d-file-check
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -uo pipefail
+              echo "=== raw videos (egoexo4d_discovery) ==="
+              find /data/raw_data/egoexo4d_discovery -iname '*.mp4' 2>/dev/null | wc -l
+              echo "=== causal cache npz (egoexo4d_probe_bundle_full) ==="
+              find /data/raw_data/egoexo4d_probe_bundle_full/cache -iname '*.npz' 2>/dev/null | wc -l
+              echo "=== supervision hdf5 ==="
+              find /data/raw_data/egoexo4d_probe_bundle_full -iname '*.hdf5' 2>/dev/null | wc -l
+              echo "SCRIPT_DONE"
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "2Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "2400Mi"
+          volumeMounts:
+            - name: data-storage
+              mountPath: /data
+      volumes:
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-170-debug-egoexo4d-file-check.yaml -n williamli-scvl
