@@ -32,6 +32,12 @@
 # Volume ID ... already exists" failure when scheduled there -- a broken
 # rook-ceph CSI driver on that one node, not a PVC problem (same pattern
 # as job-158's earlier GPU-lost node, same fix: exclude by hostname).
+#
+# sphinx.sdstate.edu also excluded (2026-11-19): the first resubmit onto
+# this node sat at Init:0/1 / PodInitializing for 4h14m with zero init-
+# container log output and zero events (both PVCs confirmed Bound, no
+# conflicting RWO claimant) -- i.e. the node itself never finished
+# attaching volumes, same failure class as node-2-3, different node.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -49,6 +55,7 @@ spec:
                     operator: NotIn
                     values:
                       - node-2-3.sdsc.optiputer.net
+                      - sphinx.sdstate.edu
       containers:
         - name: smoke-forward-fix-egodex-only-reverse
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
