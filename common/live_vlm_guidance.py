@@ -92,6 +92,77 @@ def decode_clip_with_timeout(video_path, num_frames):
     return payload
 
 
+def _decode_timestamps_worker(conn, video_path_str, target_times_seconds):
+    try:
+        from decord import VideoReader, cpu
+
+        reader = VideoReader(video_path_str, ctx=cpu(0), num_threads=1)
+        total = int(len(reader))
+        if total < 1:
+            raise ValueError(f"no frames in {video_path_str}")
+        fps = float(reader.get_avg_fps())
+        fps_safe = fps if fps > 0 else 30.0
+        # Same seconds->index convention extract_ego4d_longaxis.py's own
+        # _extract_window_worker uses (int(t * fps)) -- these timestamps
+        # are the ACTUAL achieved frame centers from that original
+        # extraction (not the naively-requested window bounds), so
+        # re-deriving indices this way lands on the same frames (or the
+        # nearest decord has, if the source file changed) rather than
+        # resampling a fresh window and silently drifting from what the
+        # cached vlm_old/vlm_new were originally computed from.
+        indices = np.clip(
+            np.round(np.asarray(target_times_seconds, dtype=np.float64) * fps_safe).astype(np.int64),
+            0, total - 1,
+        )
+        frames = np.asarray(reader.get_batch(indices).asnumpy())
+        frames = np.ascontiguousarray(frames[..., :3].astype(np.uint8, copy=False))
+        try:
+            timestamps = np.asarray(reader.get_frame_timestamp(indices), dtype=np.float64)
+            centers = (timestamps[:, 0] + timestamps[:, 1]) * 0.5
+        except Exception:
+            centers = indices.astype(np.float64) / fps_safe
+        conn.send(("ok", (frames, centers, fps)))
+    except Exception as e:
+        conn.send(("err", e))
+    finally:
+        conn.close()
+
+
+def decode_frames_at_timestamps(video_path, target_times_seconds):
+    """Like decode_clip_with_timeout, but for a long, FULL-LENGTH source
+    video (Ego4D's raw egocentric recordings, not a pre-cut small clip):
+    decodes the frame nearest each of target_times_seconds instead of
+    uniformly resampling num_frames across the whole file -- the whole
+    video is often many minutes long, so uniform resampling across all of
+    it would land nowhere near the actual segment a reverse-guided pair's
+    past_frame_times_seconds/target_frame_times_seconds refers to. Returns
+    the same (frames, frame_center_times, source_fps) shape as
+    decode_clip_with_timeout, so load_pair_live's two branches can share
+    the rest of the pipeline unchanged. Same spawned-subprocess rationale
+    as decode_clip_with_timeout (CUDA already initialized in the parent)."""
+    parent_conn, child_conn = _MP_CTX.Pipe(duplex=False)
+    proc = _MP_CTX.Process(
+        target=_decode_timestamps_worker,
+        args=(child_conn, str(video_path), list(target_times_seconds)),
+    )
+    proc.start()
+    child_conn.close()
+    if parent_conn.poll(DECODE_TIMEOUT_S):
+        status, payload = parent_conn.recv()
+    else:
+        status, payload = "timeout", None
+    parent_conn.close()
+    proc.join(5)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join()
+    if status == "timeout":
+        raise TimeoutError(f"video decode exceeded {DECODE_TIMEOUT_S}s on {video_path}")
+    if status == "err":
+        raise payload
+    return payload
+
+
 def infer_qwen_teacher_forced_live(args, model, processor, saved, device, past_frames, past_times, in_fps,
                                     question, correct_caption):
     """Same as extract_vlm_guidance_paired.py's infer_qwen_teacher_forced,

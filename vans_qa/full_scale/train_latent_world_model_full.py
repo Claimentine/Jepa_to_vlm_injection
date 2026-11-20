@@ -142,6 +142,9 @@ def load_pair(cache_dir, pid, device):
     return in_feats, out_feats, extras
 
 
+EGO4D_REVERSE_GUIDED_ROOT = os.environ.get("EGO4D_REVERSE_GUIDED_ROOT", "/data/vans_work_ego4d_reverse_guided")
+
+
 def load_pair_live(cache_dir, pid, device, qwen_model, qwen_processor, qwen_saved, qwen_args):
     """--live_vlm variant of load_pair: vjepa_input_feats/vjepa_target_feats
     still come from the cache (V-JEPA2's encoder is frozen and deterministic
@@ -149,23 +152,82 @@ def load_pair_live(cache_dir, pid, device, qwen_model, qwen_processor, qwen_save
     user's own "only JEPA's encoder stays frozen" scope does not touch this
     side). vlm_old/vlm_new, instead of being read from the cache's own frozen
     arrays, are recomputed LIVE by re-running Qwen3-VL's teacher-forced
-    inference on this pid's actual (in_clip, question, correct_caption) --
-    all three already stored in the SAME npz by extract_vlm_guidance_paired.py
-    (see its own payload dict), so no separate raw-data lookup is needed.
+    inference on this pid's actual (in_clip, question, correct_caption).
     Returns the same (in_feats, out_feats, extras) shape as load_pair, so
     forward_step needs no changes -- only vlm_old/vlm_new now carry gradients
-    back into qwen_model's LoRA parameters."""
+    back into qwen_model's LoRA parameters.
+
+    Two source schemas share this cache_dir (qa_split_full_merged_ego4d.json
+    merges both in) and need different decode paths:
+      - EgoDex (extract_vlm_guidance_paired.py's own npz): has in_clip_relpath,
+        a pre-cut small clip (always kept on disk) -- decode_clip_with_timeout
+        uniformly resamples NUM_PAST_FRAMES frames across the whole file.
+      - Ego4D narration/goalstep (extract_ego4d_reverse_guided.py's npz, pid
+        prefix "ego4d_shortaxis_"): no in_clip_relpath at all -- it references
+        a FULL-LENGTH raw egocentric video by video_uid, with the exact
+        frame timestamps it used (past_frame_times_seconds) stored instead
+        (confirmed by reading the npz's own keys: schema_name
+        'ego4d_reverse_guided_v1', fields video_uid/annotation_source/
+        past_frame_times_seconds, no in_clip_relpath) -- a straight
+        d['in_clip_relpath'] lookup KeyErrors on every one of these (first
+        caught in job-165's own run: 3411 reverse items silently skipped).
+
+    For the Ego4D branch, the raw video is checked on disk before decoding
+    live: extract_ego4d_reverse_guided.py downloads each raw video only
+    long enough to extract its frozen vlm_old/vlm_new once, then the
+    multi-GB file is not kept around -- confirmed directly: raw_videos_
+    goalstep/v2/full_scale has ZERO .mp4 files, raw_videos_narration has
+    only 126 (vs. several hundred-plus unique video_uids actually needed),
+    so a bare "assume it's there" re-decode would just trade one silent-skip
+    bug for another. When present, decode_frames_at_timestamps re-decodes
+    the SAME frames (re-deriving seconds->index the same way extract_ego4d_
+    longaxis.py's own _extract_window_worker did) and the item still gets a
+    live, gradient-carrying vlm_old/vlm_new like every EgoDex item. When
+    absent, this falls back to the npz's own frozen vlm_old/vlm_new (no
+    re-download attempted -- that's a separate, costly follow-up, not a
+    per-item fallback's job) -- the item still trains the predictor/bridge
+    normally on real data instead of being skipped outright; it just
+    contributes no VLM-LoRA gradient via the reverse path for that pid,
+    same as this project's pre---live_vlm behavior."""
     from cache_train.rebuild_causal_cache import NUM_PAST_FRAMES
-    from common.live_vlm_guidance import decode_clip_with_timeout, infer_qwen_teacher_forced_live
+    from common.live_vlm_guidance import (
+        decode_clip_with_timeout, decode_frames_at_timestamps, infer_qwen_teacher_forced_live,
+    )
 
     d = np.load(os.path.join(cache_dir, f"{pid}.npz"))
     in_feats = torch.from_numpy(d["vjepa_input_feats"].astype(np.float32)).unsqueeze(0).to(device)
     out_feats = torch.from_numpy(d["vjepa_target_feats"].astype(np.float32)).unsqueeze(0).to(device)
 
-    in_clip_relpath = str(d["in_clip_relpath"])
     question = str(d["question"])
     correct_caption = str(d["correct_caption"])
-    past_frames, past_times, in_fps = decode_clip_with_timeout(in_clip_relpath, NUM_PAST_FRAMES)
+    video_path = None
+    if "in_clip_relpath" in d.files:
+        in_clip_relpath = str(d["in_clip_relpath"])
+        video_path = in_clip_relpath if os.path.exists(in_clip_relpath) else None
+    else:
+        video_uid = str(d["video_uid"])
+        annotation_source = str(d["annotation_source"])
+        candidate = os.path.join(EGO4D_REVERSE_GUIDED_ROOT, f"raw_videos_{annotation_source}",
+                                  "v2", "full_scale", f"{video_uid}.mp4")
+        video_path = candidate if os.path.exists(candidate) else None
+
+    if video_path is None:
+        # Raw source video not on disk (expected for most Ego4D items, see
+        # docstring) -- fall back to this pid's own frozen vlm_old/vlm_new,
+        # same arrays load_pair (the non-live path) returns.
+        extras = {
+            "vlm_old": torch.from_numpy(d["vlm_old"].astype(np.float32)).to(device),
+            "vlm_new": torch.from_numpy(d["vlm_new"].astype(np.float32)).to(device),
+        }
+        return in_feats, out_feats, extras
+
+    if "in_clip_relpath" in d.files:
+        past_frames, past_times, in_fps = decode_clip_with_timeout(video_path, NUM_PAST_FRAMES)
+    else:
+        past_times_target = d["past_frame_times_seconds"].astype(np.float64)
+        past_frames, past_times, source_fps = decode_frames_at_timestamps(video_path, past_times_target)
+        span = max(1e-6, float(past_times[-1] - past_times[0]))
+        in_fps = max(1.0, (len(past_times) - 1) / span)  # same fallback extract_ego4d_reverse_guided.py itself uses
     vlm_old, vlm_new = infer_qwen_teacher_forced_live(
         qwen_args, qwen_model, qwen_processor, qwen_saved, device,
         past_frames, past_times, in_fps, question, correct_caption,
