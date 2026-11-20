@@ -38,6 +38,14 @@
 # container log output and zero events (both PVCs confirmed Bound, no
 # conflicting RWO claimant) -- i.e. the node itself never finished
 # attaching volumes, same failure class as node-2-3, different node.
+#
+# conda-storage switched ddp2 -> vlm -> precompute -> vlm again (2026-11-20):
+# after deleting the pod stuck on sphinx, the resubmit landed on a THIRD
+# node (oru.gp-argo.greatplains.net) and ruixin-conda-vol-precompute itself
+# hung Init:0/1 for 13h with zero events -- the RWO volume's attach/detach
+# likely got stuck against the broken sphinx node it was last scheduled on,
+# not a problem with the new node. vlm is the PVC job-163/164 already ran
+# to completion on, confirmed free (Used By: <none>) before this switch.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -150,7 +158,7 @@ spec:
           emptyDir: {}
         - name: conda-storage
           persistentVolumeClaim:
-            claimName: ruixin-conda-vol-precompute
+            claimName: ruixin-conda-vol-vlm
         - name: data-storage
           persistentVolumeClaim:
             claimName: jepa-vlm-injection-data-vol
