@@ -153,6 +153,32 @@ def build_dataloaders(args):
 def load_frozen_predictor(label, device):
     path = CHECKPOINTS[label] if "=" not in label else label.split("=", 1)[1]
     ckpt = torch.load(path, map_location=device, weights_only=False)
+    if "vlm_lora_state" in ckpt:
+        # FLAG (2026-11-20, not yet acted on -- user explicitly said not to
+        # run a fix yet, just mark it here): this checkpoint was trained
+        # with --lora_vlm --live_vlm (train_joint_coupled_normalized.py),
+        # meaning the predictor learned to interpret vlm_old/vlm_new
+        # produced by a LoRA-ADAPTED Qwen3-VL, not the original frozen one.
+        # EGODEX_BUNDLE's own cache (and EgoExo4D's
+        # egoexo4d_probe_bundle_full/cache, job-129/132) was built by
+        # ThinkJEPA's cache_train/rebuild_causal_cache.py against the
+        # FROZEN, un-adapted model -- every prior checkpoint probed here
+        # (job15/42/49/60/72, all dense- or predictor-LoRA-only trained,
+        # never --lora_vlm) was trained against that exact same frozen
+        # distribution, so this mismatch never existed before now. Probing
+        # a --lora_vlm checkpoint against this bundle as-is conflates two
+        # different things: "is this predictor's latent space good" vs.
+        # "does it tolerate a guidance distribution shift it never trained
+        # on." A fair comparison needs the bundle's own vlm_old/vlm_new
+        # rebuilt with THIS checkpoint's own vlm_lora_state applied first
+        # -- see vans_qa/full_scale/rebuild_vlm_guidance_with_lora.py
+        # (written, not yet run).
+        print(f"[WARN] {path}: has vlm_lora_state (trained with --lora_vlm) -- "
+              "this bundle's own vlm_old/vlm_new were cached against the FROZEN "
+              "VLM, not this checkpoint's LoRA-adapted one. Results here reflect "
+              "that distribution shift too, not just the predictor's own latent "
+              "quality -- see rebuild_vlm_guidance_with_lora.py before trusting "
+              "a regression/improvement as purely about the predictor.", flush=True)
     # Build with the SAME guidance mode the checkpoint was trained with --
     # "none"-guidance predictors (e.g. job_none_guidance) have no
     # guidance_old_adapter/guidance_memory_readers modules at all, so
