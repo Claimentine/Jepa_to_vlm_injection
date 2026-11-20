@@ -1,0 +1,156 @@
+# Step 166: smoke test for the two fixes made after job-165's first
+# (buggy) attempt on the expanded ~27k-item dataset:
+#   1. forward: rebuilt qa_split_youcook2_temporal_v2.json with
+#      VANS_WORK_ROOT=/data/vans_work (the unified root job-121 already
+#      symlink-merged YouCook2's clips/vjepa_cache_full into), re-merged
+#      into qa_split_merged_v2_hard.json -- job-165 showed "forward
+#      usable: train=6688" (YouCook2's 3447/3460 hard items silently
+#      filtered out by has_features() looking in the wrong work root);
+#      this smoke test's own "[INFO] forward usable" line should now read
+#      ~10150, not 6688.
+#   2. reverse: load_pair_live now branches on npz schema (EgoDex vs Ego4D
+#      narration/goalstep) instead of hardcoding in_clip_relpath, and
+#      falls back to frozen vlm_old/vlm_new when the Ego4D item's raw
+#      video isn't on disk (confirmed: it almost never is) -- job-165
+#      showed 3411/16834 reverse items (>20%) skipped outright with
+#      "KeyError: in_clip_relpath is not a file in the archive"; this
+#      smoke test should show zero such skips.
+#
+# Small budget (30 steps) -- only needs to prove both fixes work
+# mechanically (right usable counts, no more in_clip_relpath KeyErrors);
+# not a real training result.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-smoke-expanded-data-fixes
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: NotIn
+                    values:
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - Quadro-M4000
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-TITAN-RTX
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values:
+                      - "40000"
+      containers:
+        - name: smoke-expanded-data-fixes
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/smoke_expanded_data_fixes_runs
+              "$PY" vans_qa/full_scale/train_joint_coupled_normalized.py \
+                --qa_split /data/raw_data/qa_split_merged_v2_hard.json \
+                --cache_dir /data/vans_work/vlm_guidance_cache_paired_merged_ego4d \
+                --rev_qa_split /data/raw_data/qa_split_full_merged_ego4d.json \
+                --bridge_hidden_dim 2048 \
+                --lora_vlm --lora_vlm_r 8 --lora_vlm_alpha 16 \
+                --lora_predictor --lora_predictor_r 8 --lora_predictor_alpha 16 \
+                --live_vlm \
+                --lr 1e-4 --vlm_lr 3e-5 \
+                --lr_schedule warmup_cosine --warmup_steps 5 \
+                --grad_clip_norm 1.0 \
+                --epochs 1 \
+                --max_steps 30 \
+                --max_train_items 40 \
+                --val_every_steps 15 \
+                --save_every_steps 30 \
+                --max_val_items 4 \
+                --max_test_items 4 \
+                --out_dir /data/raw_data/smoke_expanded_data_fixes_runs 2>&1 \
+                | tee /data/raw_data/smoke_expanded_data_fixes_runs/full_run.log
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "28Gi"
+              ephemeral-storage: "4Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "32Gi"
+              ephemeral-storage: "6Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-166-smoke-expanded-data-fixes.yaml -n williamli-scvl
