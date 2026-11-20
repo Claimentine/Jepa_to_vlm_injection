@@ -26,6 +26,11 @@
 # own header for why (generic nvidia.com/gpu is allocatable=0 on every A100
 # node this cluster has; the resource must be requested by its specific
 # name). User's explicit request to run new work on A100.
+#
+# Pinned to region us-west: our PVCs (rook-ceph-block / rook-cephfs) live
+# on the us-west Ceph cluster, and job-168 hung indefinitely at volume
+# setup on every us-central A100 node it landed on. node-2-3 excluded for
+# its own broken CSI driver.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -34,6 +39,19 @@ spec:
   backoffLimit: 2
   template:
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values:
+                      - us-west
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - node-2-3.sdsc.optiputer.net
       containers:
         - name: joint-fullscale-stabfix-forward-expanded
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp

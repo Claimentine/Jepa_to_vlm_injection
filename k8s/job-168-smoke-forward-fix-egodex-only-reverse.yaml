@@ -46,6 +46,15 @@
 # likely got stuck against the broken sphinx node it was last scheduled on,
 # not a problem with the new node. vlm is the PVC job-163/164 already ran
 # to completion on, confirmed free (Used By: <none>) before this switch.
+#
+# ACTUAL root cause (2026-11-20), superseding the per-node/per-PVC theories
+# above: sphinx, oru and sdsmt (3 of the 4 hung nodes) are all region
+# us-central. Our PVCs use the unsuffixed rook-ceph-block / rook-cephfs
+# classes = the us-west Ceph cluster (regional variants exist as -central,
+# -east, ...); mounting them on a us-central node hangs at volume setup.
+# job-163 had no region constraint and simply landed in us-west. Fix:
+# require topology.kubernetes.io/region=us-west. node-2-3 (us-west) stays
+# excluded -- its own CSI error was a different, node-specific failure.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -59,11 +68,14 @@ spec:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
               - matchExpressions:
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values:
+                      - us-west
                   - key: kubernetes.io/hostname
                     operator: NotIn
                     values:
                       - node-2-3.sdsc.optiputer.net
-                      - sphinx.sdstate.edu
       containers:
         - name: smoke-forward-fix-egodex-only-reverse
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
