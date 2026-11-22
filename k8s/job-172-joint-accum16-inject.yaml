@@ -19,6 +19,18 @@ spec:
   backoffLimit: 2
   template:
     spec:
+      # us-west only: the first submit landed on us-central hcc-prp-c5038.unl.edu,
+      # mounted fine, then sat in D-state reading 0 KB/s from our us-west Ceph
+      # volumes for 28+ min before printing a single line.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values:
+                      - us-west
       containers:
         - name: joint-accum16-inject
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
