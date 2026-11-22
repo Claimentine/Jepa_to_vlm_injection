@@ -10,8 +10,8 @@
 # (~10%, same proportion as 169b). Val on 500 items (not 100: n=100 has
 # +-0.07 sampling error per easy/hard half) every 50 steps.
 # job-172 and job-173 are IDENTICAL except --no_jepa_injection, on the same
-# GPU type (rtxa6000, 48GB -- job-168b confirmed it fits; us-west A100s were
-# all taken), same seed and data, so any fwd_val_acc gap is the injection.
+# GPU type (80GB A100, us-west), same seed and data, so any fwd_val_acc gap
+# is the injection.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -22,7 +22,10 @@ spec:
     spec:
       # us-west only: the first submit landed on us-central hcc-prp-c5038.unl.edu,
       # mounted fine, then sat in D-state reading 0 KB/s from our us-west Ceph
-      # volumes for 28+ min before printing a single line.
+      # volumes for 28+ min before printing a single line. Switched rtxa6000 ->
+      # A100 per user request (us-west A6000s were all taken for 86+ min);
+      # 80GB only (this job is only confirmed to fit 48GB, us-west also has
+      # 40GB PCIe A100s), node-2-3 excluded for its broken CSI driver.
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -32,6 +35,15 @@ spec:
                     operator: In
                     values:
                       - us-west
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A100-SXM4-80GB
+                      - NVIDIA-A100-80GB-PCIe
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - node-2-3.sdsc.optiputer.net
       containers:
         - name: joint-accum16-noinject
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
@@ -94,12 +106,12 @@ spec:
               cpu: "4"
               memory: "28Gi"
               ephemeral-storage: "4Gi"
-              nvidia.com/rtxa6000: "1"
+              nvidia.com/a100: "1"
             limits:
               cpu: "4.8"
               memory: "32Gi"
               ephemeral-storage: "6Gi"
-              nvidia.com/rtxa6000: "1"
+              nvidia.com/a100: "1"
           volumeMounts:
             - name: git-repo-code
               mountPath: /code
@@ -126,7 +138,7 @@ spec:
           emptyDir: {}
         - name: conda-storage
           persistentVolumeClaim:
-            claimName: ruixin-conda-vol-baselines2
+            claimName: ruixin-conda-vol-ddp
         - name: data-storage
           persistentVolumeClaim:
             claimName: jepa-vlm-injection-data-vol
