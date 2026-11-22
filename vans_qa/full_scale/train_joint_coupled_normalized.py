@@ -240,6 +240,16 @@ def main():
                           "occasional gradient spike from either side can whipsaw those weights with "
                           "nothing to bound it, compounding the oscillation --vlm_lr addresses from "
                           "the learning-rate side.")
+    ap.add_argument("--grad_accum_steps", type=int, default=1,
+                     help="accumulate gradients over this many (forward item, reverse item) pairs per "
+                          "optimizer step. `step`, --max_steps, --val_every_steps, --save_every_steps "
+                          "and --warmup_steps all count OPTIMIZER steps, so one epoch is "
+                          "n_steps_per_epoch // grad_accum_steps steps. 1 = the old per-item update.")
+    ap.add_argument("--no_jepa_injection", action="store_true",
+                     help="ablation control: unregister the decoder-layer injection hooks, so the "
+                          "VLM scores the forward QA with no JEPA condition, in training AND validation. "
+                          "Everything else (VLM LoRA, reverse direction, bridge + cycle loss) is "
+                          "unchanged, so the only difference from a normal run is the injection itself.")
     ap.add_argument("--cycle_loss_weight", type=float, default=0.1)
     ap.add_argument("--loss_norm_decay", type=float, default=0.98,
                      help="EMA decay for the per-loss magnitude normalizer -- higher means "
@@ -431,6 +441,13 @@ def main():
         seed=args.seed, mode=args.injection_mode,
     ).to(device)
     hook = DecoderLayerInjectionHook(model, injector)
+    if args.no_jepa_injection:
+        # hook.set() still stores a condition, but with no registered
+        # pre-hooks nothing ever reads it -- the injector gets no gradient
+        # from fwd_loss and evaluate_logprob scores the bare VLM.
+        hook.remove()
+        if is_main:
+            print("[INFO] --no_jepa_injection: injection hooks removed (ablation control)", flush=True)
 
     # ---------------- reverse direction setup ----------------
     membership = rev.load_qa_split_membership(args.rev_qa_split)
@@ -555,11 +572,15 @@ def main():
             f"too few paired train steps available per rank (forward={len(my_fwd_train)}, "
             f"reverse={len(my_rev_train)}, world_size={world_size})"
         )
+    opt_steps_per_epoch = n_steps_per_epoch // args.grad_accum_steps
+    if opt_steps_per_epoch < 1:
+        raise RuntimeError(f"--grad_accum_steps {args.grad_accum_steps} exceeds n_steps_per_epoch={n_steps_per_epoch}")
     if is_main:
         print(f"[INFO] n_steps_per_epoch={n_steps_per_epoch} per rank "
-              f"(total forward={len(fwd_train)} reverse={len(rev_train)})", flush=True)
+              f"(total forward={len(fwd_train)} reverse={len(rev_train)}); "
+              f"grad_accum_steps={args.grad_accum_steps} -> {opt_steps_per_epoch} optimizer steps/epoch", flush=True)
 
-    total_steps = args.epochs * n_steps_per_epoch
+    total_steps = args.epochs * opt_steps_per_epoch
     if args.lr_schedule == "warmup_cosine":
         warmup_steps = max(1, args.warmup_steps)
 
@@ -577,147 +598,161 @@ def main():
     else:
         scheduler = None
 
+    opt.zero_grad()
     for epoch in range(args.epochs):
         rng.shuffle(my_fwd_train)
         rng.shuffle(my_rev_train)
-        for i in range(n_steps_per_epoch):
-            fwd_item = my_fwd_train[i]
-            rev_pid = my_rev_train[i]
+        for opt_i in range(opt_steps_per_epoch):
+            n_ok = 0
+            micro_logs = []
+            for micro in range(args.grad_accum_steps):
+                i = opt_i * args.grad_accum_steps + micro
+                fwd_item = my_fwd_train[i]
+                rev_pid = my_rev_train[i]
 
-            opt.zero_grad()
-            total_loss = torch.zeros((), device=device)
-            log_entry = {"step": step + 1, "epoch": epoch}
+                total_loss = torch.zeros((), device=device)
+                log_entry = {}
 
-            fwd_ok = False
-            pooled_jepa = None
-            try:
-                cached = None
-                if args.precompute_cache_dir is not None:
-                    cached = fwd.load_precomputed_inputs(args.precompute_cache_dir, fwd_item.get("pid"))
-                if cached is not None:
-                    inputs, correct_letter = cached
-                else:
-                    option_lines, correct_letter = fwd.build_option_block(fwd_item, rng)
-                    prompt_text = fwd.build_prompt_text(fwd_item["question"], option_lines)
-                    inputs = fwd.build_inputs(processor, fwd_item["in_clip"], prompt_text)
-                model_inputs = fwd.prepare_model_inputs(inputs, "cross_attn", n_tokens, placeholder_id)
-                model_inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in model_inputs.items()}
-                jepa_feats = torch.from_numpy(fwd.load_vjepa_in_feats(fwd_item["in_clip"])).unsqueeze(0).to(device)
-                pooled_jepa = jepa_feats.mean(dim=(1, 2))
-                condition = injector.condition(jepa_feats)
-                hook.set(condition)
-                scores = torch.stack([
-                    fwd.candidate_logprob(model, model_inputs, processor.tokenizer, "A"),
-                    fwd.candidate_logprob(model, model_inputs, processor.tokenizer, "B"),
-                ]).unsqueeze(0)
-                hook.clear()
-                target = torch.tensor([0 if correct_letter == "A" else 1], device=device)
-                fwd_loss = nn.functional.cross_entropy(scores, target)
-                fwd_loss_norm, fwd_ema = normalizer.normalize("fwd", fwd_loss)
-                total_loss = total_loss + fwd_loss_norm
-                log_entry["fwd_loss"] = float(fwd_loss.item())
-                log_entry["fwd_loss_ema"] = fwd_ema
-                fwd_ok = True
-            except Exception as e:
-                n_fwd_skipped += 1
-                exc_name = type(e).__name__
-                print(f"[WARN] fwd skip {fwd_item.get('pid')}: {exc_name}: {e}", flush=True)
-                if exc_name not in seen_exc_types:
-                    seen_exc_types.add(exc_name)
-                    traceback.print_exc()
+                fwd_ok = False
+                pooled_jepa = None
+                try:
+                    cached = None
+                    if args.precompute_cache_dir is not None:
+                        cached = fwd.load_precomputed_inputs(args.precompute_cache_dir, fwd_item.get("pid"))
+                    if cached is not None:
+                        inputs, correct_letter = cached
+                    else:
+                        option_lines, correct_letter = fwd.build_option_block(fwd_item, rng)
+                        prompt_text = fwd.build_prompt_text(fwd_item["question"], option_lines)
+                        inputs = fwd.build_inputs(processor, fwd_item["in_clip"], prompt_text)
+                    model_inputs = fwd.prepare_model_inputs(inputs, "cross_attn", n_tokens, placeholder_id)
+                    model_inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in model_inputs.items()}
+                    jepa_feats = torch.from_numpy(fwd.load_vjepa_in_feats(fwd_item["in_clip"])).unsqueeze(0).to(device)
+                    pooled_jepa = jepa_feats.mean(dim=(1, 2))
+                    condition = injector.condition(jepa_feats)
+                    hook.set(condition)
+                    scores = torch.stack([
+                        fwd.candidate_logprob(model, model_inputs, processor.tokenizer, "A"),
+                        fwd.candidate_logprob(model, model_inputs, processor.tokenizer, "B"),
+                    ]).unsqueeze(0)
+                    hook.clear()
+                    target = torch.tensor([0 if correct_letter == "A" else 1], device=device)
+                    fwd_loss = nn.functional.cross_entropy(scores, target)
+                    fwd_loss_norm, fwd_ema = normalizer.normalize("fwd", fwd_loss)
+                    total_loss = total_loss + fwd_loss_norm
+                    log_entry["fwd_loss"] = float(fwd_loss.item())
+                    log_entry["fwd_loss_ema"] = fwd_ema
+                    fwd_ok = True
+                except Exception as e:
+                    n_fwd_skipped += 1
+                    exc_name = type(e).__name__
+                    print(f"[WARN] fwd skip {fwd_item.get('pid')}: {exc_name}: {e}", flush=True)
+                    if exc_name not in seen_exc_types:
+                        seen_exc_types.add(exc_name)
+                        traceback.print_exc()
 
-            rev_ok = False
-            pooled_vlm = None
-            try:
-                in_feats, out_feats, extras = get_rev_pair(rev_pid)
-                pooled_vlm = extras["vlm_old"].mean(dim=(0, 1), keepdim=True)
-                metrics = rev.forward_step(predictor, in_feats, out_feats, extras, "crossattn", device)
-                rev_loss = metrics["pred_loss"]
-                rev_loss_norm, rev_ema = normalizer.normalize("rev", rev_loss)
-                total_loss = total_loss + rev_loss_norm
-                log_entry["rev_loss"] = float(rev_loss.item())
-                log_entry["rev_loss_ema"] = rev_ema
-                rev_ok = True
-            except Exception as e:
-                n_rev_skipped += 1
-                exc_name = type(e).__name__
-                print(f"[WARN] rev skip {rev_pid}: {exc_name}: {e}", flush=True)
-                if exc_name not in seen_exc_types:
-                    seen_exc_types.add(exc_name)
-                    traceback.print_exc()
+                rev_ok = False
+                pooled_vlm = None
+                try:
+                    in_feats, out_feats, extras = get_rev_pair(rev_pid)
+                    pooled_vlm = extras["vlm_old"].mean(dim=(0, 1), keepdim=True)
+                    metrics = rev.forward_step(predictor, in_feats, out_feats, extras, "crossattn", device)
+                    rev_loss = metrics["pred_loss"]
+                    rev_loss_norm, rev_ema = normalizer.normalize("rev", rev_loss)
+                    total_loss = total_loss + rev_loss_norm
+                    log_entry["rev_loss"] = float(rev_loss.item())
+                    log_entry["rev_loss_ema"] = rev_ema
+                    rev_ok = True
+                except Exception as e:
+                    n_rev_skipped += 1
+                    exc_name = type(e).__name__
+                    print(f"[WARN] rev skip {rev_pid}: {exc_name}: {e}", flush=True)
+                    if exc_name not in seen_exc_types:
+                        seen_exc_types.add(exc_name)
+                        traceback.print_exc()
 
-            if not (fwd_ok or rev_ok):
-                # Known, accepted DDP edge case: if this happens on only SOME
-                # ranks in the same step (both fwd and rev failing on the
-                # same item, on this rank specifically), those ranks skip
-                # this iteration's collectives while others proceed to
-                # sync_gradients -- a call-count mismatch. Not fixed here:
-                # empirically both directions failing on the identical step
-                # simultaneously is far rarer than either failing alone
-                # (single-digit occurrences across thousands of steps in
-                # every non-DDP run this project has logged), and NCCL
-                # surfaces a mismatch as a clear timeout/error rather than a
-                # silent hang, so the failure mode is "resubmit", not "wasted
-                # GPU-days undetected".
+                if not (fwd_ok or rev_ok):
+                    # Skips only this pair. The optimizer step (and its DDP
+                    # collectives) is skipped only if EVERY pair in the
+                    # accumulation window failed on this rank -- the known,
+                    # accepted DDP call-count-mismatch edge case, now even
+                    # rarer than at --grad_accum_steps 1; NCCL surfaces it as
+                    # a clear timeout, so the failure mode is "resubmit".
+                    continue
+
+                cyc_loss = bridge.cycle_loss(pooled_jepa, pooled_vlm)
+                cyc_loss_norm, cyc_ema = normalizer.normalize("cyc", cyc_loss)
+                total_loss = total_loss + args.cycle_loss_weight * cyc_loss_norm
+                log_entry["cycle_loss"] = float(cyc_loss.item())
+                log_entry["cycle_loss_ema"] = cyc_ema
+
+                if args.log_bridge_grad_conflict and fwd_ok and rev_ok:
+                    # Diagnostic only, opt-in. An earlier version of this logged
+                    # cos(fwd_loss grad, rev_loss grad) over ALL shared bridge
+                    # params -- but fwd_loss only ever touches jepa_to_vlm (via
+                    # the forward injector's ForwardingAdapter) and rev_loss only
+                    # ever touches vlm_to_jepa (via the reverse predictor's), a
+                    # DISJOINT split of bridge.parameters() by construction. That
+                    # made the comparison tautologically 0.0 regardless of real
+                    # interference -- confirmed empirically in job-60's smoke
+                    # test (exactly 0.0 on 20/20 steps despite nonzero individual
+                    # norms). The real question is whether cycle_loss -- the one
+                    # term that touches BOTH heads -- fights each task's own
+                    # gradient on the parameters that task actually uses:
+                    #   cos(fwd_loss grad, cycle_loss grad) on jepa_to_vlm params
+                    #   cos(rev_loss grad, cycle_loss grad) on vlm_to_jepa params
+                    # retain_graph=True keeps total_loss.backward() below valid;
+                    # allow_unused=True since a given step's forward pass may
+                    # not touch every parameter of a head (e.g. an unused bias).
+                    def _grad_cos_sim(loss_a, loss_b, params):
+                        params = [p for p in params if p.requires_grad]
+                        if not params:
+                            return 0.0, 0.0, 0.0
+                        grads_a = torch.autograd.grad(loss_a, params, retain_graph=True, allow_unused=True)
+                        grads_b = torch.autograd.grad(loss_b, params, retain_graph=True, allow_unused=True)
+                        flat_a = torch.cat([
+                            (g if g is not None else torch.zeros_like(p)).reshape(-1)
+                            for g, p in zip(grads_a, params)
+                        ])
+                        flat_b = torch.cat([
+                            (g if g is not None else torch.zeros_like(p)).reshape(-1)
+                            for g, p in zip(grads_b, params)
+                        ])
+                        denom = flat_a.norm() * flat_b.norm()
+                        cos = float((flat_a @ flat_b / denom).item()) if denom > 0 else 0.0
+                        return cos, float(flat_a.norm().item()), float(flat_b.norm().item())
+
+                    fwd_vs_cyc_cos, fwd_norm, _ = _grad_cos_sim(
+                        fwd_loss_norm, cyc_loss_norm, bridge.jepa_to_vlm.parameters())
+                    rev_vs_cyc_cos, rev_norm, _ = _grad_cos_sim(
+                        rev_loss_norm, cyc_loss_norm, bridge.vlm_to_jepa.parameters())
+                    log_entry["bridge_grad_fwd_vs_cycle_cos_sim"] = fwd_vs_cyc_cos
+                    log_entry["bridge_grad_rev_vs_cycle_cos_sim"] = rev_vs_cyc_cos
+                    log_entry["bridge_grad_fwd_norm"] = fwd_norm
+                    log_entry["bridge_grad_rev_norm"] = rev_norm
+
+                total_loss.backward()
+                n_ok += 1
+                micro_logs.append(log_entry)
+
+            if n_ok == 0:
                 continue
-
-            cyc_loss = bridge.cycle_loss(pooled_jepa, pooled_vlm)
-            cyc_loss_norm, cyc_ema = normalizer.normalize("cyc", cyc_loss)
-            total_loss = total_loss + args.cycle_loss_weight * cyc_loss_norm
-            log_entry["cycle_loss"] = float(cyc_loss.item())
-            log_entry["cycle_loss_ema"] = cyc_ema
-
-            if args.log_bridge_grad_conflict and fwd_ok and rev_ok:
-                # Diagnostic only, opt-in. An earlier version of this logged
-                # cos(fwd_loss grad, rev_loss grad) over ALL shared bridge
-                # params -- but fwd_loss only ever touches jepa_to_vlm (via
-                # the forward injector's ForwardingAdapter) and rev_loss only
-                # ever touches vlm_to_jepa (via the reverse predictor's), a
-                # DISJOINT split of bridge.parameters() by construction. That
-                # made the comparison tautologically 0.0 regardless of real
-                # interference -- confirmed empirically in job-60's smoke
-                # test (exactly 0.0 on 20/20 steps despite nonzero individual
-                # norms). The real question is whether cycle_loss -- the one
-                # term that touches BOTH heads -- fights each task's own
-                # gradient on the parameters that task actually uses:
-                #   cos(fwd_loss grad, cycle_loss grad) on jepa_to_vlm params
-                #   cos(rev_loss grad, cycle_loss grad) on vlm_to_jepa params
-                # retain_graph=True keeps total_loss.backward() below valid;
-                # allow_unused=True since a given step's forward pass may
-                # not touch every parameter of a head (e.g. an unused bias).
-                def _grad_cos_sim(loss_a, loss_b, params):
-                    params = [p for p in params if p.requires_grad]
-                    if not params:
-                        return 0.0, 0.0, 0.0
-                    grads_a = torch.autograd.grad(loss_a, params, retain_graph=True, allow_unused=True)
-                    grads_b = torch.autograd.grad(loss_b, params, retain_graph=True, allow_unused=True)
-                    flat_a = torch.cat([
-                        (g if g is not None else torch.zeros_like(p)).reshape(-1)
-                        for g, p in zip(grads_a, params)
-                    ])
-                    flat_b = torch.cat([
-                        (g if g is not None else torch.zeros_like(p)).reshape(-1)
-                        for g, p in zip(grads_b, params)
-                    ])
-                    denom = flat_a.norm() * flat_b.norm()
-                    cos = float((flat_a @ flat_b / denom).item()) if denom > 0 else 0.0
-                    return cos, float(flat_a.norm().item()), float(flat_b.norm().item())
-
-                fwd_vs_cyc_cos, fwd_norm, _ = _grad_cos_sim(
-                    fwd_loss_norm, cyc_loss_norm, bridge.jepa_to_vlm.parameters())
-                rev_vs_cyc_cos, rev_norm, _ = _grad_cos_sim(
-                    rev_loss_norm, cyc_loss_norm, bridge.vlm_to_jepa.parameters())
-                log_entry["bridge_grad_fwd_vs_cycle_cos_sim"] = fwd_vs_cyc_cos
-                log_entry["bridge_grad_rev_vs_cycle_cos_sim"] = rev_vs_cyc_cos
-                log_entry["bridge_grad_fwd_norm"] = fwd_norm
-                log_entry["bridge_grad_rev_norm"] = rev_norm
-
-            total_loss.backward()
+            # Mean over the pairs that actually contributed (a skipped pair
+            # adds nothing), so the update scale doesn't depend on skips.
+            if n_ok > 1:
+                for p in all_params:
+                    if p.grad is not None:
+                        p.grad.div_(n_ok)
+            log_entry = {"step": step + 1, "epoch": epoch, "n_micro_ok": n_ok}
+            for key in sorted({k for m in micro_logs for k in m}):
+                vals = [m[key] for m in micro_logs if key in m]
+                log_entry[key] = sum(vals) / len(vals)
             if is_ddp():
                 sync_gradients(all_params, world_size)
             if args.grad_clip_norm > 0:
                 log_entry["grad_norm"] = torch.nn.utils.clip_grad_norm_(all_params, args.grad_clip_norm).item()
             opt.step()
+            opt.zero_grad()
             if scheduler is not None:
                 scheduler.step()
             step += 1
@@ -752,6 +787,7 @@ def main():
                     best_fwd_val_acc = fwd_val_tally.acc
                     ckpt_fwd = {"step": step, "val_acc": fwd_val_tally.acc,
                                 "injection_mode": args.injection_mode, "layer_strategy": args.layer_strategy,
+                                "no_jepa_injection": args.no_jepa_injection,
                                 "injector_state": injector.state_dict(), "bridge_state": bridge.state_dict()}
                     if args.lora_vlm:
                         ckpt_fwd["vlm_lora_state"] = lora_state_dict(model)
@@ -767,6 +803,7 @@ def main():
             if is_main and args.save_every_steps and step % args.save_every_steps == 0:
                 ckpt_step = {
                     "step": step, "injection_mode": args.injection_mode, "layer_strategy": args.layer_strategy,
+                    "no_jepa_injection": args.no_jepa_injection,
                     "injector_state": injector.state_dict(),
                     "predictor_state": predictor.state_dict(), "bridge_state": bridge.state_dict(),
                 }

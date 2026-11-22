@@ -1,0 +1,127 @@
+# Step 173: the NO-INJECTION CONTROL arm (--no_jepa_injection) of a
+# matched pair with job-172.
+#
+# Accumulates gradients over 16 (forward, reverse) pairs per optimizer step
+# (--grad_accum_steps 16) instead of job-169b's per-pair update, whose
+# fwd_val_acc swung by 0.2+ between neighbouring evals. One epoch = 8253
+# pairs // 16 = 515 optimizer steps; --lr/--vlm_lr doubled vs 169b
+# (2e-4 / 6e-5) since 16x fewer updates at the same lr risks undertraining
+# both arms into a chance-level, inconclusive comparison. Warmup 50 steps
+# (~10%, same proportion as 169b). Val on 500 items (not 100: n=100 has
+# +-0.07 sampling error per easy/hard half) every 50 steps.
+# job-172 and job-173 are IDENTICAL except --no_jepa_injection, on the same
+# GPU type (rtxa6000, 48GB -- job-168b confirmed it fits; us-west A100s were
+# all taken), same seed and data, so any fwd_val_acc gap is the injection.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-joint-accum16-noinject
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      containers:
+        - name: joint-accum16-noinject
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              cd "$REPO"
+
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p /data/raw_data/joint_accum16_noinject_runs
+              "$PY" vans_qa/full_scale/train_joint_coupled_normalized.py \
+                --qa_split /data/raw_data/qa_split_merged_v2_hard.json \
+                --cache_dir /data/vans_work/vlm_guidance_cache_paired \
+                --rev_qa_split /data/raw_data/qa_split_full.json \
+                --bridge_hidden_dim 2048 \
+                --lora_vlm --lora_vlm_r 8 --lora_vlm_alpha 16 \
+                --lora_predictor --lora_predictor_r 8 --lora_predictor_alpha 16 \
+                --live_vlm \
+                --lr 2e-4 --vlm_lr 6e-5 \
+                --lr_schedule warmup_cosine --warmup_steps 50 \
+                --grad_clip_norm 1.0 \
+                --grad_accum_steps 16 \
+                --no_jepa_injection \
+                --epochs 1 \
+                --val_every_steps 50 \
+                --save_every_steps 50 \
+                --max_val_items 500 \
+                --max_test_items 500 \
+                --out_dir /data/raw_data/joint_accum16_noinject_runs 2>&1 \
+                | tee /data/raw_data/joint_accum16_noinject_runs/full_run.log
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "28Gi"
+              ephemeral-storage: "4Gi"
+              nvidia.com/rtxa6000: "1"
+            limits:
+              cpu: "4.8"
+              memory: "32Gi"
+              ephemeral-storage: "6Gi"
+              nvidia.com/rtxa6000: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-baselines2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-173-joint-accum16-noinject.yaml -n williamli-scvl
