@@ -201,15 +201,24 @@ def load_pair_live(cache_dir, pid, device, qwen_model, qwen_processor, qwen_save
     question = str(d["question"])
     correct_caption = str(d["correct_caption"])
     video_path = None
+    clip_offset = 0.0
     if "in_clip_relpath" in d.files:
         in_clip_relpath = str(d["in_clip_relpath"])
         video_path = in_clip_relpath if os.path.exists(in_clip_relpath) else None
     else:
         video_uid = str(d["video_uid"])
         annotation_source = str(d["annotation_source"])
+        # Past-window clip cut by fetch_ego4d_past_clips.py (its .json is
+        # written last, so it marks a complete clip); full video as fallback.
+        clip_base = os.path.join(EGO4D_REVERSE_GUIDED_ROOT, "past_clips", annotation_source, pid)
         candidate = os.path.join(EGO4D_REVERSE_GUIDED_ROOT, f"raw_videos_{annotation_source}",
                                   "v2", "full_scale", f"{video_uid}.mp4")
-        video_path = candidate if os.path.exists(candidate) else None
+        if os.path.exists(clip_base + ".json"):
+            with open(clip_base + ".json") as f:
+                clip_offset = float(json.load(f)["offset_seconds"])
+            video_path = clip_base + ".mp4"
+        elif os.path.exists(candidate):
+            video_path = candidate
 
     if video_path is None:
         # Raw source video not on disk (expected for most Ego4D items, see
@@ -225,7 +234,8 @@ def load_pair_live(cache_dir, pid, device, qwen_model, qwen_processor, qwen_save
         past_frames, past_times, in_fps = decode_clip_with_timeout(video_path, NUM_PAST_FRAMES)
     else:
         past_times_target = d["past_frame_times_seconds"].astype(np.float64)
-        past_frames, past_times, source_fps = decode_frames_at_timestamps(video_path, past_times_target)
+        past_frames, past_times, source_fps = decode_frames_at_timestamps(video_path, past_times_target - clip_offset)
+        past_times = past_times + clip_offset
         span = max(1e-6, float(past_times[-1] - past_times[0]))
         in_fps = max(1.0, (len(past_times) - 1) / span)  # same fallback extract_ego4d_reverse_guided.py itself uses
     vlm_old, vlm_new = infer_qwen_teacher_forced_live(

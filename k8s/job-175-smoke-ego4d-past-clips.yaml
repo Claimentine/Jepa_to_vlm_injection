@@ -1,0 +1,109 @@
+# Step 175: smoke test for fetch_ego4d_past_clips.py on 4 videos. Restores
+# live decoding for the Ego4D reverse-guided pairs without keeping their
+# ~3.6 GB full-length videos (~10 TB for all ~2,900; /data has 2 TB free):
+# download each video, cut every pair's past window (+-0.5 s, 448 px short
+# side) into a small clip, delete the full video. --verify then decodes the
+# clips exactly the way load_pair_live does and reports how far the achieved
+# frame times land from the cached past_frame_times_seconds (should be
+# within one frame). Also builds and caches the pid index for the full run.
+# CPU only; us-west (our Ceph volumes stall on us-central nodes).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-smoke-ego4d-past-clips
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values:
+                      - us-west
+      containers:
+        - name: smoke-ego4d-past-clips
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              cd /code/Jepa_to_vlm_injection
+              "$PY" -m pip install --quiet ego4d
+              export PATH="$(dirname "$PY"):$PATH"
+              "$PY" vans_qa/full_scale/fetch_ego4d_past_clips.py \
+                --limit_videos 4 --concurrency 4 --verify 12
+              du -sh /data/vans_work_ego4d_reverse_guided/past_clips
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: ego4d-aws-credentials
+                  key: AWS_DEFAULT_REGION
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              ephemeral-storage: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+              ephemeral-storage: "6Gi"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-175-smoke-ego4d-past-clips.yaml -n williamli-scvl
