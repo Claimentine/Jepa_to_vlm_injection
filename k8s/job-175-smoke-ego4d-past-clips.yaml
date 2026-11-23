@@ -1,8 +1,9 @@
 # Step 175: smoke test for fetch_ego4d_past_clips.py on 4 videos. Restores
 # live decoding for the Ego4D reverse-guided pairs without keeping their
 # ~3.6 GB full-length videos (~10 TB for all ~2,900; /data has 2 TB free):
-# download each video, cut every pair's past window (+-0.5 s, 448 px short
-# side) into a small clip, delete the full video. --verify then decodes the
+# download each video, cut every pair's past window (+-0.5 s) into a clip at
+# the ORIGINAL resolution (x264 CRF 18, no B-frames; resize happens at load
+# time), delete the full video. --verify then decodes the
 # clips exactly the way load_pair_live does and reports how far the achieved
 # frame times land from the cached past_frame_times_seconds (should be
 # within one frame). Also builds and caches the pid index for the full run.
@@ -35,7 +36,7 @@ spec:
               set -euo pipefail
               PY=/home/jovyan/conda-envs/qwen3vl/bin/python
               cd /code/Jepa_to_vlm_injection
-              "$PY" -m pip install --quiet ego4d
+              "$PY" -m pip install --quiet ego4d imageio-ffmpeg
               export PATH="$(dirname "$PY"):$PATH"
               "$PY" vans_qa/full_scale/fetch_ego4d_past_clips.py \
                 --limit_videos 4 --concurrency 4 --verify 12

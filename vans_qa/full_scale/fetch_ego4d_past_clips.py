@@ -7,18 +7,22 @@ re-decodes each pair's PAST window: the frames at past_frame_times_seconds
 full_scale videos average ~3.6 GB each (126 still on disk = 450 GB), so the
 ~2,900 unique videos behind the 8,412 cached pairs would need ~10 TB --
 more than /data has. Instead, per video: download it, cut each pair's past
-window (+-pad) into a small downscaled clip, delete the full video.
+window (+-pad) into a clip at the ORIGINAL resolution, delete the full
+video. Resizing happens at load time (the Qwen processor's own qwen_res).
+
+Cutting at an arbitrary frame needs a re-encode: every frame in the window
+is decoded from the source and piped to x264 at CRF 18 (visually lossless),
+same fps, no B-frames, so clip frame i is source frame start_idx + i.
 
 Output per pid, under --clips_root/<annotation_source>/:
   <pid>.mp4   the past-window clip at the source fps
   <pid>.json  {"offset_seconds", "start_idx", "source_fps", ...}; written last,
               so its presence means the clip is complete
 
-The loader decodes the clip at (past_frame_times_seconds - offset_seconds).
-start_idx is kept even: decode_frames_at_timestamps uses np.round (half to
-even) and the cached times are frame centres ((idx+0.5)/fps), so an odd
-offset could flip the rounding and pick a neighbouring frame vs decoding
-the full video. With an even offset it picks exactly the same frames.
+The loader maps each cached time to its source frame round(t * source_fps)
+(the full-video rule), subtracts start_idx, and decodes that exact clip
+frame index -- the cached times sit on half-frame boundaries, so shifting
+the float times instead could flip the rounding to a neighbouring frame.
 
 Idempotent: videos whose pids all have a .json are skipped, so a rerun
 retries only what failed.
@@ -71,41 +75,47 @@ def clip_paths(clips_root, item):
     return base + ".mp4", base + ".json"
 
 
-def cut_clip(reader, item, out_mp4, out_json, pad_seconds, short_side):
-    import cv2
+def cut_clip(reader, item, out_mp4, out_json, pad_seconds, crf):
+    import subprocess
+
+    import imageio_ffmpeg
 
     total = len(reader)
     fps = float(reader.get_avg_fps())
     t0, t1 = item["past_times"][0], item["past_times"][-1]
     start_idx = max(0, int(np.floor((t0 - pad_seconds) * fps)))
-    start_idx -= start_idx % 2
     end_idx = min(total - 1, int(np.ceil((t1 + pad_seconds) * fps)))
     if end_idx <= start_idx:
         raise ValueError(f"empty window {start_idx}..{end_idx} (total={total}, fps={fps})")
 
     h, w = reader[0].shape[:2]
-    scale = short_side / min(h, w)
-    out_w, out_h = (int(round(w * scale)) // 2 * 2, int(round(h * scale)) // 2 * 2) if scale < 1 else (w, h)
-
     os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
     tmp_mp4 = out_mp4 + f".tmp.{os.getpid()}.{threading.get_ident()}.mp4"
-    writer = cv2.VideoWriter(tmp_mp4, cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_w, out_h))
-    if not writer.isOpened():
-        raise RuntimeError(f"cv2.VideoWriter failed to open {tmp_mp4}")
+    cmd = [
+        imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", f"{fps:.6f}", "-i", "-",
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-bf", "0",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", tmp_mp4,
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         for s in range(start_idx, end_idx + 1, CHUNK_FRAMES):
             idx = list(range(s, min(s + CHUNK_FRAMES, end_idx + 1)))
-            frames = reader.get_batch(idx).asnumpy()
-            for fr in frames:
-                if (out_w, out_h) != (w, h):
-                    fr = cv2.resize(fr, (out_w, out_h), interpolation=cv2.INTER_AREA)
-                writer.write(cv2.cvtColor(fr, cv2.COLOR_RGB2BGR))
-    finally:
-        writer.release()
+            proc.stdin.write(np.ascontiguousarray(reader.get_batch(idx).asnumpy()[..., :3]).tobytes())
+        proc.stdin.close()
+        err = proc.stderr.read().decode(errors="replace")
+        if proc.wait() != 0:
+            raise RuntimeError(f"ffmpeg exit {proc.returncode}: {err[-500:]}")
+    except BaseException:
+        proc.kill()
+        if os.path.exists(tmp_mp4):
+            os.remove(tmp_mp4)
+        raise
     os.replace(tmp_mp4, out_mp4)
     meta = {
         "pid": item["pid"], "offset_seconds": start_idx / fps, "start_idx": start_idx,
-        "end_idx": end_idx, "source_fps": fps, "source_size": [w, h], "clip_size": [out_w, out_h],
+        "end_idx": end_idx, "source_fps": fps, "source_size": [w, h], "crf": crf,
     }
     with open(out_json + ".tmp", "w") as f:
         json.dump(meta, f)
@@ -130,7 +140,7 @@ def process_video(uid, items, args):
         for it in todo:
             out_mp4, out_json = clip_paths(args.clips_root, it)
             try:
-                cut_clip(reader, it, out_mp4, out_json, args.pad_seconds, args.short_side)
+                cut_clip(reader, it, out_mp4, out_json, args.pad_seconds, args.crf)
             except Exception as e:
                 n_err += 1
                 print(f"[CLIP FAIL] {it['pid']}: {type(e).__name__}: {e}", flush=True)
@@ -158,7 +168,8 @@ def verify(by_video, uids, clips_root, n):
                 continue
             meta = json.load(open(js))
             target = np.asarray(it["past_times"])
-            frames, centers, fps = decode_frames_at_timestamps(mp4, target - meta["offset_seconds"])
+            clip_idx = np.round(target * meta["source_fps"]) - meta["start_idx"]
+            frames, centers, fps = decode_frames_at_timestamps(mp4, clip_idx / meta["source_fps"])
             err = np.abs(centers + meta["offset_seconds"] - target)
             n_clip = len(VideoReader(mp4, ctx=cpu(0)))
             print(f"[VERIFY] {it['pid']}: frames={frames.shape} clip_fps={fps:.3f} src_fps={meta['source_fps']:.3f} "
@@ -176,7 +187,7 @@ def main():
     ap.add_argument("--download_root", default=f"{root}/tmp_full_videos")
     ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--pad_seconds", type=float, default=0.5)
-    ap.add_argument("--short_side", type=int, default=448)
+    ap.add_argument("--crf", type=int, default=18, help="x264 CRF for the re-encoded clips (lower = closer to source)")
     ap.add_argument("--limit_videos", type=int, default=None, help="smoke test: only the first N videos")
     ap.add_argument("--passes", type=int, default=2, help="extra passes retry videos that failed")
     ap.add_argument("--verify", type=int, default=0, help="after fetching, decode-check this many clips")

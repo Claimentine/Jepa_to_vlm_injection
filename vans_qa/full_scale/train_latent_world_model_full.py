@@ -201,7 +201,7 @@ def load_pair_live(cache_dir, pid, device, qwen_model, qwen_processor, qwen_save
     question = str(d["question"])
     correct_caption = str(d["correct_caption"])
     video_path = None
-    clip_offset = 0.0
+    clip_meta = None
     if "in_clip_relpath" in d.files:
         in_clip_relpath = str(d["in_clip_relpath"])
         video_path = in_clip_relpath if os.path.exists(in_clip_relpath) else None
@@ -215,7 +215,7 @@ def load_pair_live(cache_dir, pid, device, qwen_model, qwen_processor, qwen_save
                                   "v2", "full_scale", f"{video_uid}.mp4")
         if os.path.exists(clip_base + ".json"):
             with open(clip_base + ".json") as f:
-                clip_offset = float(json.load(f)["offset_seconds"])
+                clip_meta = json.load(f)
             video_path = clip_base + ".mp4"
         elif os.path.exists(candidate):
             video_path = candidate
@@ -234,8 +234,17 @@ def load_pair_live(cache_dir, pid, device, qwen_model, qwen_processor, qwen_save
         past_frames, past_times, in_fps = decode_clip_with_timeout(video_path, NUM_PAST_FRAMES)
     else:
         past_times_target = d["past_frame_times_seconds"].astype(np.float64)
-        past_frames, past_times, source_fps = decode_frames_at_timestamps(video_path, past_times_target - clip_offset)
-        past_times = past_times + clip_offset
+        if clip_meta is None:
+            past_frames, past_times, source_fps = decode_frames_at_timestamps(video_path, past_times_target)
+        else:
+            # Same source frame the full video would give (round(t * fps)),
+            # re-expressed as an exact clip frame index: the cached times sit
+            # on half-frame boundaries, so shifting the float times instead
+            # can flip the rounding to a neighbouring frame.
+            fps_src = float(clip_meta["source_fps"])
+            clip_idx = np.round(past_times_target * fps_src) - clip_meta["start_idx"]
+            past_frames, past_times, source_fps = decode_frames_at_timestamps(video_path, clip_idx / fps_src)
+            past_times = past_times + float(clip_meta["offset_seconds"])
         span = max(1e-6, float(past_times[-1] - past_times[0]))
         in_fps = max(1.0, (len(past_times) - 1) / span)  # same fallback extract_ego4d_reverse_guided.py itself uses
     vlm_old, vlm_new = infer_qwen_teacher_forced_live(
