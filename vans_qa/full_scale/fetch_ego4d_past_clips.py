@@ -193,7 +193,8 @@ def main():
     ap.add_argument("--verify", type=int, default=0, help="after fetching, decode-check this many clips")
     args = ap.parse_args()
 
-    write_aws_credentials()
+    if not os.environ.get("LAB22_API_KEY"):
+        write_aws_credentials()
     os.makedirs(args.clips_root, exist_ok=True)
     by_video = build_index(args.cache_dirs, os.path.join(args.clips_root, "index_by_video.json"))
     uids = sorted(by_video)

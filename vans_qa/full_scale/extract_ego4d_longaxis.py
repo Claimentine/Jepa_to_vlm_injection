@@ -330,10 +330,13 @@ def select_shortaxis_pairs_narration(narration_data, min_gap_seconds, max_gap_se
 
 
 def _download_worker(conn, video_uid, output_dir_str):
+    # Ego4D access moved to the Lab22 platform (LAB22_API_KEY); `lab22 ego4d`
+    # takes the official ego4d CLI's options and writes the same layout.
+    cli = ["lab22", "ego4d"] if os.environ.get("LAB22_API_KEY") else ["ego4d.cli.cli"]
     try:
         result = subprocess.run(
             [
-                sys.executable, "-m", "ego4d.cli.cli",
+                sys.executable, "-m", *cli,
                 "-o", output_dir_str,
                 "--datasets", "full_scale",
                 "--video_uids", video_uid,

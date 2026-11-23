@@ -36,7 +36,7 @@ spec:
               set -euo pipefail
               PY=/home/jovyan/conda-envs/qwen3vl/bin/python
               cd /code/Jepa_to_vlm_injection
-              "$PY" -m pip install --quiet ego4d imageio-ffmpeg
+              "$PY" -m pip install --quiet lab22 imageio-ffmpeg
               export PATH="$(dirname "$PY"):$PATH"
               "$PY" vans_qa/full_scale/fetch_ego4d_past_clips.py \
                 --limit_videos 4 --concurrency 4 --verify 12
@@ -47,21 +47,11 @@ spec:
               value: /data
             - name: PYTHONUNBUFFERED
               value: "1"
-            - name: AWS_ACCESS_KEY_ID
+            - name: LAB22_API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: ego4d-aws-credentials
-                  key: AWS_ACCESS_KEY_ID
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: ego4d-aws-credentials
-                  key: AWS_SECRET_ACCESS_KEY
-            - name: AWS_DEFAULT_REGION
-              valueFrom:
-                secretKeyRef:
-                  name: ego4d-aws-credentials
-                  key: AWS_DEFAULT_REGION
+                  name: lab22-api-key
+                  key: LAB22_API_KEY
           resources:
             requests:
               cpu: "4"
