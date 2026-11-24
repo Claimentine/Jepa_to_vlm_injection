@@ -11,7 +11,9 @@
 # easy+hard / easy; easy twins from build_easy_train_split.py, distractor =
 # another video's correct caption); val/test identical, 500 val items every
 # 1000 steps. --max_steps 13380 also ends the cosine schedule there, so all
-# three get the same lr curve. One L40/L40S each (us-west A100/A6000s full).
+# three get the same lr curve. job-176 runs on an L40/L40S; job-177/178
+# moved to 80GB A100s (user request) after 2.5h Pending -- same numerics,
+# only wall-clock speed differs.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -32,8 +34,12 @@ spec:
                   - key: nvidia.com/gpu.product
                     operator: In
                     values:
-                      - NVIDIA-L40
-                      - NVIDIA-L40S
+                      - NVIDIA-A100-SXM4-80GB
+                      - NVIDIA-A100-80GB-PCIe
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - node-2-3.sdsc.optiputer.net
       containers:
         - name: lora-temporal-easy
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
@@ -95,12 +101,12 @@ spec:
               cpu: "4"
               memory: "28Gi"
               ephemeral-storage: "4Gi"
-              nvidia.com/gpu: "1"
+              nvidia.com/a100: "1"
             limits:
               cpu: "4.8"
               memory: "32Gi"
               ephemeral-storage: "6Gi"
-              nvidia.com/gpu: "1"
+              nvidia.com/a100: "1"
           volumeMounts:
             - name: git-repo-code
               mountPath: /code
