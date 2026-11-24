@@ -169,10 +169,20 @@ def cut_clip(reader, src_path, item, out_mp4, out_json, pad_seconds, crf):
     os.replace(out_json + ".tmp", out_json)
 
 
+def clip_done(clips_root, item):
+    """A clip counts only if its .json records the timestamp check -- clips cut
+    by earlier versions of this script (pixel-checked or unchecked) are redone."""
+    js = clip_paths(clips_root, item)[1]
+    if not os.path.exists(js):
+        return False
+    with open(js) as f:
+        return "check_time_err_ms" in json.load(f)
+
+
 def process_video(uid, items, args):
     from decord import VideoReader, cpu
 
-    todo = [it for it in items if not os.path.exists(clip_paths(args.clips_root, it)[1])]
+    todo = [it for it in items if not clip_done(args.clips_root, it)]
     if not todo:
         return uid, "skip", None
     dl_dir = Path(args.download_root) / uid
@@ -271,8 +281,8 @@ def main():
         if counts["fail"] == 0 and counts["partial"] == 0:
             break
 
-    done = sum(os.path.exists(clip_paths(args.clips_root, it)[1]) for u in uids for it in by_video[u])
-    print(f"[DONE] clips with metadata: {done}/{n_pairs} pairs", flush=True)
+    done = sum(clip_done(args.clips_root, it) for u in uids for it in by_video[u])
+    print(f"[DONE] timestamp-checked clips: {done}/{n_pairs} pairs", flush=True)
     if args.verify:
         verify(by_video, uids, args.clips_root, args.verify)
 

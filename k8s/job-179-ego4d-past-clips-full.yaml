@@ -1,0 +1,106 @@
+# Step 179: full run of fetch_ego4d_past_clips.py over all 8,412 Ego4D
+# reverse-guided pairs (~2,900 videos, narration + goalstep). job-175's smoke
+# test passed 10/10 pairs: ffmpeg seek-and-encode at the original resolution,
+# every clip's frames checked against decord's index timestamps (nearest-frame
+# identity), peak memory 3.2 GB at 2 videos in flight, ~100 videos/h.
+# 6 videos in flight here (~10 GB, ~300 videos/h -> roughly 10 h, plus
+# Lab22's download throughput). Clips are ~9-32 MB each at full resolution
+# (goalstep windows are up to ~40 s, so larger): ~100-200 GB total, /data
+# has ~2 TB free. Idempotent: rerunning skips every timestamp-checked clip
+# and redoes the rest (including the 4 smoke-test clips cut by older,
+# pixel-checked versions). Lab22 key from the lab22-api-key Secret.
+# CPU only; us-west (our Ceph volumes stall on us-central nodes).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-ego4d-past-clips-full
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values:
+                      - us-west
+      containers:
+        - name: ego4d-past-clips-full
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              LOG=/data/vans_work_ego4d_reverse_guided/past_clips/full_run_$(date +%Y%m%dT%H%M%S).log
+              exec > >(tee -a "$LOG") 2>&1
+              trap 'echo "EXIT code=$? at line $LINENO"' EXIT
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              cd /code/Jepa_to_vlm_injection
+              "$PY" -m pip install --quiet lab22 imageio-ffmpeg
+              export PATH="$(dirname "$PY"):$PATH"
+              (while true; do echo "[mem $(date +%T)] cgroup=$(( $(cat /sys/fs/cgroup/memory.current) / 1048576 ))MB"; sleep 300; done) &
+              "$PY" vans_qa/full_scale/fetch_ego4d_past_clips.py --concurrency 6 --passes 3 --verify 20
+              du -sh /data/vans_work_ego4d_reverse_guided/past_clips
+              echo "peak memory: $(( $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0) / 1048576 )) MB"
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: LAB22_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: lab22-api-key
+                  key: LAB22_API_KEY
+          resources:
+            requests:
+              cpu: "12"
+              memory: "24Gi"
+              ephemeral-storage: "4Gi"
+            limits:
+              cpu: "14"
+              memory: "32Gi"
+              ephemeral-storage: "6Gi"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-vlm2
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-179-ego4d-past-clips-full.yaml -n williamli-scvl
