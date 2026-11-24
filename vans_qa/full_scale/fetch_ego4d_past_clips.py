@@ -47,7 +47,7 @@ import sys
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -98,6 +98,10 @@ def check_clip_times(ffmpeg_stderr, seek, index_starts, first, n):
 
     times = [float(m) for m in re.findall(r"\bn:\s*\d+\s.*?\bpts_time:\s*(-?[\d.]+)", ffmpeg_stderr)]
     size = re.search(r"\bs:(\d+)x(\d+)", ffmpeg_stderr)
+    if seek is None and times:
+        # no seek: decoding starts at the very first frame, so align its time to
+        # source frame lo + first and check the rest relative to it
+        seek = float(index_starts[first]) - times[0]
     return _match_frames(times, seek, np.asarray(index_starts, dtype=np.float64), first, n), \
         ([int(size.group(1)), int(size.group(2))] if size else None)
 
@@ -137,13 +141,18 @@ def cut_clip(reader, src_path, item, out_mp4, out_json, pad_seconds, crf):
     lo, hi = max(0, start_idx - 1), min(total - 1, end_idx + 1)
     index_starts = reader.get_frame_timestamp(list(range(lo, hi + 1)))[:, 0].astype(np.float64)
     first = start_idx - lo
-    seek = max(0.0, float(index_starts[first]) - 0.5 / fps)
+    seek = float(index_starts[first]) - 0.5 / fps
+    if seek <= 0:
+        # Window starts at the first frame: no -ss at all. ffmpeg then keeps the
+        # stream's own start offset (~20-30 ms on some Ego4D files) in its frame
+        # times, so the check anchors the clip's first frame to source frame 0.
+        seek = None
 
     os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
     tmp_mp4 = out_mp4 + f".tmp.{os.getpid()}.{threading.get_ident()}.mp4"
     cmd = [
         imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-hide_banner", "-nostats", "-loglevel", "info",
-        "-ss", f"{seek:.6f}", "-i", str(src_path),
+        *(["-ss", f"{seek:.6f}"] if seek is not None else []), "-i", str(src_path),
         "-map", "0:v:0", "-an", "-frames:v", str(n_frames), "-fps_mode", "passthrough",
         "-vf", "showinfo,pad=ceil(iw/2)*2:ceil(ih/2)*2",
         "-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-bf", "0", "-threads", "2",
@@ -266,7 +275,8 @@ def main():
         counts = {"ok": 0, "skip": 0, "partial": 0, "fail": 0}
         with ThreadPoolExecutor(args.concurrency) as pool:
             futures = [pool.submit(process_video, u, by_video[u], args) for u in uids]
-            for i, fut in enumerate(futures, start=1):
+            # in completion order, so one slow video doesn't stall the progress lines
+            for i, fut in enumerate(as_completed(futures), start=1):
                 try:
                     uid, status, err = fut.result()
                 except Exception:
