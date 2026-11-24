@@ -47,7 +47,7 @@ spec:
               "$PY" -m lab22 ego4d -o /tmp/dryrun --datasets full_scale --video_uids $UIDS --no-metadata --dry-run 2>&1 | tail -8
               (while true; do echo "[mem $(date +%T)] cgroup=$(( $(cat /sys/fs/cgroup/memory.current) / 1048576 ))MB top: $(ps -eo rss=,comm= --sort=-rss | head -4 | awk '{printf "%s=%dMB ", $2, $1/1024}')"; sleep 5; done) &
               "$PY" vans_qa/full_scale/fetch_ego4d_past_clips.py \
-                --limit_videos 4 --concurrency 1 --verify 12
+                --limit_videos 4 --concurrency 2 --verify 12
               du -sh /data/vans_work_ego4d_reverse_guided/past_clips
               echo "peak memory: $(( $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes) / 1048576 )) MB"
               echo "SCRIPT_DONE"

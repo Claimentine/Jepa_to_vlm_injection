@@ -10,9 +10,14 @@ more than /data has. Instead, per video: download it, cut each pair's past
 window (+-pad) into a clip at the ORIGINAL resolution, delete the full
 video. Resizing happens at load time (the Qwen processor's own qwen_res).
 
-Cutting at an arbitrary frame needs a re-encode: every frame in the window
-is decoded from the source and piped to x264 at CRF 18 (visually lossless),
-same fps, no B-frames, so clip frame i is source frame start_idx + i.
+Cutting at an arbitrary frame needs a re-encode. ffmpeg does the decode as
+well as the encode (decord's get_batch leaks every decoded frame: job-175
+grew ~230 MB/s until OOMKilled at 32Gi): it seeks to half a frame before
+source frame start_idx's own timestamp (from decord's index, no decode) and
+takes the next end_idx - start_idx + 1 frames with timestamps passed
+through, x264 CRF 18 (visually lossless), no B-frames -- so clip frame i is
+source frame start_idx + i. Each clip is then checked: frame count, and its
+first/middle/last frames against decord's own decode of those source frames.
 
 Output per pid, under --clips_root/<annotation_source>/:
   <pid>.mp4   the past-window clip at the source fps
@@ -44,9 +49,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from extract_ego4d_longaxis import download_video, write_aws_credentials  # noqa: E402
 
-# Full-resolution frames are large (a 64-frame chunk at 1440p is ~0.8 GB), and
-# job-175 OOMed at 16Gi with 4 videos in flight -- keep per-video memory small.
-CHUNK_FRAMES = 16
+MAX_CHECK_PIXEL_ERR = 6.0  # mean |diff| on 0-255; CRF 18 lands around 1-3
 
 
 def build_index(cache_dirs, index_path):
@@ -77,7 +80,32 @@ def clip_paths(clips_root, item):
     return base + ".mp4", base + ".json"
 
 
-def cut_clip(reader, item, out_mp4, out_json, pad_seconds, crf):
+def check_clip(reader, clip_path, start_idx, n_frames):
+    """Clip frame count must be n_frames, and its first/middle/last frames must
+    match decord's decode of source frames start_idx + k. Returns the error."""
+    import imageio_ffmpeg
+
+    picks = sorted({0, n_frames // 2, n_frames - 1})
+    gen = imageio_ffmpeg.read_frames(clip_path)
+    meta = next(gen)
+    w, h = meta["size"]
+    got, count = {}, 0
+    for raw in gen:
+        if count in picks:
+            got[count] = np.frombuffer(raw, np.uint8).reshape(h, w, 3)
+        count += 1
+    if count != n_frames:
+        raise RuntimeError(f"clip has {count} frames, expected {n_frames}")
+    ref = reader.get_batch([start_idx + k for k in picks]).asnumpy()[..., :3]
+    errs = [float(np.abs(got[k][: ref.shape[1], : ref.shape[2]].astype(np.int16)
+                         - ref[i].astype(np.int16)).mean()) for i, k in enumerate(picks)]
+    if max(errs) > MAX_CHECK_PIXEL_ERR:
+        raise RuntimeError(f"clip frames don't match source frames {[start_idx + k for k in picks]}: "
+                           f"mean abs err {errs}")
+    return max(errs)
+
+
+def cut_clip(reader, src_path, item, out_mp4, out_json, pad_seconds, crf):
     import subprocess
 
     import imageio_ffmpeg
@@ -89,35 +117,34 @@ def cut_clip(reader, item, out_mp4, out_json, pad_seconds, crf):
     end_idx = min(total - 1, int(np.ceil((t1 + pad_seconds) * fps)))
     if end_idx <= start_idx:
         raise ValueError(f"empty window {start_idx}..{end_idx} (total={total}, fps={fps})")
+    n_frames = end_idx - start_idx + 1
+    seek = max(0.0, float(reader.get_frame_timestamp([start_idx])[0][0]) - 0.5 / fps)
 
-    h, w = reader[0].shape[:2]
     os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
     tmp_mp4 = out_mp4 + f".tmp.{os.getpid()}.{threading.get_ident()}.mp4"
     cmd = [
         imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", f"{fps:.6f}", "-i", "-",
+        "-ss", f"{seek:.6f}", "-i", str(src_path),
+        "-map", "0:v:0", "-an", "-frames:v", str(n_frames), "-fps_mode", "passthrough",
         "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
         "-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-bf", "0", "-threads", "2",
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", tmp_mp4,
     ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        for s in range(start_idx, end_idx + 1, CHUNK_FRAMES):
-            idx = list(range(s, min(s + CHUNK_FRAMES, end_idx + 1)))
-            proc.stdin.write(np.ascontiguousarray(reader.get_batch(idx).asnumpy()[..., :3]).tobytes())
-        proc.stdin.close()
-        err = proc.stderr.read().decode(errors="replace")
-        if proc.wait() != 0:
-            raise RuntimeError(f"ffmpeg exit {proc.returncode}: {err[-500:]}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg exit {result.returncode}: {result.stderr[-500:]}")
+        pixel_err = check_clip(reader, tmp_mp4, start_idx, n_frames)
     except BaseException:
-        proc.kill()
         if os.path.exists(tmp_mp4):
             os.remove(tmp_mp4)
         raise
     os.replace(tmp_mp4, out_mp4)
+    h, w = reader[start_idx].shape[:2]
     meta = {
         "pid": item["pid"], "offset_seconds": start_idx / fps, "start_idx": start_idx,
         "end_idx": end_idx, "source_fps": fps, "source_size": [w, h], "crf": crf,
+        "check_pixel_err": pixel_err,
     }
     with open(out_json + ".tmp", "w") as f:
         json.dump(meta, f)
@@ -142,7 +169,7 @@ def process_video(uid, items, args):
         for it in todo:
             out_mp4, out_json = clip_paths(args.clips_root, it)
             try:
-                cut_clip(reader, it, out_mp4, out_json, args.pad_seconds, args.crf)
+                cut_clip(reader, video_path, it, out_mp4, out_json, args.pad_seconds, args.crf)
             except Exception as e:
                 n_err += 1
                 print(f"[CLIP FAIL] {it['pid']}: {type(e).__name__}: {e}", flush=True)
