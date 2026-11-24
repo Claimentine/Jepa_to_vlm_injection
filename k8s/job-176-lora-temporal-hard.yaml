@@ -1,23 +1,21 @@
-# Step 177: frozen-VLM recipe, EASY+HARD train (each hard row plus an
-# easy twin with an other-video distractor).
+# Step 176: LoRA model, HARD-only train (exactly job-72's training rows).
 #
-# Replicates job-72's frozen-VLM recipe -- the only forward setup that ever
-# learned (val easy 0.94 / hard 0.78 at step 3500, trained on hard-only
-# qa_split_temporal.json) -- after the LoRA-VLM + live-VLM pipeline stayed at
-# chance (job-169b, job-172/173). Same as job-72: frozen VLM (no --lora_vlm),
-# cached reverse guidance (no --live_vlm), --disable_norm,
-# --cycle_loss_weight 0, --bridge_hidden_dim 2048, constant lr 1e-4, 2 epochs,
-# and no grad clipping (job-72 predates it, so --grad_clip_norm 0). job-72 ran
-# 2-GPU DDP (2 pairs per update); --grad_accum_steps 2 on one GPU gives the
-# same 2 pairs per update and the same 6690 updates.
-# job-176/177/178 differ ONLY in --qa_split's train side (hard / easy+hard /
-# easy; build_easy_train_split.py); val/test are identical, scored on 500 val
-# items (job-72 used 100) every 500 updates. --max_steps 6690 gives every run
-# the same 13,380 forward samples (the mixed split's 13,380 rows = one pass).
+# The LoRA model (VLM LoRA + predictor LoRA, live VLM guidance, job-169b's
+# optimizer settings) trained on the DATA recipe of the best frozen-VLM run,
+# job-72 (val easy 0.94 / hard 0.78): qa_split_temporal.json's COIN/VANS rows
+# (no YouCook2), 13,380 forward samples (job-72's 2 epochs over 6,690 rows).
+# The LoRA runs so far (job-169b, job-172/173) trained on the merged
+# COIN/VANS+YouCook2 hard split and stayed at chance, with easy val collapsing
+# below chance (0.22) -- the shortcut job-72 also showed once (step 4500).
+# job-176/177/178 differ ONLY in the train side of --qa_split (hard /
+# easy+hard / easy; easy twins from build_easy_train_split.py, distractor =
+# another video's correct caption); val/test identical, 500 val items every
+# 1000 steps. --max_steps 13380 also ends the cosine schedule there, so all
+# three get the same lr curve. One L40/L40S each (us-west A100/A6000s full).
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: ruixin-frozen-recipe-mixed
+  name: ruixin-lora-temporal-hard
 spec:
   backoffLimit: 1
   template:
@@ -31,15 +29,13 @@ spec:
                     operator: In
                     values:
                       - us-west
-                  # L40/L40S (46GB): us-west A6000s were all taken for 3h+;
-                  # one GPU family for all three arms.
                   - key: nvidia.com/gpu.product
                     operator: In
                     values:
                       - NVIDIA-L40
                       - NVIDIA-L40S
       containers:
-        - name: frozen-recipe-mixed
+        - name: lora-temporal-hard
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
           command:
             - "bash"
@@ -49,30 +45,33 @@ spec:
               set -euo pipefail
               PY=/home/jovyan/conda-envs/qwen3vl/bin/python
               REPO=/code/Jepa_to_vlm_injection
-              "$PY" -m pip install --quiet h5py
-              export PATH="$(dirname "$PY"):$PATH"
+              cd "$REPO"
 
               mkdir -p "$VANS_WORK_ROOT"
               ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
               ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
 
-              cd "$REPO"
               nvidia-smi --query-gpu=index,name,memory.total --format=csv
-              mkdir -p /data/raw_data/frozen_recipe_mixed_runs
+              mkdir -p /data/raw_data/lora_temporal_hard_runs
               "$PY" vans_qa/full_scale/train_joint_coupled_normalized.py \
-                --qa_split /data/raw_data/qa_split_temporal_mixed.json \
-                --disable_norm \
-                --cycle_loss_weight 0 \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --cache_dir /data/vans_work/vlm_guidance_cache_paired \
+                --rev_qa_split /data/raw_data/qa_split_full.json \
                 --bridge_hidden_dim 2048 \
-                --grad_clip_norm 0 \
-                --grad_accum_steps 2 \
+                --lora_vlm --lora_vlm_r 8 --lora_vlm_alpha 16 \
+                --lora_predictor --lora_predictor_r 8 --lora_predictor_alpha 16 \
+                --live_vlm \
+                --lr 1e-4 --vlm_lr 3e-5 \
+                --lr_schedule warmup_cosine --warmup_steps 1300 \
+                --grad_clip_norm 1.0 \
                 --epochs 2 \
-                --max_steps 6690 \
-                --val_every_steps 500 \
+                --max_steps 13380 \
+                --val_every_steps 1000 \
                 --save_every_steps 1000 \
                 --max_val_items 500 \
-                --out_dir /data/raw_data/frozen_recipe_mixed_runs 2>&1 \
-                | tee /data/raw_data/frozen_recipe_mixed_runs/full_run.log
+                --max_test_items 500 \
+                --out_dir /data/raw_data/lora_temporal_hard_runs 2>&1 \
+                | tee /data/raw_data/lora_temporal_hard_runs/full_run.log
               echo "SCRIPT_DONE"
           env:
             - name: VANS_ROOT
@@ -83,22 +82,24 @@ spec:
               value: /home/jovyan/ThinkJEPA
             - name: HF_HOME
               value: /data/hf_cache
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: FORCE_QWENVL_VIDEO_READER
               value: decord
-            - name: PYTORCH_ALLOC_CONF
-              value: expandable_segments:True
           resources:
             requests:
-              cpu: "6"
+              cpu: "4"
               memory: "28Gi"
-              ephemeral-storage: "2Gi"
+              ephemeral-storage: "4Gi"
               nvidia.com/gpu: "1"
             limits:
-              cpu: "7"
+              cpu: "4.8"
               memory: "32Gi"
-              ephemeral-storage: "2400Mi"
+              ephemeral-storage: "6Gi"
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: git-repo-code
@@ -126,7 +127,7 @@ spec:
           emptyDir: {}
         - name: conda-storage
           persistentVolumeClaim:
-            claimName: ruixin-conda-vol-ddp
+            claimName: ruixin-conda-vol-youcook
         - name: data-storage
           persistentVolumeClaim:
             claimName: jepa-vlm-injection-data-vol
@@ -136,4 +137,4 @@ spec:
       restartPolicy: Never
 
 # Apply with:
-#   kubectl apply -f job-177-frozen-recipe-mixed.yaml -n williamli-scvl
+#   kubectl apply -f job-176-lora-temporal-hard.yaml -n williamli-scvl

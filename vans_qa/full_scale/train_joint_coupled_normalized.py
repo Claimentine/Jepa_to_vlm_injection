@@ -581,6 +581,10 @@ def main():
               f"grad_accum_steps={args.grad_accum_steps} -> {opt_steps_per_epoch} optimizer steps/epoch", flush=True)
 
     total_steps = args.epochs * opt_steps_per_epoch
+    if args.max_steps:
+        # The schedule ends where training actually stops, so runs capped to
+        # the same --max_steps get the same lr curve whatever their split size.
+        total_steps = min(total_steps, args.max_steps)
     if args.lr_schedule == "warmup_cosine":
         warmup_steps = max(1, args.warmup_steps)
 
