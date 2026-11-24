@@ -19,10 +19,11 @@ through, x264 CRF 18 (visually lossless), no B-frames -- so clip frame i is
 source frame start_idx + i. Nothing here decodes with decord at all: even
 3 check frames each decode from the previous keyframe, and that leak alone
 took job-175 to 30 GB. Each clip is checked by timestamps instead: ffmpeg's
-showinfo reports every output frame's time, which (plus the seek point) must
-equal decord's index timestamps (read from the container index, no decode)
-for source frames start_idx..end_idx to within 2 ms -- this catches a wrong
-frame count, a one-frame shift, or a time-base mismatch.
+showinfo reports every output frame's time, which (plus the seek point) must lie
+nearer its intended source frame's decord index timestamp (read from the
+container index, no decode) than either neighbour's -- this catches a wrong
+frame count or a one-frame shift, while tolerating the ~12 ms off-grid
+timestamps some Ego4D videos have.
 
 Output per pid, under --clips_root/<annotation_source>/:
   <pid>.mp4   the past-window clip at the source fps
@@ -54,7 +55,6 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from extract_ego4d_longaxis import download_video, write_aws_credentials  # noqa: E402
 
-MAX_TIME_ERR_S = 0.002
 
 
 def build_index(cache_dirs, index_path):
@@ -85,25 +85,39 @@ def clip_paths(clips_root, item):
     return base + ".mp4", base + ".json"
 
 
-def check_clip_times(ffmpeg_stderr, seek, expected_starts):
-    """Every output frame's showinfo time + seek must equal the decord index
-    start time of the source frame it is supposed to be. Returns (max error
-    in seconds, source size parsed from showinfo)."""
+def check_clip_times(ffmpeg_stderr, seek, index_starts, first, n):
+    """index_starts: decord index start times for source frames lo..hi, which
+    cover the clip's n frames plus one neighbour on each side where they exist;
+    the clip's frame k is meant to be source frame lo + first + k. Every output
+    frame's showinfo time + seek must lie closer to its intended source frame
+    than to either neighbour -- some Ego4D videos' timestamps sit ~12 ms off
+    the 1/fps grid, so an absolute tolerance either misfires or must be loose
+    enough to hide a real one-frame shift. Returns (max distance to the
+    intended frame in seconds, source size parsed from showinfo)."""
     import re
 
     times = [float(m) for m in re.findall(r"\bn:\s*\d+\s.*?\bpts_time:\s*(-?[\d.]+)", ffmpeg_stderr)]
     size = re.search(r"\bs:(\d+)x(\d+)", ffmpeg_stderr)
+    return _match_frames(times, seek, np.asarray(index_starts, dtype=np.float64), first, n), \
+        ([int(size.group(1)), int(size.group(2))] if size else None)
+
+
+def _match_frames(times, seek, ts, first, n):
     # showinfo can see one frame past -frames:v (the filter runs ahead of the
-    # encoder's stop), so only the first N are the clip's own frames.
-    if len(times) < len(expected_starts):
-        raise RuntimeError(f"clip has {len(times)} frames, expected {len(expected_starts)}")
-    times = times[: len(expected_starts)]
-    err = np.abs(np.asarray(times) + seek - np.asarray(expected_starts))
-    if err.max() > MAX_TIME_ERR_S:
-        k = int(err.argmax())
-        raise RuntimeError(f"clip frame {k} is at source time {times[k] + seek:.4f}s, expected "
-                           f"{expected_starts[k]:.4f}s (max err {err.max() * 1000:.1f} ms)")
-    return float(err.max()), ([int(size.group(1)), int(size.group(2))] if size else None)
+    # encoder's stop), so only the first n are the clip's own frames.
+    if len(times) < n:
+        raise RuntimeError(f"clip has {len(times)} frames, expected {n}")
+    worst = 0.0
+    for k in range(n):
+        t = times[k] + seek
+        j = first + k
+        d = abs(t - ts[j])
+        for nb in (j - 1, j + 1):
+            if 0 <= nb < len(ts) and abs(t - ts[nb]) <= d:
+                raise RuntimeError(f"clip frame {k} (source time {t:.4f}s) is nearer source frame "
+                                   f"offset {nb - first} than its own ({k}): {ts[nb]:.4f}s vs {ts[j]:.4f}s")
+        worst = max(worst, d)
+    return worst
 
 
 def cut_clip(reader, src_path, item, out_mp4, out_json, pad_seconds, crf):
@@ -120,8 +134,10 @@ def cut_clip(reader, src_path, item, out_mp4, out_json, pad_seconds, crf):
         raise ValueError(f"empty window {start_idx}..{end_idx} (total={total}, fps={fps})")
     n_frames = end_idx - start_idx + 1
     # index timestamps only -- get_frame_timestamp reads the container index, no decode
-    expected_starts = reader.get_frame_timestamp(list(range(start_idx, end_idx + 1)))[:, 0].astype(np.float64)
-    seek = max(0.0, float(expected_starts[0]) - 0.5 / fps)
+    lo, hi = max(0, start_idx - 1), min(total - 1, end_idx + 1)
+    index_starts = reader.get_frame_timestamp(list(range(lo, hi + 1)))[:, 0].astype(np.float64)
+    first = start_idx - lo
+    seek = max(0.0, float(index_starts[first]) - 0.5 / fps)
 
     os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
     tmp_mp4 = out_mp4 + f".tmp.{os.getpid()}.{threading.get_ident()}.mp4"
@@ -137,7 +153,7 @@ def cut_clip(reader, src_path, item, out_mp4, out_json, pad_seconds, crf):
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg exit {result.returncode}: {result.stderr[-500:]}")
-        time_err, size = check_clip_times(result.stderr, seek, expected_starts)
+        time_err, size = check_clip_times(result.stderr, seek, index_starts, first, n_frames)
     except BaseException:
         if os.path.exists(tmp_mp4):
             os.remove(tmp_mp4)
@@ -200,12 +216,13 @@ def verify(by_video, uids, clips_root, n):
             meta = json.load(open(js))
             target = np.asarray(it["past_times"])
             clip_idx = np.round(target * meta["source_fps"]) - meta["start_idx"]
-            frames, centers, fps = decode_frames_at_timestamps(mp4, clip_idx / meta["source_fps"])
-            err = np.abs(centers + meta["offset_seconds"] - target)
+            frames, _, fps = decode_frames_at_timestamps(mp4, clip_idx / meta["source_fps"])
             n_clip = len(VideoReader(mp4, ctx=cpu(0)))
+            in_range = bool((clip_idx >= 0).all() and (clip_idx < n_clip).all())
             print(f"[VERIFY] {it['pid']}: frames={frames.shape} clip_fps={fps:.3f} src_fps={meta['source_fps']:.3f} "
-                  f"clip_frames={n_clip} size={os.path.getsize(mp4)/1e6:.1f}MB "
-                  f"max_time_err={err.max()*1000:.1f}ms (1 frame={1000/meta['source_fps']:.1f}ms)", flush=True)
+                  f"clip_frames={n_clip} all_32_indices_inside_clip={in_range} "
+                  f"cut_check={meta.get('check_time_err_ms', 'n/a')}ms size={os.path.getsize(mp4)/1e6:.1f}MB",
+                  flush=True)
             checked += 1
 
 

@@ -243,8 +243,11 @@ def load_pair_live(cache_dir, pid, device, qwen_model, qwen_processor, qwen_save
             # can flip the rounding to a neighbouring frame.
             fps_src = float(clip_meta["source_fps"])
             clip_idx = np.round(past_times_target * fps_src) - clip_meta["start_idx"]
-            past_frames, past_times, source_fps = decode_frames_at_timestamps(video_path, clip_idx / fps_src)
-            past_times = past_times + float(clip_meta["offset_seconds"])
+            past_frames, _, source_fps = decode_frames_at_timestamps(video_path, clip_idx / fps_src)
+            # The clip's own timestamps start half a frame in (it is cut from
+            # half a frame before start_idx), so hand Qwen the cached source
+            # times -- the exact times the original extraction used.
+            past_times = past_times_target
         span = max(1e-6, float(past_times[-1] - past_times[0]))
         in_fps = max(1.0, (len(past_times) - 1) / span)  # same fallback extract_ego4d_reverse_guided.py itself uses
     vlm_old, vlm_new = infer_qwen_teacher_forced_live(
