@@ -16,8 +16,13 @@ grew ~230 MB/s until OOMKilled at 32Gi): it seeks to half a frame before
 source frame start_idx's own timestamp (from decord's index, no decode) and
 takes the next end_idx - start_idx + 1 frames with timestamps passed
 through, x264 CRF 18 (visually lossless), no B-frames -- so clip frame i is
-source frame start_idx + i. Each clip is then checked: frame count, and its
-first/middle/last frames against decord's own decode of those source frames.
+source frame start_idx + i. Nothing here decodes with decord at all: even
+3 check frames each decode from the previous keyframe, and that leak alone
+took job-175 to 30 GB. Each clip is checked by timestamps instead: ffmpeg's
+showinfo reports every output frame's time, which (plus the seek point) must
+equal decord's index timestamps (read from the container index, no decode)
+for source frames start_idx..end_idx to within 2 ms -- this catches a wrong
+frame count, a one-frame shift, or a time-base mismatch.
 
 Output per pid, under --clips_root/<annotation_source>/:
   <pid>.mp4   the past-window clip at the source fps
@@ -49,7 +54,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from extract_ego4d_longaxis import download_video, write_aws_credentials  # noqa: E402
 
-MAX_CHECK_PIXEL_ERR = 6.0  # mean |diff| on 0-255; CRF 18 lands around 1-3
+MAX_TIME_ERR_S = 0.002
 
 
 def build_index(cache_dirs, index_path):
@@ -80,29 +85,25 @@ def clip_paths(clips_root, item):
     return base + ".mp4", base + ".json"
 
 
-def check_clip(reader, clip_path, start_idx, n_frames):
-    """Clip frame count must be n_frames, and its first/middle/last frames must
-    match decord's decode of source frames start_idx + k. Returns the error."""
-    import imageio_ffmpeg
+def check_clip_times(ffmpeg_stderr, seek, expected_starts):
+    """Every output frame's showinfo time + seek must equal the decord index
+    start time of the source frame it is supposed to be. Returns (max error
+    in seconds, source size parsed from showinfo)."""
+    import re
 
-    picks = sorted({0, n_frames // 2, n_frames - 1})
-    gen = imageio_ffmpeg.read_frames(clip_path)
-    meta = next(gen)
-    w, h = meta["size"]
-    got, count = {}, 0
-    for raw in gen:
-        if count in picks:
-            got[count] = np.frombuffer(raw, np.uint8).reshape(h, w, 3)
-        count += 1
-    if count != n_frames:
-        raise RuntimeError(f"clip has {count} frames, expected {n_frames}")
-    ref = reader.get_batch([start_idx + k for k in picks]).asnumpy()[..., :3]
-    errs = [float(np.abs(got[k][: ref.shape[1], : ref.shape[2]].astype(np.int16)
-                         - ref[i].astype(np.int16)).mean()) for i, k in enumerate(picks)]
-    if max(errs) > MAX_CHECK_PIXEL_ERR:
-        raise RuntimeError(f"clip frames don't match source frames {[start_idx + k for k in picks]}: "
-                           f"mean abs err {errs}")
-    return max(errs)
+    times = [float(m) for m in re.findall(r"\bn:\s*\d+\s.*?\bpts_time:\s*(-?[\d.]+)", ffmpeg_stderr)]
+    size = re.search(r"\bs:(\d+)x(\d+)", ffmpeg_stderr)
+    # showinfo can see one frame past -frames:v (the filter runs ahead of the
+    # encoder's stop), so only the first N are the clip's own frames.
+    if len(times) < len(expected_starts):
+        raise RuntimeError(f"clip has {len(times)} frames, expected {len(expected_starts)}")
+    times = times[: len(expected_starts)]
+    err = np.abs(np.asarray(times) + seek - np.asarray(expected_starts))
+    if err.max() > MAX_TIME_ERR_S:
+        k = int(err.argmax())
+        raise RuntimeError(f"clip frame {k} is at source time {times[k] + seek:.4f}s, expected "
+                           f"{expected_starts[k]:.4f}s (max err {err.max() * 1000:.1f} ms)")
+    return float(err.max()), ([int(size.group(1)), int(size.group(2))] if size else None)
 
 
 def cut_clip(reader, src_path, item, out_mp4, out_json, pad_seconds, crf):
@@ -118,15 +119,17 @@ def cut_clip(reader, src_path, item, out_mp4, out_json, pad_seconds, crf):
     if end_idx <= start_idx:
         raise ValueError(f"empty window {start_idx}..{end_idx} (total={total}, fps={fps})")
     n_frames = end_idx - start_idx + 1
-    seek = max(0.0, float(reader.get_frame_timestamp([start_idx])[0][0]) - 0.5 / fps)
+    # index timestamps only -- get_frame_timestamp reads the container index, no decode
+    expected_starts = reader.get_frame_timestamp(list(range(start_idx, end_idx + 1)))[:, 0].astype(np.float64)
+    seek = max(0.0, float(expected_starts[0]) - 0.5 / fps)
 
     os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
     tmp_mp4 = out_mp4 + f".tmp.{os.getpid()}.{threading.get_ident()}.mp4"
     cmd = [
-        imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
+        imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-hide_banner", "-nostats", "-loglevel", "info",
         "-ss", f"{seek:.6f}", "-i", str(src_path),
         "-map", "0:v:0", "-an", "-frames:v", str(n_frames), "-fps_mode", "passthrough",
-        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-vf", "showinfo,pad=ceil(iw/2)*2:ceil(ih/2)*2",
         "-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-bf", "0", "-threads", "2",
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", tmp_mp4,
     ]
@@ -134,17 +137,16 @@ def cut_clip(reader, src_path, item, out_mp4, out_json, pad_seconds, crf):
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg exit {result.returncode}: {result.stderr[-500:]}")
-        pixel_err = check_clip(reader, tmp_mp4, start_idx, n_frames)
+        time_err, size = check_clip_times(result.stderr, seek, expected_starts)
     except BaseException:
         if os.path.exists(tmp_mp4):
             os.remove(tmp_mp4)
         raise
     os.replace(tmp_mp4, out_mp4)
-    h, w = reader[start_idx].shape[:2]
     meta = {
         "pid": item["pid"], "offset_seconds": start_idx / fps, "start_idx": start_idx,
-        "end_idx": end_idx, "source_fps": fps, "source_size": [w, h], "crf": crf,
-        "check_pixel_err": pixel_err,
+        "end_idx": end_idx, "source_fps": fps, "source_size": size, "crf": crf,
+        "check_time_err_ms": time_err * 1000,
     }
     with open(out_json + ".tmp", "w") as f:
         json.dump(meta, f)
