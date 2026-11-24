@@ -44,7 +44,9 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from extract_ego4d_longaxis import download_video, write_aws_credentials  # noqa: E402
 
-CHUNK_FRAMES = 64
+# Full-resolution frames are large (a 64-frame chunk at 1440p is ~0.8 GB), and
+# job-175 OOMed at 16Gi with 4 videos in flight -- keep per-video memory small.
+CHUNK_FRAMES = 16
 
 
 def build_index(cache_dirs, index_path):
@@ -95,7 +97,7 @@ def cut_clip(reader, item, out_mp4, out_json, pad_seconds, crf):
         imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", f"{fps:.6f}", "-i", "-",
         "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-        "-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-bf", "0",
+        "-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-bf", "0", "-threads", "2",
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", tmp_mp4,
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -135,7 +137,7 @@ def process_video(uid, items, args):
             download_video(uid, dl_dir)
         if not video_path.exists():
             raise RuntimeError(f"ego4d CLI reported success but {video_path} is missing")
-        reader = VideoReader(str(video_path), ctx=cpu(0), num_threads=2)
+        reader = VideoReader(str(video_path), ctx=cpu(0), num_threads=1)
         n_err = 0
         for it in todo:
             out_mp4, out_json = clip_paths(args.clips_root, it)

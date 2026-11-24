@@ -38,9 +38,11 @@ spec:
               cd /code/Jepa_to_vlm_injection
               "$PY" -m pip install --quiet lab22 imageio-ffmpeg
               export PATH="$(dirname "$PY"):$PATH"
+              # 2 videos in flight: the first try (4 in flight, 16Gi) was OOMKilled.
               "$PY" vans_qa/full_scale/fetch_ego4d_past_clips.py \
-                --limit_videos 4 --concurrency 4 --verify 12
+                --limit_videos 4 --concurrency 2 --verify 12
               du -sh /data/vans_work_ego4d_reverse_guided/past_clips
+              echo "peak memory: $(( $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes) / 1048576 )) MB"
               echo "SCRIPT_DONE"
           env:
             - name: VANS_ROOT
@@ -55,11 +57,11 @@ spec:
           resources:
             requests:
               cpu: "4"
-              memory: "16Gi"
+              memory: "32Gi"
               ephemeral-storage: "4Gi"
             limits:
               cpu: "4"
-              memory: "16Gi"
+              memory: "32Gi"
               ephemeral-storage: "6Gi"
           volumeMounts:
             - name: git-repo-code

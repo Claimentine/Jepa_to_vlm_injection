@@ -30,6 +30,13 @@ spec:
                     operator: In
                     values:
                       - us-west
+                  # L40/L40S (46GB): us-west A6000s were all taken for 3h+;
+                  # one GPU family for all three arms.
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
       containers:
         - name: frozen-recipe-easy
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
@@ -86,12 +93,12 @@ spec:
               cpu: "6"
               memory: "28Gi"
               ephemeral-storage: "2Gi"
-              nvidia.com/rtxa6000: "1"
+              nvidia.com/gpu: "1"
             limits:
               cpu: "7"
               memory: "32Gi"
               ephemeral-storage: "2400Mi"
-              nvidia.com/rtxa6000: "1"
+              nvidia.com/gpu: "1"
           volumeMounts:
             - name: git-repo-code
               mountPath: /code
