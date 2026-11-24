@@ -34,6 +34,11 @@ spec:
             - "-c"
             - |
               set -euo pipefail
+              # The 3rd run failed after 6 min and its pod (and stdout) was
+              # cleaned up -- keep every line on /data too.
+              LOG=/data/vans_work_ego4d_reverse_guided/past_clips/smoke_run_$(date +%Y%m%dT%H%M%S).log
+              exec > >(tee -a "$LOG") 2>&1
+              trap 'echo "EXIT code=$? at line $LINENO"' EXIT
               PY=/home/jovyan/conda-envs/qwen3vl/bin/python
               cd /code/Jepa_to_vlm_injection
               "$PY" -m pip install --quiet lab22 imageio-ffmpeg
