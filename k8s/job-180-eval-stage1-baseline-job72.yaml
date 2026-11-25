@@ -1,0 +1,121 @@
+# Step 180: stage-1 baseline for two-stage training. Scores job-72's
+# step_4000.pt (frozen-VLM recipe, the project's "current best": val easy
+# 0.92 / hard 0.76 on 100 items in Oct) with TODAY's code on the same 500
+# val items the LoRA runs (job-176/177/178) are scored on, so stage 2
+# (job-181: resume from it, add VLM LoRA) has a like-for-like number to
+# beat. Also confirms the Oct checkpoint still loads after the code changes
+# since (a module mismatch fails loudly here). zeroshot=NONE (bare VLM, no
+# injection) shows how much of easy/hard the VLM gets on its own.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-eval-stage1-baseline-job72
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values:
+                      - us-west
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - NVIDIA-RTX-A6000
+      containers:
+        - name: eval-stage1-baseline-job72
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              LOG=/data/raw_data/stage1_baseline_eval_full_run.log
+              exec > >(tee -a "$LOG") 2>&1
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              cd /code/Jepa_to_vlm_injection
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              "$PY" vans_qa/full_scale/eval_forward_checkpoint.py \
+                --checkpoint job72_step4000=/data/raw_data/joint_coupled_bridge_mlp_2epoch_runs/step_4000.pt \
+                --checkpoint zeroshot=NONE \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --split_part val \
+                --limit 500 \
+                --out_path /data/raw_data/stage1_baseline_eval_val500.json
+              echo "SCRIPT_DONE"
+          env:
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "24Gi"
+              ephemeral-storage: "4Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4.8"
+              memory: "32Gi"
+              ephemeral-storage: "6Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-ddp
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-180-eval-stage1-baseline-job72.yaml -n williamli-scvl
