@@ -246,6 +246,12 @@ def main():
                           "optimizer step. `step`, --max_steps, --val_every_steps, --save_every_steps "
                           "and --warmup_steps all count OPTIMIZER steps, so one epoch is "
                           "n_steps_per_epoch // grad_accum_steps steps. 1 = the old per-item update.")
+    ap.add_argument("--symmetric_options", action="store_true",
+                     help="score each caption by its letter log-prob averaged over both A/B orders "
+                          "(train_qa_full.symmetric_scores), in training and validation, so a letter "
+                          "preference can't lower the loss. The 2-letter LoRA runs collapsed to answering "
+                          "one letter (job-172/173 matched to the last digit at step 200; easy below "
+                          "chance). Two prompts per item from one decode, same forward-pass count.")
     ap.add_argument("--max_fwd_skip_frac", type=float, default=0.2,
                      help="abort if more than this fraction of the last 200 forward items were skipped "
                           "(decode/memory errors). job-182 ran 22h with every forward item failing on "
@@ -357,6 +363,8 @@ def main():
                           "are reused here, but the layer COUNT fixes guidance_old_adapter/"
                           "guidance_new_adapter's expected shape at predictor-construction time).")
     args = ap.parse_args()
+    if args.symmetric_options and args.precompute_cache_dir:
+        ap.error("--symmetric_options needs live decode (the precompute cache holds one A/B order only)")
 
     if is_ddp():
         rank, world_size, local_rank = setup_ddp()
@@ -634,19 +642,35 @@ def main():
                     else:
                         option_lines, correct_letter = fwd.build_option_block(fwd_item, rng)
                         prompt_text = fwd.build_prompt_text(fwd_item["question"], option_lines)
-                        inputs = fwd.build_inputs(processor, fwd_item["in_clip"], prompt_text)
+                        handle = fwd.start_decode(fwd_item["in_clip"], prompt_text)
+                        decoded = fwd.finish_decode(handle)
+                        inputs = fwd.build_inputs_from_decoded(processor, handle.abs_path, prompt_text, decoded)
                     model_inputs = fwd.prepare_model_inputs(inputs, "cross_attn", n_tokens, placeholder_id)
                     model_inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in model_inputs.items()}
+                    if args.symmetric_options:
+                        # same decoded frames, A/B swapped
+                        swapped = fwd.build_inputs_from_decoded(
+                            processor, handle.abs_path,
+                            fwd.build_prompt_text(fwd_item["question"], fwd.swap_option_lines(option_lines)),
+                            decoded)
+                        swapped = fwd.prepare_model_inputs(swapped, "cross_attn", n_tokens, placeholder_id)
+                        swapped = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in swapped.items()}
                     jepa_feats = torch.from_numpy(fwd.load_vjepa_in_feats(fwd_item["in_clip"])).unsqueeze(0).to(device)
                     pooled_jepa = jepa_feats.mean(dim=(1, 2))
                     condition = injector.condition(jepa_feats)
                     hook.set(condition)
-                    scores = torch.stack([
-                        fwd.candidate_logprob(model, model_inputs, processor.tokenizer, "A"),
-                        fwd.candidate_logprob(model, model_inputs, processor.tokenizer, "B"),
-                    ]).unsqueeze(0)
+                    if args.symmetric_options:
+                        # index 0 = correct caption, 1 = distractor
+                        scores = fwd.symmetric_scores(
+                            model, model_inputs, swapped, processor.tokenizer, correct_letter).unsqueeze(0)
+                        target = torch.tensor([0], device=device)
+                    else:
+                        scores = torch.stack([
+                            fwd.candidate_logprob(model, model_inputs, processor.tokenizer, "A"),
+                            fwd.candidate_logprob(model, model_inputs, processor.tokenizer, "B"),
+                        ]).unsqueeze(0)
+                        target = torch.tensor([0 if correct_letter == "A" else 1], device=device)
                     hook.clear()
-                    target = torch.tensor([0 if correct_letter == "A" else 1], device=device)
                     fwd_loss = nn.functional.cross_entropy(scores, target)
                     fwd_loss_norm, fwd_ema = normalizer.normalize("fwd", fwd_loss)
                     total_loss = total_loss + fwd_loss_norm
@@ -787,6 +811,7 @@ def main():
             if is_main and step % args.val_every_steps == 0:
                 fwd_val_tally = fwd.evaluate_logprob(
                     model, processor, hook, injector, fwd_val, "cross_attn", n_tokens, placeholder_id, device, rng,
+                    symmetric=args.symmetric_options,
                 )
                 rev_val_metrics, n_rev_val = rev.evaluate(predictor, get_rev_pair, rev_val, "crossattn", device)
                 print(f"[epoch {epoch} step {step}] fwd_val_acc={fwd_val_tally.summary_str()}  "

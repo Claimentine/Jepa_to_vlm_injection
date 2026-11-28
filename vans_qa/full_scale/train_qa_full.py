@@ -412,6 +412,35 @@ def candidate_logprob(model, model_inputs, tokenizer, letter):
     return token_logprobs.gather(1, targets.unsqueeze(1)).sum()
 
 
+def swap_option_lines(option_lines):
+    """["A. x", "B. y"] -> ["A. y", "B. x"]: same two captions, letters swapped."""
+    first, second = (line.split(". ", 1)[1] for line in option_lines)
+    return [f"A. {second}", f"B. {first}"]
+
+
+def letter_logprobs(model, model_inputs, tokenizer):
+    """[log P(' A'), log P(' B')] at the answer position from ONE forward pass --
+    identical to candidate_logprob for single-token letters (the logits at the
+    last prompt position are the ones candidate_logprob reads after appending)."""
+    ids = [tokenizer(f" {letter}", add_special_tokens=False)["input_ids"] for letter in ("A", "B")]
+    if any(len(i) != 1 for i in ids):
+        return torch.stack([candidate_logprob(model, model_inputs, tokenizer, letter) for letter in ("A", "B")])
+    out = model(**model_inputs)
+    lp = out.logits[0, -1].float().log_softmax(dim=-1)
+    return lp[[ids[0][0], ids[1][0]]]
+
+
+def symmetric_scores(model, inputs_orig, inputs_swapped, tokenizer, correct_letter):
+    """[score(correct caption), score(distractor)], each caption's letter
+    log-prob averaged over both A/B orders. A preference for one letter adds
+    the same amount to both captions' scores and cancels, so always answering
+    "A" (the collapse the 2-letter LoRA runs fell into) no longer lowers the loss."""
+    lp1 = letter_logprobs(model, inputs_orig, tokenizer)
+    lp2 = letter_logprobs(model, inputs_swapped, tokenizer)
+    c = 0 if correct_letter == "A" else 1
+    return torch.stack([(lp1[c] + lp2[1 - c]) / 2, (lp1[1 - c] + lp2[c]) / 2])
+
+
 def prepare_model_inputs(inputs, injection_site, n_tokens, placeholder_id):
     model_inputs = {k: v for k, v in inputs.items() if k not in ("input_ids", "attention_mask")}
     input_ids, attn_mask = inputs["input_ids"], inputs["attention_mask"]
@@ -491,7 +520,9 @@ def _start_item_decode(item, rng, precompute_cache_dir=None):
 
 
 def evaluate_logprob(model, processor, hook, injector, items, injection_site, n_tokens, placeholder_id, device, rng,
-                      prefetch_depth=4, precompute_cache_dir=None):
+                      prefetch_depth=4, precompute_cache_dir=None, symmetric=False):
+    if symmetric:
+        precompute_cache_dir = None  # cached inputs hold one A/B order only
     model.eval()
     # Without this, JepaPoolerTemporal's internal attention dropout (p=0.1)
     # stays active during periodic in-training validation, adding noise to
@@ -542,12 +573,22 @@ def evaluate_logprob(model, processor, hook, injector, items, injection_site, n_
                 feats = torch.from_numpy(feats_np).unsqueeze(0).to(device)
                 condition = injector(feats) if injection_site == "prefix" else injector.condition(feats)
                 hook.set(condition)
-                scores = torch.stack([
-                    candidate_logprob(model, model_inputs, processor.tokenizer, "A"),
-                    candidate_logprob(model, model_inputs, processor.tokenizer, "B"),
-                ])
+                if symmetric:
+                    swapped = build_inputs_from_decoded(
+                        processor, handle.abs_path,
+                        build_prompt_text(item["question"], swap_option_lines(option_lines)), decoded)
+                    swapped = prepare_model_inputs(swapped, injection_site, n_tokens, placeholder_id)
+                    swapped = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in swapped.items()}
+                    s = symmetric_scores(model, model_inputs, swapped, processor.tokenizer, correct_letter)
+                    is_correct = bool(s[0] > s[1])
+                else:
+                    scores = torch.stack([
+                        candidate_logprob(model, model_inputs, processor.tokenizer, "A"),
+                        candidate_logprob(model, model_inputs, processor.tokenizer, "B"),
+                    ])
+                    is_correct = ("A" if scores[0] > scores[1] else "B") == correct_letter
                 hook.clear()
-                tally.add(item, ("A" if scores[0] > scores[1] else "B") == correct_letter)
+                tally.add(item, is_correct)
             except Exception as e:
                 # matches the training loop's per-item try/except: a small fraction of
                 # clips are corrupt/too-short (bad feature cache or torchvision frame-count

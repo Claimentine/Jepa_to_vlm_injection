@@ -70,7 +70,8 @@ import train_qa_full as fwd  # noqa: E402
 NONE_SENTINEL = "NONE"
 
 
-def evaluate_logprob_none(model, processor, items, device, rng, prefetch_depth=4, precompute_cache_dir=None):
+def evaluate_logprob_none(model, processor, items, device, rng, prefetch_depth=4, precompute_cache_dir=None,
+                          symmetric=False):
     """Zero-shot frozen-VLM baseline over the FULL split: same prompt/option/
     decode pipeline as evaluate_logprob, but with no hook and no injector at
     all -- not even a placeholder/condition tensor. This is the "injection=none"
@@ -79,6 +80,8 @@ def evaluate_logprob_none(model, processor, items, device, rng, prefetch_depth=4
     the comparison against a real checkpoint's full-test-set accuracy is
     apples-to-apples.
     """
+    if symmetric:
+        precompute_cache_dir = None  # cached inputs hold one A/B order only
     model.eval()
     tally = fwd.AccTally()
     seen_exc_types = set()
@@ -106,11 +109,20 @@ def evaluate_logprob_none(model, processor, items, device, rng, prefetch_depth=4
                     decoded = fwd.finish_decode(handle)
                     inputs = fwd.build_inputs_from_decoded(processor, handle.abs_path, prompt_text, decoded)
                 model_inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
-                scores = torch.stack([
-                    fwd.candidate_logprob(model, model_inputs, processor.tokenizer, "A"),
-                    fwd.candidate_logprob(model, model_inputs, processor.tokenizer, "B"),
-                ])
-                tally.add(item, ("A" if scores[0] > scores[1] else "B") == correct_letter)
+                if symmetric:
+                    swapped = fwd.build_inputs_from_decoded(
+                        processor, handle.abs_path,
+                        fwd.build_prompt_text(item["question"], fwd.swap_option_lines(option_lines)), decoded)
+                    swapped = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in swapped.items()}
+                    s = fwd.symmetric_scores(model, model_inputs, swapped, processor.tokenizer, correct_letter)
+                    is_correct = bool(s[0] > s[1])
+                else:
+                    scores = torch.stack([
+                        fwd.candidate_logprob(model, model_inputs, processor.tokenizer, "A"),
+                        fwd.candidate_logprob(model, model_inputs, processor.tokenizer, "B"),
+                    ])
+                    is_correct = ("A" if scores[0] > scores[1] else "B") == correct_letter
+                tally.add(item, is_correct)
             except Exception as e:
                 exc_name = type(e).__name__
                 print(f"[WARN] eval(none): skipping item {item.get('pid')}: {exc_name}: {e}", flush=True)
@@ -226,6 +238,11 @@ def main():
                           "silently contaminated by the previous checkpoint's LoRA weights.")
     ap.add_argument("--lora_vlm_r", type=int, default=8, help="only used with --lora_vlm")
     ap.add_argument("--lora_vlm_alpha", type=float, default=16.0, help="only used with --lora_vlm")
+    ap.add_argument("--symmetric_options", action="store_true",
+                     help="score each caption by its letter log-prob averaged over both A/B orders "
+                          "(train_qa_full.symmetric_scores), so a letter preference can't move the "
+                          "result. Use it for checkpoints trained with --symmetric_options, and as a "
+                          "check on whether a 2-letter score reflects a letter bias.")
     ap.add_argument("--resume", action="store_true",
                      help="if --out_path already exists, load it first and skip any checkpoint "
                           "label already present with the same split_part -- lets a multi-checkpoint "
@@ -301,7 +318,7 @@ def main():
                 rng = random.Random(args.seed)
                 tally = evaluate_logprob_none(
                     model, processor, items, device, rng,
-                    precompute_cache_dir=cache_dir,
+                    precompute_cache_dir=cache_dir, symmetric=args.symmetric_options,
                 )
             else:
                 injector = load_checkpoint_into_fresh_injector(checkpoint_path, model, hidden_size, args.layer_strategy, args.seed, device)
@@ -315,13 +332,14 @@ def main():
                     rng = random.Random(args.seed)
                     tally = fwd.evaluate_logprob(
                         model, processor, hook, injector, items, "cross_attn", n_tokens, placeholder_id, device, rng,
-                        precompute_cache_dir=cache_dir,
+                        precompute_cache_dir=cache_dir, symmetric=args.symmetric_options,
                     )
                 finally:
                     hook.remove()
             print(f"[RESULT] {label} {args.split_part} n={tally.n_total} val_acc(logprob)={tally.summary_str()}", flush=True)
             results[label] = {
                 "checkpoint": checkpoint_path, "split_part": args.split_part,
+                "symmetric_options": args.symmetric_options,
                 "n_total": tally.n_total, "acc": tally.acc,
                 "acc_by_difficulty": tally.acc_by_difficulty,
             }

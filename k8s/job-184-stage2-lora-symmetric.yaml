@@ -1,0 +1,147 @@
+# Step 184: job-181 (stage 2: resume job-72's step_4000.pt, add VLM +
+# predictor LoRA, VLM LoRA lr 5e-6, live guidance, job-72's recipe) plus
+# --symmetric_options, in training and validation. The 2-letter LoRA runs
+# collapsed toward answering one letter (job-172/173 identical to the last
+# digit at step 200; job-181 step 4500 easy 0.41). Symmetric scoring makes a
+# letter preference cancel in the loss, so that shortcut stops paying off.
+# Baseline to beat: job-183's symmetric score of job72_step4000. node-1-3
+# excluded (host-memory failures), node printed at start.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ruixin-stage2-lora-symmetric
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values:
+                      - us-west
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A100-SXM4-80GB
+                      - NVIDIA-A100-80GB-PCIe
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - node-2-3.sdsc.optiputer.net
+                      - node-1-3.sdsc.optiputer.net
+      containers:
+        - name: stage2-lora-symmetric
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          command:
+            - "bash"
+          args:
+            - "-c"
+            - |
+              set -euo pipefail
+              PY=/home/jovyan/conda-envs/qwen3vl/bin/python
+              REPO=/code/Jepa_to_vlm_injection
+              RUNS=/data/raw_data/stage2_lora_symmetric_runs
+              cd "$REPO"
+              mkdir -p "$VANS_WORK_ROOT"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
+              ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/vjepa_cache_full"
+              echo "node: $NODE_NAME"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              mkdir -p "$RUNS"
+              "$PY" vans_qa/full_scale/train_joint_coupled_normalized.py \
+                --qa_split /data/raw_data/qa_split_temporal.json \
+                --cache_dir /data/vans_work/vlm_guidance_cache_paired \
+                --rev_qa_split /data/raw_data/qa_split_full.json \
+                --resume_from /data/raw_data/joint_coupled_bridge_mlp_2epoch_runs/step_4000.pt \
+                --disable_norm \
+                --cycle_loss_weight 0 \
+                --bridge_hidden_dim 2048 \
+                --lora_vlm --lora_vlm_r 8 --lora_vlm_alpha 16 \
+                --lora_predictor --lora_predictor_r 8 --lora_predictor_alpha 16 \
+                --live_vlm \
+                --symmetric_options \
+                --lr 1e-4 --vlm_lr 5e-6 \
+                --grad_clip_norm 1.0 \
+                --grad_accum_steps 2 \
+                --epochs 2 \
+                --max_steps 7000 \
+                --val_every_steps 500 \
+                --save_every_steps 500 \
+                --max_val_items 500 \
+                --max_test_items 500 \
+                --out_dir "$RUNS" 2>&1 \
+                | tee -a "$RUNS/full_run.log"
+              echo "SCRIPT_DONE"
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: VANS_ROOT
+              value: /data
+            - name: VANS_WORK_ROOT
+              value: /data/vans_work
+            - name: THINKJEPA_ROOT
+              value: /home/jovyan/ThinkJEPA
+            - name: HF_HOME
+              value: /data/hf_cache
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FORCE_QWENVL_VIDEO_READER
+              value: decord
+          resources:
+            requests:
+              cpu: "4"
+              memory: "28Gi"
+              ephemeral-storage: "4Gi"
+              nvidia.com/a100: "1"
+            limits:
+              cpu: "4.8"
+              memory: "32Gi"
+              ephemeral-storage: "6Gi"
+              nvidia.com/a100: "1"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /home/jovyan
+            - name: data-storage
+              mountPath: /data
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          resources:
+            requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "1", memory: "2Gi", ephemeral-storage: "1200Mi"}
+          args:
+            - clone
+            - --single-branch
+            - https://github.com/Claimentine/Jepa_to_vlm_injection.git
+            - /opt/repo/Jepa_to_vlm_injection
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: ruixin-conda-vol-youcook
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: jepa-vlm-injection-data-vol
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      restartPolicy: Never
+
+# Apply with:
+#   kubectl apply -f job-184-stage2-lora-symmetric.yaml -n williamli-scvl
