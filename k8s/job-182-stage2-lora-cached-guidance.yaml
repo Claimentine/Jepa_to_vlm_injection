@@ -9,6 +9,13 @@
 # cached guidance, so the VLM LoRA is trained by the forward loss alone.
 # Stable and above 0.739 -> the reverse gradient through the shared VLM is
 # the problem; still swinging -> it's the LoRA itself.
+#
+# Rerun (2026-11-27): the first run trained 7000 steps with EVERY forward item
+# skipped on host-memory errors ("Unable to allocate 8.00 KiB") -- only the
+# reverse direction trained, so its forward result is void. Same symptom as
+# node-1-3 earlier, which is now excluded; the node name is printed at start;
+# the training script now aborts if >20% of recent forward items are skipped;
+# fresh out dir (a resumed run appends to its logs).
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -35,6 +42,7 @@ spec:
                     operator: NotIn
                     values:
                       - node-2-3.sdsc.optiputer.net
+                      - node-1-3.sdsc.optiputer.net
       containers:
         - name: stage2-lora-cached-guidance
           image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
@@ -46,7 +54,8 @@ spec:
               set -euo pipefail
               PY=/home/jovyan/conda-envs/qwen3vl/bin/python
               REPO=/code/Jepa_to_vlm_injection
-              RUNS=/data/raw_data/stage2_lora_cached_guidance_runs
+              RUNS=/data/raw_data/stage2_lora_cached_guidance_v2_runs
+              echo "node: $NODE_NAME"
               cd "$REPO"
               mkdir -p "$VANS_WORK_ROOT"
               ln -sfn /data/hf_data/vans_injection_backup "$VANS_WORK_ROOT/clips"
@@ -76,6 +85,10 @@ spec:
                 | tee -a "$RUNS/full_run.log"
               echo "SCRIPT_DONE"
           env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: VANS_ROOT
               value: /data
             - name: VANS_WORK_ROOT

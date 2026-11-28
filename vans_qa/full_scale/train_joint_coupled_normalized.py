@@ -86,6 +86,7 @@ added after that crash so this eval can be capped like every other
 --max_*_items pass instead of relying on storage staying fast enough.
 """
 import argparse
+import collections
 import datetime
 import json
 import math
@@ -245,6 +246,10 @@ def main():
                           "optimizer step. `step`, --max_steps, --val_every_steps, --save_every_steps "
                           "and --warmup_steps all count OPTIMIZER steps, so one epoch is "
                           "n_steps_per_epoch // grad_accum_steps steps. 1 = the old per-item update.")
+    ap.add_argument("--max_fwd_skip_frac", type=float, default=0.2,
+                     help="abort if more than this fraction of the last 200 forward items were skipped "
+                          "(decode/memory errors). job-182 ran 22h with every forward item failing on "
+                          "host-memory errors and only the reverse direction training. 1 disables.")
     ap.add_argument("--no_jepa_injection", action="store_true",
                      help="ablation control: unregister the decoder-layer injection hooks, so the "
                           "VLM scores the forward QA with no JEPA condition, in training AND validation. "
@@ -554,6 +559,7 @@ def main():
     n_fwd_skipped = 0
     n_rev_skipped = 0
     seen_exc_types = set()
+    recent_fwd_ok = collections.deque(maxlen=200)
     best_fwd_val_acc = -1.0
     best_rev_val_mse = float("inf")
 
@@ -654,6 +660,13 @@ def main():
                     if exc_name not in seen_exc_types:
                         seen_exc_types.add(exc_name)
                         traceback.print_exc()
+                recent_fwd_ok.append(fwd_ok)
+                if (args.max_fwd_skip_frac < 1 and len(recent_fwd_ok) == recent_fwd_ok.maxlen
+                        and recent_fwd_ok.count(False) > args.max_fwd_skip_frac * recent_fwd_ok.maxlen):
+                    raise RuntimeError(
+                        f"{recent_fwd_ok.count(False)}/{recent_fwd_ok.maxlen} of the last forward items "
+                        f"were skipped (> --max_fwd_skip_frac {args.max_fwd_skip_frac}) -- the forward "
+                        "direction isn't training; aborting instead of silently burning GPU time")
 
                 rev_ok = False
                 pooled_vlm = None
